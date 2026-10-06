@@ -1,11 +1,11 @@
 # Pinned models-as-a-service source for ai-gateway-controller e2e.
 #
-# Includes the rate-group TRLP contract and subscription-deletion test.
+# Includes short subscription IDs in TRLP predicates (#1546) and cascade-deletion tests.
 #
 # Validate e2e when bumping this pin.
 # Override for one-off runs without editing this file:
 #   MAAS_COMMIT=<sha> ./test/e2e/scripts/prow_run_ai_gateway_controller_test.sh
 maas_repo=https://github.com/opendatahub-io/models-as-a-service
-maas_commit=26e3116f6ddbe50a73fe9c31b61fbd6d3c817411
+maas_commit=090cc5d1a52a82f75b81a0a104f0d244c9a0ab9f
 maas_ref=main
-updated_at=2026-09-27T03:55:47Z
+updated_at=2026-10-06T18:06:56Z
