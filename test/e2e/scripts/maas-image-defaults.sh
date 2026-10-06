@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Default container images for ai-gateway-controller e2e (no local maas-api/maas-controller trees).
 #
-# MaaS main-branch Konflux pushes publish :latest (see models-as-a-service
-# .tekton/odh-maas-api-push.yaml and odh-maas-controller-push.yaml).
+# MaaS main-branch Konflux pushes publish :latest and a tag for each commit SHA (see
+# models-as-a-service .tekton/odh-maas-api-push.yaml and odh-maas-controller-push.yaml).
 # Override with MAAS_API_IMAGE / MAAS_CONTROLLER_IMAGE when testing specific builds.
 
 set -euo pipefail
 
-# Branch ci/e2e-maas-pr-1508: deploy maas-controller built from MaaS PR #1508.
-MAAS_IMAGE_TAG="${MAAS_IMAGE_TAG:-odh-pr-1508}"
+# Deploy images from the MaaS commit pinned in test/maas-e2e.lock, so local runs match
+# the fetched tests. Update this tag whenever the pin changes.
+MAAS_IMAGE_TAG="${MAAS_IMAGE_TAG:-090cc5d1a52a82f75b81a0a104f0d244c9a0ab9f}"
 
 export MAAS_API_IMAGE="${MAAS_API_IMAGE:-quay.io/opendatahub/maas-api:${MAAS_IMAGE_TAG}}"
 export MAAS_CONTROLLER_IMAGE="${MAAS_CONTROLLER_IMAGE:-quay.io/opendatahub/maas-controller:${MAAS_IMAGE_TAG}}"

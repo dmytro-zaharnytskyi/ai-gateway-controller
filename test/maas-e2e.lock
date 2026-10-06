@@ -2,7 +2,8 @@
 #
 # Includes short subscription IDs in TRLP predicates (#1546) and cascade-deletion tests.
 #
-# Validate e2e when bumping this pin.
+# Validate e2e when bumping this pin, and update the default MAAS_IMAGE_TAG in
+# test/e2e/scripts/maas-image-defaults.sh to the same commit.
 # Override for one-off runs without editing this file:
 #   MAAS_COMMIT=<sha> ./test/e2e/scripts/prow_run_ai_gateway_controller_test.sh
 maas_repo=https://github.com/opendatahub-io/models-as-a-service

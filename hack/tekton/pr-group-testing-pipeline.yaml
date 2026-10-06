@@ -304,7 +304,7 @@ spec:
 
               # Do not force :latest — that strips payload-processing-type from
               # MaasTenantConfig (main mirror). Leave unset so prow's
-              # maas-image-defaults.sh pins odh-pr-1508 (keeps type annotation).
+              # maas-image-defaults.sh pins the test/maas-e2e.lock commit (keeps type annotation).
               unset MAAS_API_IMAGE MAAS_CONTROLLER_IMAGE 2>/dev/null || true
               echo "PRAXIS_EXTPROC_IMAGE=${PRAXIS_EXTPROC_IMAGE}"
 
