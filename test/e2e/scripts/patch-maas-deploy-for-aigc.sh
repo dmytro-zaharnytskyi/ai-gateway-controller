@@ -145,26 +145,3 @@ open(path, "w").write(text)
 PY
   echo "Patched ${DEPLOY_MODELS_SH} (MaaS AuthPolicy wait scope)"
 fi
-
-# MaaS #1594 split the dedicated-tenant tests into concurrent xdist groups. Each tenant also
-# gets its own Praxis stack under aigc, and the concurrent tenants' model routes stopped
-# becoming Ready in the group test, so run them in one group as before #1594.
-TENANT_GROUP_MARKER="ai-gateway-controller: run dedicated-tenant tests in one xdist group"
-for tenant_test in test_per_tenant_ipp_isolation.py test_tenant_model_inference.py; do
-  TENANT_TEST_PY="${MAAS_CHECKOUT_ROOT}/test/e2e/tests/${tenant_test}"
-  if [[ -f "${TENANT_TEST_PY}" ]] && ! grep -qF "${TENANT_GROUP_MARKER}" "${TENANT_TEST_PY}"; then
-    python3 - <<'PY' "${TENANT_TEST_PY}" "${TENANT_GROUP_MARKER}"
-import re
-import sys
-path, marker = sys.argv[1], sys.argv[2]
-text = open(path).read()
-pattern = re.compile(r'^pytestmark = pytest\.mark\.xdist_group\("(tenant_ipp|tenant_inference)"\)$', re.M)
-if not pattern.search(text):
-    print(f"WARN: {path}: split tenant xdist group not found; patch not applied", file=sys.stderr)
-    sys.exit(0)
-text = pattern.sub(f'# {marker}\npytestmark = pytest.mark.xdist_group("tenant_isolation")', text, count=1)
-open(path, "w").write(text)
-print(f"Patched {path} (xdist group tenant_isolation)")
-PY
-  fi
-done
