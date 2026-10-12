@@ -177,22 +177,6 @@ func newHTTPRoute() *unstructured.Unstructured {
 	return u
 }
 
-func splitList(value string) []string {
-	if value == "" {
-		return nil
-	}
-	return strings.Split(value, ",")
-}
-
-func appendMissingRequests(requests, more []reconcile.Request) []reconcile.Request {
-	for _, request := range more {
-		if !slices.Contains(requests, request) {
-			requests = append(requests, request)
-		}
-	}
-	return requests
-}
-
 // gatewayAttachedModels enqueues models attached to the AITenant's Gateway.
 func (r *Reconciler) gatewayAttachedModels(ctx context.Context, ait *unstructured.Unstructured) []reconcile.Request {
 	name, namespace, ok := tenant.GatewayRef(ait)
@@ -345,7 +329,7 @@ func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1
 	homeReported := false
 	if home >= 0 {
 		var err error
-		result, err = r.reconcileHomeModel(ctx, model, func(ready bool, reason, message string, env *envelope.Envelope) error {
+		result, err = r.reconcileHomeModel(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}, model, func(ready bool, reason, message string, env *envelope.Envelope) error {
 			homeReported = true
 			results[home] = attachmentResult{gateway: targets[home].result.gateway, ready: ready, reason: reason, message: message, routeName: modelRouteName(model.Name), env: env}
 			return nil
@@ -353,50 +337,37 @@ func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1
 		if err != nil {
 			errs = append(errs, err)
 		}
-	} else if err := r.leaveHomeTenant(ctx, model); err != nil {
-		errs = append(errs, err)
 	}
 
-	keep := map[string]bool{}
 	for i, target := range targets {
 		if i == home {
 			continue
 		}
+		// Unsupported attachments retain existing state and never fall back
+		// to another Gateway.
 		results[i] = target.result
 		if target.tenantNamespace == "" {
-			// Unsupported attachments retain existing state and never fall
-			// back to another Gateway.
-			keep[gatewayKey(target.result.gateway)] = true
 			continue
 		}
 		t, gated, cleanup, err := r.gateAttachmentTenant(ctx, target.ait, target.tenantNamespace, target.result)
 		results[i] = gated
-		if err != nil {
+		switch {
+		case err != nil:
 			errs = append(errs, err)
 			results[i] = failedAttachment(gated, err)
-			keep[gatewayKey(gated.gateway)] = true
-			continue
+		case cleanup:
+			// An explicit non-Praxis selection is the existing cleanup
+			// command: the tenant reconciler's switch-away cleanup removes
+			// the tenant's ExtProc, route filter and copies; this the route.
+			if err := r.removeAttachmentRoute(ctx, model, gated.gateway); err != nil {
+				errs = append(errs, err)
+			}
+		case gated.ready:
+			if results[i], err = r.reconcileAttachment(ctx, model, t); err != nil {
+				errs = append(errs, err)
+				results[i] = failedAttachment(results[i], err)
+			}
 		}
-		if cleanup {
-			// An explicit non-Praxis selection removes this attachment
-			// below; the tenant reconciler's switch-away cleanup removes
-			// the tenant's ExtProc, route filter and copies.
-			continue
-		}
-		keep[gatewayKey(gated.gateway)] = true
-		if !gated.ready {
-			continue
-		}
-		results[i], err = r.reconcileAttachment(ctx, model, t)
-		if err != nil {
-			errs = append(errs, err)
-			results[i] = failedAttachment(results[i], err)
-		}
-	}
-	if deleted, err := r.detachAttachments(ctx, model, func(key string) bool { return keep[key] }); err != nil {
-		errs = append(errs, err)
-	} else if err := r.cleanupAttachmentModelTransport(ctx, model.Namespace, deleted); err != nil {
-		errs = append(errs, err)
 	}
 
 	if home >= 0 && !homeReported {
@@ -485,30 +456,6 @@ func (r *Reconciler) setModelStatus(ctx context.Context, m *v1alpha1.ExternalMod
 	return nil
 }
 
-// leaveHomeTenant republishes the model's own tenant without it when its
-// gatewayRefs no longer name that tenant's Gateway. The home state is kept
-// until the tenant is steady, as for any other home republish.
-func (r *Reconciler) leaveHomeTenant(ctx context.Context, model *v1alpha1.ExternalModel) error {
-	if hasHome, err := r.hasHomeRoute(ctx, model); err != nil || !hasHome {
-		return err
-	}
-	live, err := r.liveTenantResolution(ctx, model.Namespace)
-	if err != nil {
-		return err
-	}
-	if live.missingConfig || !live.selected || live.aitenant == nil || live.status != tenant.PayloadProcessingStatusSteady ||
-		!live.mtc.GetDeletionTimestamp().IsZero() || !live.aitenant.GetDeletionTimestamp().IsZero() ||
-		!tenant.IsActive(live.aitenant) || !tenant.StatusIsCurrent(live.aitenant) {
-		return nil
-	}
-	gatewayName, gatewayNamespace, ok := tenant.GatewayRef(live.aitenant)
-	if !ok || tenant.ServedByTenantGateway(model, gatewayName, gatewayNamespace) {
-		// Still bound to its own tenant; the Gateway lookup was unresolved.
-		return nil
-	}
-	return r.republishHomeWithout(ctx, model, tenant.ID(live.aitenant.GetName()), gatewayName, gatewayNamespace)
-}
-
 // reconcileAttachment serves the model through a steady Praxis tenant of
 // another namespace.
 func (r *Reconciler) reconcileAttachment(ctx context.Context, model *v1alpha1.ExternalModel, t attachmentTenant) (attachmentResult, error) {
@@ -529,9 +476,6 @@ func (r *Reconciler) reconcileAttachment(ctx context.Context, model *v1alpha1.Ex
 		// model: no route, overlay entry or transport on this Gateway.
 		result.reason, result.message = self.reason, self.message
 		return result, r.excludeAttachment(ctx, model, t)
-	}
-	if err := r.addExternalModelFinalizer(ctx, model); err != nil {
-		return result, err
 	}
 	providers, _, validProviders, err := r.providerInputs(ctx, model.Namespace)
 	if err != nil {
@@ -557,11 +501,11 @@ func (r *Reconciler) reconcileAttachment(ctx context.Context, model *v1alpha1.Ex
 		}
 	}
 
-	accepted, reason, message, err := r.attachmentAccepted(ctx, model.Namespace, self.routeName, t.gateway)
+	route, err := r.getAttachmentRoute(ctx, model.Namespace, self.routeName)
 	if err != nil {
 		return result, err
 	}
-	if !accepted {
+	if accepted, reason, message := routeAccepted(route, t.gateway); !accepted {
 		result.reason, result.message = reason, message
 		result.pending = reason == reasonAttachmentPending
 		// A revoked acceptance withdraws the overlay entry, copies and
@@ -808,12 +752,9 @@ func (r *Reconciler) admitAttachments(ctx context.Context, t attachmentTenant, c
 		if candidate.reason != "" {
 			continue
 		}
-		route := newHTTPRoute()
-		if err := r.Get(ctx, client.ObjectKey{Namespace: candidate.model.Namespace, Name: candidate.routeName}, route); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			return nil, fmt.Errorf("get attachment HTTPRoute %s/%s: %w", candidate.model.Namespace, candidate.routeName, err)
+		route, err := r.getAttachmentRoute(ctx, candidate.model.Namespace, candidate.routeName)
+		if err != nil {
+			return nil, err
 		}
 		if accepted, _, _ := routeAccepted(route, t.gateway); !accepted {
 			continue
@@ -828,11 +769,11 @@ func (r *Reconciler) admitAttachments(ctx context.Context, t attachmentTenant, c
 		capacity -= len(candidate.routes)
 		candidate.ready = true
 		for _, copied := range candidate.copies {
-			ready, err := r.credentialCopyReady(ctx, t.namespace, copied)
+			_, owned, err := r.credentialCopyOwned(ctx, t.namespace, copied)
 			if err != nil {
 				return nil, err
 			}
-			candidate.ready = candidate.ready && ready
+			candidate.ready = candidate.ready && owned
 		}
 		admitted = append(admitted, candidate)
 	}
@@ -862,14 +803,6 @@ func excludedRoutes(attached []attachedModel) map[types.UID]bool {
 		}
 	}
 	return routes
-}
-
-func attachedRoutePatches(attached []attachedModel) []any {
-	var patches []any
-	for _, a := range servedAttachments(attached) {
-		patches = append(patches, routeFilterPatches(a.model.Namespace, a.routeName, len(a.routes)*2+2)...)
-	}
-	return patches
 }
 
 // publishTenantOverlay publishes the tenant's own route set followed by its
@@ -925,7 +858,7 @@ func (r *Reconciler) publishAttachmentTenant(ctx context.Context, t attachmentTe
 	if err != nil {
 		return nil, err
 	}
-	if err := r.writeExternalModelRouteFilter(ctx, t.tenantID, t.namespace, t.gateway.Name, t.gateway.Namespace, append(ownPatches, attachedRoutePatches(admitted)...)); err != nil {
+	if err := r.writeExternalModelRoutes(ctx, t.tenantID, t.namespace, t.gateway.Name, t.gateway.Namespace, nil, ownPatches, admitted); err != nil {
 		return nil, err
 	}
 	if len(preserved) == 0 && len(servedAttachments(admitted)) == 0 {
@@ -1032,8 +965,10 @@ func (r *Reconciler) applyAttachmentRoute(ctx context.Context, a attachedModel, 
 		annotationAttachmentCredentials: strings.Join(copies, ","),
 	})
 	setOwnerReference(&route, m)
-	if err := r.verifyAttachmentRoute(ctx, m, a.routeName, t.gateway); err != nil {
+	if existing, err := r.getAttachmentRoute(ctx, m.Namespace, a.routeName); err != nil {
 		return err
+	} else if existing != nil && !isAttachmentRoute(existing, m, t.gateway) {
+		return fmt.Errorf("HTTPRoute %s/%s exists with a different identity; refusing to adopt it", m.Namespace, a.routeName)
 	}
 	return r.applyResources(ctx, append(resources, sink, route))
 }
@@ -1053,37 +988,32 @@ func (r *Reconciler) applyResources(ctx context.Context, resources []unstructure
 	return nil
 }
 
-// verifyAttachmentRoute refuses to adopt an existing HTTPRoute at a hashed
-// name unless its identity annotations name this model and Gateway.
-func (r *Reconciler) verifyAttachmentRoute(ctx context.Context, model *v1alpha1.ExternalModel, name string, gateway v1alpha1.NamespacedObjectReference) error {
-	existing := newHTTPRoute()
-	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: name}, existing); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	annotations := existing.GetAnnotations()
-	if annotations[annotationAttachmentModel] != model.Name || annotations[annotationAttachmentGateway] != gatewayKey(gateway) {
-		return fmt.Errorf("HTTPRoute %s/%s exists with a different identity; refusing to adopt it", model.Namespace, name)
-	}
-	return nil
-}
-
-// attachmentAccepted reads the route's parent status for the Gateway. The
-// Gateway enforces listener allowedRoutes; its Accepted=False reason is
-// reported unchanged.
-func (r *Reconciler) attachmentAccepted(ctx context.Context, namespace, name string, gateway v1alpha1.NamespacedObjectReference) (bool, string, string, error) {
+// getAttachmentRoute returns the HTTPRoute at an attachment route name, or nil.
+func (r *Reconciler) getAttachmentRoute(ctx context.Context, namespace, name string) (*unstructured.Unstructured, error) {
 	route := newHTTPRoute()
 	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, route); err != nil {
 		if apierrors.IsNotFound(err) {
-			return false, reasonAttachmentPending, "waiting for the attachment HTTPRoute", nil
+			return nil, nil
 		}
-		return false, reasonAttachmentPending, "", fmt.Errorf("get attachment HTTPRoute %s/%s: %w", namespace, name, err)
+		return nil, fmt.Errorf("get attachment HTTPRoute %s/%s: %w", namespace, name, err)
 	}
-	accepted, reason, message := routeAccepted(route, gateway)
-	return accepted, reason, message, nil
+	return route, nil
 }
 
-// routeAccepted reads the route's parent status for the Gateway.
+// isAttachmentRoute verifies a hashed route name against its identity
+// annotations before AGC adopts or deletes the route.
+func isAttachmentRoute(route *unstructured.Unstructured, model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference) bool {
+	annotations := route.GetAnnotations()
+	return annotations[annotationAttachmentModel] == model.Name && annotations[annotationAttachmentGateway] == gatewayKey(gateway)
+}
+
+// routeAccepted reads the route's parent status for the Gateway. The Gateway
+// enforces listener allowedRoutes; its Accepted=False reason is reported
+// unchanged.
 func routeAccepted(route *unstructured.Unstructured, gateway v1alpha1.NamespacedObjectReference) (bool, string, string) {
+	if route == nil {
+		return false, reasonAttachmentPending, "waiting for the attachment HTTPRoute"
+	}
 	namespace := route.GetNamespace()
 	parents, _, _ := unstructured.NestedSlice(route.Object, "status", "parents")
 	reason, message := reasonAttachmentPending, "waiting for the Gateway to accept the attachment HTTPRoute"
@@ -1162,8 +1092,10 @@ func (r *Reconciler) applyCredentialCopies(ctx context.Context, a attachedModel,
 	}
 	copies := make([]unstructured.Unstructured, 0, len(a.copies))
 	for _, copied := range a.copies {
-		if err := r.verifyCredentialCopy(ctx, t.namespace, copied); err != nil {
+		if exists, owned, err := r.credentialCopyOwned(ctx, t.namespace, copied); err != nil {
 			return err
+		} else if exists && !owned {
+			return fmt.Errorf("credential copy Secret %s/%s exists with a different identity; refusing to adopt it", t.namespace, copied.name)
 		}
 		var source corev1.Secret
 		if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: copied.sourceNamespace, Name: copied.sourceName}, &source); err != nil {
@@ -1190,41 +1122,20 @@ func (r *Reconciler) applyCredentialCopies(ctx context.Context, a attachedModel,
 	return r.applyResources(ctx, copies)
 }
 
-func credentialCopyMetadata() *metav1.PartialObjectMetadata {
-	m := &metav1.PartialObjectMetadata{}
-	m.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
-	return m
-}
-
-// verifyCredentialCopy refuses to adopt an existing Secret at a copy name
-// unless it is the controller-owned copy of the same source.
-func (r *Reconciler) verifyCredentialCopy(ctx context.Context, namespace string, copied credentialCopy) error {
-	existing := credentialCopyMetadata()
-	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: copied.name}, existing); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	if !isCredentialCopyOf(existing, copied) {
-		return fmt.Errorf("credential copy Secret %s/%s exists with a different identity; refusing to adopt it", namespace, copied.name)
-	}
-	return nil
-}
-
-func isCredentialCopyOf(secret *metav1.PartialObjectMetadata, copied credentialCopy) bool {
-	return secret.GetLabels()[tenant.LabelCredentialCopy] == "true" &&
-		secret.GetAnnotations()[annotationCredentialSource] == copied.source()
-}
-
-// credentialCopyReady reports whether the controller-owned copy exists.
-// Secret metadata is read from the metadata-only cache.
-func (r *Reconciler) credentialCopyReady(ctx context.Context, namespace string, copied credentialCopy) (bool, error) {
-	existing := credentialCopyMetadata()
+// credentialCopyOwned reports whether a Secret exists at the copy name and
+// whether it is the controller-owned copy of the same source. Secret metadata
+// is read from the metadata-only cache.
+func (r *Reconciler) credentialCopyOwned(ctx context.Context, namespace string, copied credentialCopy) (bool, bool, error) {
+	existing := &metav1.PartialObjectMetadata{}
+	existing.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
 	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: copied.name}, existing); err != nil {
 		if apierrors.IsNotFound(err) {
-			return false, nil
+			return false, false, nil
 		}
-		return false, fmt.Errorf("get credential copy %s/%s: %w", namespace, copied.name, err)
+		return false, false, fmt.Errorf("get credential copy %s/%s: %w", namespace, copied.name, err)
 	}
-	return isCredentialCopyOf(existing, copied), nil
+	return true, existing.GetLabels()[tenant.LabelCredentialCopy] == "true" &&
+		existing.GetAnnotations()[annotationCredentialSource] == copied.source(), nil
 }
 
 // listAttachmentRoutes lists controller-owned attachment HTTPRoutes.
@@ -1239,49 +1150,24 @@ func (r *Reconciler) listAttachmentRoutes(ctx context.Context, opts ...client.Li
 }
 
 // removeAttachmentRoute deletes the model's identity-verified HTTPRoute for
-// one Gateway and the tenant state no remaining attachment references.
+// one Gateway, then the tenant's DestinationRules and credential copies no
+// remaining attachment references.
 func (r *Reconciler) removeAttachmentRoute(ctx context.Context, model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference) error {
-	_, err := r.detachAttachments(ctx, model, func(key string) bool { return key != gatewayKey(gateway) })
-	return err
-}
-
-// detachAttachments deletes the model's attachment HTTPRoutes whose Gateway
-// is not kept (nil keeps none), then removes the credential copies and
-// DestinationRules no remaining attachment of those tenants references. The
-// tenant overlay is not rebuilt: its next steady publish drops the inert
-// entries, which no route reaches.
-// It returns the deleted routes, which the informer cache may still list.
-func (r *Reconciler) detachAttachments(ctx context.Context, model *v1alpha1.ExternalModel, keep func(gatewayKey string) bool) (map[types.UID]bool, error) {
-	routes, err := r.listAttachmentRoutes(ctx, client.InNamespace(model.Namespace))
-	if err != nil {
-		return nil, err
+	route, err := r.getAttachmentRoute(ctx, model.Namespace, attachmentRouteName(model, gateway))
+	if err != nil || route == nil || !isAttachmentRoute(route, model, gateway) {
+		return err
 	}
-	deleted := map[types.UID]bool{}
-	tenants := map[string]bool{}
-	for i := range routes {
-		route := &routes[i]
-		annotations := route.GetAnnotations()
-		if annotations[annotationAttachmentModel] != model.Name || (keep != nil && keep(annotations[annotationAttachmentGateway])) {
-			continue
-		}
-		if err := client.IgnoreNotFound(r.Delete(ctx, route)); err != nil {
-			return nil, fmt.Errorf("delete attachment HTTPRoute %s/%s: %w", route.GetNamespace(), route.GetName(), err)
-		}
-		deleted[route.GetUID()] = true
-		tenants[route.GetLabels()[tenant.LabelAttachmentTenant]] = true
+	if err := client.IgnoreNotFound(r.Delete(ctx, route)); err != nil {
+		return fmt.Errorf("delete attachment HTTPRoute %s/%s: %w", route.GetNamespace(), route.GetName(), err)
 	}
-	for tenantNamespace := range tenants {
-		if err := r.gcAttachmentState(ctx, tenantNamespace, deleted); err != nil {
-			return nil, err
-		}
-	}
-	return deleted, nil
+	// The informer cache may still list the deleted route.
+	return r.gcAttachmentState(ctx, route.GetLabels()[tenant.LabelAttachmentTenant], map[types.UID]bool{route.GetUID(): true})
 }
 
 // gcAttachmentState deletes the tenant's attachment DestinationRules and
 // credential copies that no accepted attachment HTTPRoute references, other
 // than the given routes: just deleted, or excluded by the overlay capacity.
-func (r *Reconciler) gcAttachmentState(ctx context.Context, tenantNamespace string, deleted map[types.UID]bool) error {
+func (r *Reconciler) gcAttachmentState(ctx context.Context, tenantNamespace string, withdrawn map[types.UID]bool) error {
 	routes, err := r.listAttachmentRoutes(ctx, client.MatchingLabels{tenant.LabelAttachmentTenant: tenantNamespace})
 	if err != nil {
 		return err
@@ -1291,13 +1177,13 @@ func (r *Reconciler) gcAttachmentState(ctx context.Context, tenantNamespace stri
 		annotations := routes[i].GetAnnotations()
 		gatewayNamespace, gatewayName, _ := strings.Cut(annotations[annotationAttachmentGateway], "/")
 		accepted, _, _ := routeAccepted(&routes[i], v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace})
-		if deleted[routes[i].GetUID()] || !accepted {
+		if withdrawn[routes[i].GetUID()] || !accepted {
 			continue
 		}
-		for _, name := range splitList(annotations[annotationAttachmentRules]) {
+		for _, name := range strings.Split(annotations[annotationAttachmentRules], ",") {
 			keepRules[name] = true
 		}
-		for _, name := range splitList(annotations[annotationAttachmentCredentials]) {
+		for _, name := range strings.Split(annotations[annotationAttachmentCredentials], ",") {
 			keepCopies[name] = true
 		}
 	}
@@ -1335,135 +1221,20 @@ func (r *Reconciler) gcAttachmentState(ctx context.Context, tenantNamespace stri
 
 // attachmentTransportKeep returns the providers and models whose
 // model-namespace transport the namespace's attachment HTTPRoutes use.
-func (r *Reconciler) attachmentTransportKeep(ctx context.Context, namespace string, deleted map[types.UID]bool) (map[string]bool, map[string]bool, error) {
+func (r *Reconciler) attachmentTransportKeep(ctx context.Context, namespace string) (map[string]bool, map[string]bool, error) {
 	routes, err := r.listAttachmentRoutes(ctx, client.InNamespace(namespace))
 	if err != nil {
 		return nil, nil, err
 	}
 	providers, models := map[string]bool{}, map[string]bool{}
 	for i := range routes {
-		if deleted[routes[i].GetUID()] {
-			continue
-		}
 		annotations := routes[i].GetAnnotations()
 		models[annotations[annotationAttachmentModel]] = true
-		for _, provider := range splitList(annotations[annotationAttachmentProviders]) {
+		for _, provider := range strings.Split(annotations[annotationAttachmentProviders], ",") {
 			providers[provider] = true
 		}
 	}
 	return providers, models, nil
-}
-
-// cleanupAttachmentModelTransport removes model-namespace transport that no
-// attachment uses. In a tenant namespace, or one still holding tenant-local
-// routes, the existing path owns that transport.
-func (r *Reconciler) cleanupAttachmentModelTransport(ctx context.Context, namespace string, deleted map[types.UID]bool) error {
-	if tenantNamespace, err := r.isTenantNamespace(ctx, namespace); err != nil || tenantNamespace {
-		return err
-	}
-	homeRoutes := &unstructured.UnstructuredList{}
-	homeRoutes.SetGroupVersionKind(httpRouteGVK.GroupVersion().WithKind("HTTPRouteList"))
-	if err := r.List(ctx, homeRoutes, client.InNamespace(namespace), client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller"},
-		client.HasLabels{"inference.opendatahub.io/external-model"}); err != nil {
-		return fmt.Errorf("list tenant-local HTTPRoutes in %s: %w", namespace, err)
-	}
-	if len(homeRoutes.Items) > 0 {
-		return nil
-	}
-	providers, models, err := r.attachmentTransportKeep(ctx, namespace, deleted)
-	if err != nil {
-		return err
-	}
-	for _, resource := range []struct {
-		gvk   schema.GroupVersionKind
-		label string
-		keep  map[string]bool
-	}{
-		{schema.GroupVersionKind{Version: "v1", Kind: "ServiceList"}, "inference.opendatahub.io/external-provider", providers},
-		{schema.GroupVersionKind{Version: "v1", Kind: "ServiceList"}, "inference.opendatahub.io/external-model", models},
-		{schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "ServiceEntryList"}, "inference.opendatahub.io/external-provider", providers},
-	} {
-		list := &unstructured.UnstructuredList{}
-		list.SetGroupVersionKind(resource.gvk)
-		if err := r.List(ctx, list, client.InNamespace(namespace), client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller"},
-			client.HasLabels{resource.label}); err != nil {
-			return fmt.Errorf("list attachment transport in %s: %w", namespace, err)
-		}
-		for i := range list.Items {
-			if resource.keep[list.Items[i].GetLabels()[resource.label]] {
-				continue
-			}
-			if err := client.IgnoreNotFound(r.Delete(ctx, &list.Items[i])); err != nil {
-				return fmt.Errorf("delete attachment transport %s/%s: %w", namespace, list.Items[i].GetName(), err)
-			}
-		}
-	}
-	return nil
-}
-
-// reconcileDeletingAttachedModel deletes the model's extra attachments, then
-// runs the existing deletion path when the model still has home state.
-func (r *Reconciler) reconcileDeletingAttachedModel(ctx context.Context, model *v1alpha1.ExternalModel) error {
-	if err := r.releaseAttachments(ctx, model); err != nil {
-		return err
-	}
-	hasHome, err := r.hasHomeRoute(ctx, model)
-	if err != nil {
-		return err
-	}
-	if hasHome {
-		return r.reconcileDeletingModel(ctx, model)
-	}
-	return r.removeExternalModelFinalizer(ctx, model)
-}
-
-// releaseAttachments deletes every extra attachment of the model and the
-// model-namespace transport no remaining attachment uses.
-func (r *Reconciler) releaseAttachments(ctx context.Context, model *v1alpha1.ExternalModel) error {
-	deleted, err := r.detachAttachments(ctx, model, nil)
-	if err != nil {
-		return err
-	}
-	return r.cleanupAttachmentModelTransport(ctx, model.Namespace, deleted)
-}
-
-// releaseRemovedAttachments handles a model whose gatewayRefs were removed
-// entirely: its extra attachments are deleted, and outside a tenant namespace
-// the finalizer that only guarded them is released.
-func (r *Reconciler) releaseRemovedAttachments(ctx context.Context, model *v1alpha1.ExternalModel) error {
-	if hasAttachments, err := r.hasAttachmentRoutes(ctx, model); err != nil || !hasAttachments {
-		return err
-	}
-	if err := r.releaseAttachments(ctx, model); err != nil {
-		return err
-	}
-	tenantNamespace, err := r.isTenantNamespace(ctx, model.Namespace)
-	if err != nil || tenantNamespace {
-		return err
-	}
-	if hasHome, err := r.hasHomeRoute(ctx, model); err != nil || hasHome {
-		return err
-	}
-	return r.removeExternalModelFinalizer(ctx, model)
-}
-
-// hasAttachmentRoutes reports whether the model has extra attachment routes.
-func (r *Reconciler) hasAttachmentRoutes(ctx context.Context, model *v1alpha1.ExternalModel) (bool, error) {
-	routes, err := r.listAttachmentRoutes(ctx, client.InNamespace(model.Namespace))
-	if err != nil {
-		return false, err
-	}
-	return slices.ContainsFunc(routes, func(route unstructured.Unstructured) bool {
-		return route.GetAnnotations()[annotationAttachmentModel] == model.Name
-	}), nil
-}
-
-func (r *Reconciler) hasHomeRoute(ctx context.Context, model *v1alpha1.ExternalModel) (bool, error) {
-	route := newHTTPRoute()
-	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: modelRouteName(model.Name)}, route); err != nil {
-		return false, client.IgnoreNotFound(err)
-	}
-	return route.GetLabels()["inference.opendatahub.io/external-model"] == model.Name, nil
 }
 
 func (r *Reconciler) isTenantNamespace(ctx context.Context, namespace string) (bool, error) {

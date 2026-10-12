@@ -260,130 +260,73 @@ doc comment for the full state machine this mirrors. In short:
 
 `spec.gatewayRefs` ([RHOAIENG-90801](https://redhat.atlassian.net/browse/RHOAIENG-90801))
 serves a model through explicitly selected tenant Gateways, including models in
-user namespaces and models shared by several tenants. The contract is the
-RHOAIENG-90800 compatibility one pager; this section records how it is
-implemented (`pkg/controller/attachment.go`).
+user namespaces and models shared by several tenants
+(`pkg/controller/attachment.go`). The contract is the RHOAIENG-90800
+compatibility one pager; this records how it is implemented.
 
-**Home attachment.** A model is served by its own tenant (the tenant whose
-`MaasTenantConfig` is in the model namespace) when `gatewayRefs` is omitted or
-names that tenant's Gateway. That path is the existing tenant-local path with
-unchanged resources, identifiers, labels, overlay content and deletion. A
-model without `gatewayRefs` in a namespace that has no `MaasTenantConfig` and
-was never served there gets no serving state: phase `Pending`, `Ready=False`,
-reason `TenantNotResolved`. A tenant-namespace model whose `gatewayRefs` no
-longer name its own tenant is removed from the tenant-local set; the tenant
-republishes without it once steady. An explicit binding never falls back to
-another Gateway.
-
-**Per-attachment resolution and gating.** Every other reference is an extra
-attachment, resolved Gateway → owning `AITenant` (reverse lookup on
-`status.gatewayRef`) → that tenant's `MaasTenantConfig`. No owner reports
-`GatewayNotManaged`, several `AmbiguousTenant`. The existing backend handshake
-gate then applies to that tenant alone: it must select Praxis and be `steady`
-with an Active, current `AITenant` (otherwise `TenantNotSteady`, retaining the
-attachment's existing state, including when the `MaasTenantConfig` is
-temporarily missing). An explicit non-Praxis selection (`TenantNotPraxis`) is
-the existing cleanup command: the attachment is removed. One attachment's
-result never blocks another. Status reports the first failing attachment in
-`gatewayRefs` order as a top-level `Ready=False` reason; per-Gateway status is
-[RHOAIENG-90802](https://redhat.atlassian.net/browse/RHOAIENG-90802).
-
-**Gateway-attachment authorization.** The attachment's HTTPRoute is created in
-the model namespace first. The Gateway enforces its listener `allowedRoutes`;
-AGC does not re-implement it and needs no Gateway or Namespace access. Only
-after the route's parent status for that Gateway is `Accepted=True` are the
-DestinationRule, credential copies and overlay entries published.
-`Accepted=False` reports the Gateway's reason (for example
-`NotAllowedByListeners`); no parent status yet reports `AttachmentPending`. A
-later loss of acceptance withdraws the attachment's overlay entry, credential
-copies and DestinationRules.
-Default MaaS Gateways use `allowedRoutes.from: Same`, so serving user-namespace
-models requires an administrator-configured namespace selector.
-
-**Identifiers.** Extra attachments always have a model outside the tenant
-namespace, so they use only the new, disjoint forms:
-
-| Output | Extra attachment form |
-| --- | --- |
-| HTTPRoute (model namespace) | `external-model-<model>-<hash12>`, `external-model-<hash12>` above 253 characters |
-| Gateway-namespace DestinationRule | `provider-<provider>-<hash12>`, at most 63 characters, with the existing ownership labels plus `inference.opendatahub.io/attachment-tenant` |
-| Overlay `stable_id` | `<modelNamespace>/<model>/<providerNamespace>/<provider>`, or `sha256:<hex>` over the length-prefixed fields above 256 bytes |
-| Credential copy (tenant namespace) | `agc-cred-<hash12>` |
-
-Provider Services, ServiceEntries and the selection sink in the model
-namespace keep their existing names (`provider-<provider>`): providers are
-model-local until cross-namespace references are authorized
-([RHOAIENG-90804](https://redhat.atlassian.net/browse/RHOAIENG-90804)), so the
-overlay cluster also stays `provider-<provider>`. Hashed objects carry identity
-annotations and are verified before AGC adopts them; a collision is an error,
-never an overwrite. Attachment HTTPRoutes carry no
-`inference.opendatahub.io/external-model` label and attachment DestinationRules
-are skipped by tenant-local cleanup, so the two paths never delete each other's
-objects; tenant-local cleanup keeps the model-namespace transport that the
-namespace's attachment routes use.
-
-**Tenant overlay and route filter.** Each tenant still has one overlay and one
-route EnvoyFilter. The tenant-local path publishes its own candidates and route
-patches followed by the admitted attachments. An attachment republishes only
-the attachments: it preserves the tenant's own published candidates (existing
-`stable_id` form) and own route patches (route names in the tenant namespace)
-verbatim, so attachments never change or block the tenant's own serving.
-Attachments are admitted per model, oldest first: resolution or credential
-failures, more than 7 distinct providers (`TooManyProviders`; HTTPRoutes allow
-16 rules, AGC uses two per provider plus two) and the 1024-candidate Praxis
-overlay limit after the tenant's own candidates (`OverlayCapacityExceeded`)
-exclude only that model. Model-name conflicts apply across namespaces only:
-the tenant's own models keep their client-facing name, otherwise the oldest
-model (`creationTimestamp`, then `namespace/name`) wins and the loser gets no
-route, overlay entry or transport on that Gateway (`ModelNameConflict`, naming
-the winner). An excluded model is withdrawn when it is reconciled: the tenant
-republishes without it and its DestinationRules and credential copies are
-deleted. A failing or conflicting model also loses its HTTPRoute; a model over
-the overlay capacity keeps its accepted route, and so its place in admission
-order. Capacity is decided, and the handoff re-checked live, before anything
-is written into the tenant. A failed API read is retried rather than treated
-as the model's failure, so it never withdraws a served attachment. The tenant reconciler adds the attachments' overlay candidates to
-the external-model ExtProc configuration and mounts their credential copies;
-as before, a configuration change restarts that Deployment.
-
-**Credential copies.** A credential Secret in the tenant namespace is mounted
-directly, as before. A Secret elsewhere (a provider outside the tenant
-namespace, or a model-local override in a user namespace) is copied, referenced
-key only, into a controller-owned `agc-cred-<hash12>` Secret in the tenant
-namespace after route acceptance; the overlay candidate references the copy so
-the existing mount and path logic is unchanged. Copies follow the source on
-each reconcile (Secret events fan out to referencing models): a deleted source,
-or one missing the key, excludes the model and deletes its copy. Copies are
-also deleted once no attachment HTTPRoute of that tenant references them, or
-on tenant teardown/switch-away. This is the only departure from the reference-only
-credential model. It is exposure, not isolation: a copied credential is
-readable by anyone who can read Secrets or create pods in the tenant
-namespace, the same tier as tenant-local provider credentials; MaaS's
-tenant-admin Role grants no Secret access. Writing copies requires the Secret
-create/patch/delete permission from
-[RHOAIENG-90808](https://redhat.atlassian.net/browse/RHOAIENG-90808).
-
-**Per-attachment deletion.** Removing a reference (or all of them, which
-restores tenant-local resolution) or deleting the model deletes only that attachment's identity-verified HTTPRoute, then the tenant's
-DestinationRules and credential copies no remaining attachment route
-references, and, outside tenant namespaces, model-namespace transport no
-attachment uses. It never rebuilds shared tenant state and needs no deletion
-timeout: the tenant's next steady publish drops the inert overlay entries (no
-route reaches them, and the ExtProc skips candidates whose copy is gone), and
-the tenant's cleanup finalizer removes copies and attachment DestinationRules
-on teardown or switch-away. The tenant reconciler keeps the route EnvoyFilter
-while attachment routes target the tenant, since attachment patches can be
-written before it observes them in the overlay. The home attachment keeps the
-existing deletion logic.
-
-**Ownership.** Attachments reuse the backend handshake above per tenant: one
-active external-model controller owns a tenant, and AGC publishes into a
-tenant only while it is the selected, `steady` backend. Legacy IPP exclusion of
-new-shaped objects is
-[RHOAIENG-99761](https://redhat.atlassian.net/browse/RHOAIENG-99761). AGC
-writes the status of providers used by an attachment, as it does for
-tenant-local providers. A single-namespace controller (`--namespace`) serves no
-attachments from other namespaces.
+- **Home attachment.** The tenant whose `MaasTenantConfig` is in the model
+  namespace serves the model when `gatewayRefs` is omitted or names its
+  Gateway, through the existing tenant-local path with unchanged resources,
+  identifiers and deletion. A model without `gatewayRefs` in a namespace with no
+  `MaasTenantConfig` gets no serving state (`Pending`, `TenantNotResolved`). An
+  explicit binding never falls back to another Gateway.
+- **Extra attachments** resolve Gateway → owning `AITenant`
+  (`status.gatewayRef`) → its `MaasTenantConfig` (`GatewayNotManaged`,
+  `AmbiguousTenant`) and are gated per tenant by the handshake above: Praxis and
+  `steady`, otherwise `TenantNotSteady` (existing state retained) or
+  `TenantNotPraxis` (a cleanup request: the attachment's route is removed).
+  Status reports the first failing attachment in `gatewayRefs` order; per-Gateway
+  status is [RHOAIENG-90802](https://redhat.atlassian.net/browse/RHOAIENG-90802).
+- **Authorization.** The attachment's HTTPRoute is created in the model
+  namespace first and the Gateway enforces its listener `allowedRoutes`.
+  DestinationRules, credential copies and overlay entries are published only
+  after the route's parent status for that Gateway is `Accepted=True`, and are
+  withdrawn if acceptance is lost; `Accepted=False` reports the Gateway's reason.
+  Default MaaS Gateways use `allowedRoutes.from: Same`, so user-namespace models
+  need an administrator-configured namespace selector.
+- **Identifiers.** Extra attachments use only new, disjoint forms: HTTPRoute
+  `external-model-<model>-<hash12>`, Gateway DestinationRule
+  `provider-<provider>-<hash12>` (labelled
+  `inference.opendatahub.io/attachment-tenant`), `stable_id`
+  `<modelNamespace>/<model>/<providerNamespace>/<provider>` (`sha256:` above 256
+  bytes) and credential copy `agc-cred-<hash12>`. Hashed objects carry identity
+  annotations and are never adopted or deleted when they do not match.
+  Model-namespace provider Services keep `provider-<provider>`, since providers
+  stay model-local until
+  [RHOAIENG-90804](https://redhat.atlassian.net/browse/RHOAIENG-90804).
+  Tenant-local cleanup skips attachment DestinationRules and keeps the
+  transport attachment routes use.
+- **Publication.** Each tenant keeps one overlay and one route EnvoyFilter. The
+  tenant-local path publishes its own candidates and routes, then the admitted
+  attachments; an attachment republishes the attachments and preserves the
+  tenant's own published candidates and route patches verbatim. Both rely on
+  ExternalModel reconciles running one at a time. Attachments are admitted per
+  model, oldest first. A model-name conflict (across namespaces only: the
+  tenant's own models win, then the oldest), a resolution or credential failure
+  or more than 7 providers (`TooManyProviders`) excludes the model: it loses its
+  route, overlay entry, DestinationRules and copies. Over the 1024-candidate
+  overlay limit (`OverlayCapacityExceeded`) a model keeps its accepted route but
+  nothing else. Capacity is decided, and the handoff re-checked live, before
+  anything is written into the tenant; a failed API read is retried, never
+  treated as the model's failure.
+- **Credential copies.** Secrets in the tenant namespace are mounted directly,
+  as before. Others (a provider or model override outside the tenant
+  namespace) are copied, referenced key only, into the tenant namespace after
+  route acceptance; the candidate references the copy, so the ExtProc mount
+  logic is unchanged. Copies follow their source (a deleted source excludes the
+  model) and are deleted when no accepted attachment route references them, and
+  on tenant teardown or switch-away. This is the only departure from the
+  reference-only credential model and it is exposure, not isolation: a copy is
+  readable by anyone who can read Secrets or create pods in the tenant
+  namespace, the same tier as tenant-local credentials. Writing copies needs the
+  Secret permission from
+  [RHOAIENG-90808](https://redhat.atlassian.net/browse/RHOAIENG-90808).
+- **Lifecycle.** Cleanup after removing a `gatewayRef` or deleting a model with
+  extra attachments is RHOAIENG-90802. Until then a removed `gatewayRef` leaves
+  its attachment in place, and a deleted model's DestinationRules and copies
+  remain until the tenant's next attachment reconcile or teardown. Deleting the
+  tenant's last own model keeps its attachments published. A single-namespace
+  controller (`--namespace`) serves no attachments from other namespaces.
 
 ## Scope
 

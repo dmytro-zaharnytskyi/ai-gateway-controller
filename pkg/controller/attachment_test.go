@@ -251,41 +251,6 @@ func TestUserNamespaceModelServedOnlyAfterRouteAcceptance(t *testing.T) {
 	}
 }
 
-func TestAttachmentDeletionRemovesOnlyItsOwnObjects(t *testing.T) {
-	provider, secret := attachmentProvider("team")
-	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
-	objects := append([]client.Object{provider, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
-	r := attachmentReconciler(t, objects...)
-	reconcileModel(t, r, model)
-	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
-	reconcileModel(t, r, model)
-	if !strings.Contains(strings.Join(getModel(t, r, model).Finalizers, ","), externalModelFinalizer) {
-		t.Fatal("served attachment must hold the cleanup finalizer")
-	}
-
-	if err := r.Delete(context.Background(), getModel(t, r, model)); err != nil {
-		t.Fatal(err)
-	}
-	reconcileModel(t, r, model)
-	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB)); !apierrors.IsNotFound(err) {
-		t.Fatalf("attachment HTTPRoute survived deletion: %v", err)
-	}
-	if _, err := getUnstructured(r, destinationRuleGVK, "gateway-b", attachmentDestinationRuleName(gatewayB, "team", "openai")); !apierrors.IsNotFound(err) {
-		t.Fatalf("attachment DestinationRule survived deletion: %v", err)
-	}
-	var copied corev1.Secret
-	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key")}, &copied); !apierrors.IsNotFound(err) {
-		t.Fatalf("credential copy survived deletion: %v", err)
-	}
-	if _, err := getUnstructured(r, schema.GroupVersionKind{Version: "v1", Kind: "Service"}, "team", "provider-openai"); !apierrors.IsNotFound(err) {
-		t.Fatalf("unreferenced user-namespace provider Service survived deletion: %v", err)
-	}
-	var gone v1alpha1.ExternalModel
-	if err := r.Get(context.Background(), client.ObjectKeyFromObject(model), &gone); !apierrors.IsNotFound(err) {
-		t.Fatalf("model finalizer was not released: %v", err)
-	}
-}
-
 func TestSharedModelAttachesToTenantsInIsolation(t *testing.T) {
 	provider, secret := attachmentProvider("team")
 	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB, gatewayC)
@@ -327,22 +292,6 @@ func TestSharedModelAttachesToTenantsInIsolation(t *testing.T) {
 	got := getModel(t, r, model)
 	if got.Status.Phase != resolver.PhaseReady || got.Status.HTTPRouteName != "" {
 		t.Fatalf("multi-attachment status = %q httpRouteName=%q, want Ready and empty", got.Status.Phase, got.Status.HTTPRouteName)
-	}
-
-	// Removing one gatewayRef deletes only that attachment.
-	got.Spec.GatewayRefs = []v1alpha1.NamespacedObjectReference{gatewayB}
-	if err := r.Update(context.Background(), got); err != nil {
-		t.Fatal(err)
-	}
-	reconcileModel(t, r, model)
-	if _, err := getUnstructured(r, httpRouteGVK, "team", routeC); !apierrors.IsNotFound(err) {
-		t.Fatalf("detached route survived: %v", err)
-	}
-	if _, err := getUnstructured(r, destinationRuleGVK, "gateway-c", attachmentDestinationRuleName(gatewayC, "team", "openai")); !apierrors.IsNotFound(err) {
-		t.Fatalf("detached DestinationRule survived: %v", err)
-	}
-	if _, err := getUnstructured(r, httpRouteGVK, "team", routeB); err != nil {
-		t.Fatalf("remaining attachment route removed: %v", err)
 	}
 }
 
@@ -604,34 +553,12 @@ func assertAttachmentWithdrawn(t *testing.T, r *Reconciler) {
 	}
 }
 
-func TestRemovingAllGatewayRefsReleasesAttachments(t *testing.T) {
-	r, model := servedAttachmentFixture(t)
-	got := getModel(t, r, model)
-	got.Spec.GatewayRefs = nil
-	if err := r.Update(context.Background(), got); err != nil {
-		t.Fatal(err)
-	}
-	reconcileModel(t, r, model)
-	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB)); !apierrors.IsNotFound(err) {
-		t.Fatalf("attachment route remains after removing gatewayRefs: %v", err)
-	}
-	assertAttachmentWithdrawn(t, r)
-	reconcileModel(t, r, model)
-	got = getModel(t, r, model)
-	if len(got.Finalizers) != 0 || readyReason(got) != reasonTenantNotResolved {
-		t.Fatalf("finalizers=%v reason=%q, want released and %q", got.Finalizers, readyReason(got), reasonTenantNotResolved)
-	}
-}
-
 func TestRevokedAcceptanceWithdrawsAttachment(t *testing.T) {
 	r, model := servedAttachmentFixture(t)
 	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionFalse, "NotAllowedByListeners")
 	reconcileModel(t, r, model)
 	assertAttachmentWithdrawn(t, r)
-	var overlay corev1.ConfigMap
-	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
-		t.Fatalf("overlay entry remains after revocation: %v", err)
-	}
+	assertNoTenantOverlay(t, r)
 	if got := getModel(t, r, model); readyReason(got) != "NotAllowedByListeners" {
 		t.Fatalf("reason = %q", readyReason(got))
 	}
