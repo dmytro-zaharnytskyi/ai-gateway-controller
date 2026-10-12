@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -106,6 +107,11 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels), builder.WithPredicates(inScope)).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewMaasTenantConfig(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.maasTenantConfigModels))).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewAITenant(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.tenantModels))).
+		// Gateway attachments: route acceptance is reported in HTTPRoute
+		// status, and a model-name change can decide a conflict on another
+		// namespace's attachment.
+		WatchesRawSource(source.Kind(mgr.GetCache(), newHTTPRoute(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.attachmentRouteModels))).
+		Watches(&v1alpha1.ExternalModel{}, handler.EnqueueRequestsFromMapFunc(r.sameNameModels), builder.WithPredicates(inScope)).
 		Complete(r)
 }
 
@@ -131,7 +137,22 @@ func (r *Reconciler) secretModels(ctx context.Context, obj client.Object) []reco
 			providerNames[p.Name] = true
 		}
 	}
-	return r.modelsReferencingProviders(ctx, obj.GetNamespace(), providerNames)
+	requests := r.modelsReferencingProviders(ctx, obj.GetNamespace(), providerNames)
+	// Credential copies follow their source, including model auth overrides.
+	var models v1alpha1.ExternalModelList
+	if err := r.List(ctx, &models, client.InNamespace(obj.GetNamespace())); err != nil {
+		r.Log.Error(err, "list models for Secret event", "secret", obj.GetName())
+		return requests
+	}
+	var overrides []reconcile.Request
+	for i := range models.Items {
+		if len(models.Items[i].Spec.GatewayRefs) > 0 && slices.ContainsFunc(models.Items[i].Spec.ExternalProviderRefs, func(ref v1alpha1.ExternalProviderRef) bool {
+			return ref.Auth != nil && ref.Auth.SecretRef.Name == obj.GetName()
+		}) {
+			overrides = append(overrides, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&models.Items[i])})
+		}
+	}
+	return appendMissingRequests(requests, overrides)
 }
 
 func (r *Reconciler) serviceModels(ctx context.Context, obj client.Object) []reconcile.Request {
@@ -149,14 +170,21 @@ func (r *Reconciler) tenantModels(ctx context.Context, ait *unstructured.Unstruc
 	if !r.namespaceAllowed(ns) {
 		return nil
 	}
-	return r.modelsInNamespace(ctx, ns)
+	return appendMissingRequests(r.modelsInNamespace(ctx, ns), r.gatewayAttachedModels(ctx, ait))
 }
 
 func (r *Reconciler) maasTenantConfigModels(ctx context.Context, mtc *unstructured.Unstructured) []reconcile.Request {
 	if mtc.GetName() != tenant.MaasTenantConfigInstanceName || !r.namespaceAllowed(mtc.GetNamespace()) {
 		return nil
 	}
-	return r.modelsInNamespace(ctx, mtc.GetNamespace())
+	requests := r.modelsInNamespace(ctx, mtc.GetNamespace())
+	if name, namespace, ok := tenant.OwningAITenantRef(mtc); ok {
+		ait := tenant.NewAITenant()
+		if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, ait); err == nil {
+			requests = appendMissingRequests(requests, r.gatewayAttachedModels(ctx, ait))
+		}
+	}
+	return requests
 }
 
 func (r *Reconciler) modelsInNamespace(ctx context.Context, namespace string) []reconcile.Request {
@@ -251,12 +279,41 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	// The deletion path uses the ExternalModel namespace and controller-owned
 	// resource labels as its independent ownership proof.
 	if !model.DeletionTimestamp.IsZero() {
+		hasAttachments, err := r.hasAttachmentRoutes(ctx, &model)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		if len(model.Spec.GatewayRefs) > 0 || hasAttachments {
+			return reconcile.Result{}, r.reconcileDeletingAttachedModel(ctx, &model)
+		}
 		if err := r.reconcileDeletingModel(ctx, &model); err != nil {
 			return reconcile.Result{}, err
 		}
 		return reconcile.Result{}, nil
 	}
-	modelTenant, proceed, err := r.prepareModelTenant(ctx, &model, req.Namespace)
+	if len(model.Spec.GatewayRefs) > 0 {
+		return r.reconcileAttachedModel(ctx, &model)
+	}
+	// Removing every gatewayRef restores tenant-local resolution only.
+	if err := r.releaseRemovedAttachments(ctx, &model); err != nil {
+		return reconcile.Result{}, err
+	}
+	return r.reconcileHomeModel(ctx, &model, func(ready bool, reason, message string, env *envelope.Envelope) error {
+		return r.updateModelStatus(ctx, &model, ready, reason, message, env)
+	})
+}
+
+// modelStatusReporter receives the home path's model status. Models with
+// gatewayRefs aggregate it with their other attachments into one write.
+type modelStatusReporter func(ready bool, reason, message string, env *envelope.Envelope) error
+
+// reconcileHomeModel serves the model through its own tenant: the tenant
+// whose MaasTenantConfig is in the model namespace. This is the existing
+// tenant-local path; it publishes every model the tenant serves from its own
+// namespace plus the admitted contributions from other namespaces.
+func (r *Reconciler) reconcileHomeModel(ctx context.Context, model *v1alpha1.ExternalModel, report modelStatusReporter) (reconcile.Result, error) {
+	namespace := model.Namespace
+	modelTenant, proceed, err := r.prepareModelTenant(ctx, model, namespace, report)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -265,10 +322,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	}
 	gatewayName, gatewayNamespace := modelTenant.gatewayName, modelTenant.gatewayNamespace
 	var models v1alpha1.ExternalModelList
-	if err := r.List(ctx, &models, client.InNamespace(req.Namespace)); err != nil {
+	if err := r.List(ctx, &models, client.InNamespace(namespace)); err != nil {
 		return reconcile.Result{}, err
 	}
-	providers, providerPtrs, validProviders, err := r.providerInputs(ctx, req.Namespace)
+	providers, providerPtrs, validProviders, err := r.providerInputs(ctx, namespace)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -276,6 +333,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models.Items))
 	modelOwners := make(map[string]*v1alpha1.ExternalModel, len(models.Items))
 	for i := range models.Items {
+		if !tenant.ServedByTenantGateway(&models.Items[i], gatewayName, gatewayNamespace) {
+			continue
+		}
 		modelPtrs = append(modelPtrs, &models.Items[i])
 		modelOwners[models.Items[i].Name] = &models.Items[i]
 	}
@@ -289,7 +349,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		if errors.Is(err, resolver.ErrNoRoutes) {
 			reason = reasonProviderNotReady
 		}
-		if statusErr := r.updateModelStatus(ctx, &model, false, reason, err.Error(), nil); statusErr != nil {
+		if statusErr := report(false, reason, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, err
@@ -299,7 +359,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		if errors.Is(err, errCredentialNotReady) {
 			reason = reasonProviderNotReady
 		}
-		if statusErr := r.updateModelStatus(ctx, &model, false, reason, err.Error(), nil); statusErr != nil {
+		if statusErr := report(false, reason, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, err
@@ -307,46 +367,53 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	// The selector/status/owner may have changed while provider inputs and
 	// credential references were being resolved. Do not publish or delete
 	// serving state from a stale cached decision.
-	if valid, err := r.livePraxisBeforeWrite(ctx, req.Namespace, modelTenant); err != nil {
+	if valid, err := r.livePraxisBeforeWrite(ctx, namespace, modelTenant); err != nil {
 		return reconcile.Result{}, err
 	} else if !valid {
 		return reconcile.Result{Requeue: true}, nil
 	}
 	if len(set.Routes()) == 0 {
-		if err := r.enableExternalModelRoutes(ctx, tenant.ID(modelTenant.aitenant.GetName()), req.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
+		if err := r.enableExternalModelRoutes(ctx, tenant.ID(modelTenant.aitenant.GetName()), namespace, gatewayName, gatewayNamespace, nil); err != nil {
 			return reconcile.Result{}, err
 		}
 		if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenant.ID(modelTenant.aitenant.GetName())); err != nil {
 			return reconcile.Result{}, err
 		}
-		if cleanupErr := r.cleanupTransport(ctx, req.Namespace, gatewayName, gatewayNamespace, nil); cleanupErr != nil {
+		if cleanupErr := r.cleanupTransport(ctx, namespace, gatewayName, gatewayNamespace, nil); cleanupErr != nil {
 			return reconcile.Result{}, cleanupErr
 		}
-		if cleanupErr := r.cleanupOverlay(ctx, req.Namespace); cleanupErr != nil {
+		if cleanupErr := r.cleanupOverlay(ctx, namespace); cleanupErr != nil {
 			return reconcile.Result{}, cleanupErr
 		}
 		message := "no ExternalModel provider references resolved to a Ready provider"
-		if statusErr := r.updateModelStatus(ctx, &model, false, reasonNoRoutes, message, nil); statusErr != nil {
+		if statusErr := report(false, reasonNoRoutes, message, nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, resolver.ErrNoRoutes
 	}
-	if err := r.applyTransport(ctx, set.Routes(), req.Namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace, modelOwners, providerOwners); err != nil {
+	attached, err := r.admittedAttachments(ctx, attachmentTenant{
+		namespace: namespace, tenantID: tenant.ID(modelTenant.aitenant.GetName()),
+		gateway: v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace},
+	}, len(set.Routes()))
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if err := r.applyTransport(ctx, set.Routes(), namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace, modelOwners, providerOwners, attached); err != nil {
 		for _, p := range validProviders {
 			if statusErr := r.updateProviderStatus(ctx, p, false, reasonReconcileFailed, err.Error()); statusErr != nil {
 				return reconcile.Result{}, statusErr
 			}
 		}
-		if statusErr := r.updateModelStatus(ctx, &model, false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
+		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, err
 	}
-	if err := r.cleanupExternalModelRouteFilters(ctx, req.Namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace); err != nil {
+	if err := r.cleanupExternalModelRouteFilters(ctx, namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace); err != nil {
 		return reconcile.Result{}, err
 	}
-	if err := r.cleanupTransport(ctx, req.Namespace, gatewayName, gatewayNamespace, set.Routes()); err != nil {
-		if statusErr := r.updateModelStatus(ctx, &model, false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
+	if err := r.cleanupTransport(ctx, namespace, gatewayName, gatewayNamespace, set.Routes()); err != nil {
+		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, err
@@ -357,28 +424,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 	}
 
-	pub, err := publisher.New(r.Client, publisher.Config{Namespace: req.Namespace, Name: r.ConfigMap})
+	result, err := r.publishTenantOverlay(ctx, namespace, gatewayName, set, attached, nil, string(model.UID))
 	if err != nil {
-		return reconcile.Result{}, err
-	}
-	publish := r.PublishOverlay
-	if publish == nil {
-		publish = pub.Publish
-	}
-	result, err := publish(ctx, set, envelope.Scope{
-		Network: r.Network, Gateway: gatewayName, Namespace: req.Namespace, LocalSite: r.localSite(),
-	}, envelope.Options{
-		KnownClusters: r.KnownClusters, SourceUID: string(model.UID), ProducerVersion: r.ProducerVersion,
-	})
-	if err != nil {
-		if statusErr := r.updateModelStatus(ctx, &model, false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
+		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, err
 	}
+	// Attachments the tenant's own candidates pushed over the overlay
+	// capacity lose their DestinationRules and credential copies.
+	if excluded := excludedRoutes(attached); len(excluded) > 0 {
+		if err := r.gcAttachmentState(ctx, namespace, excluded); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
 
 	message := fmt.Sprintf("distributed routing overlay digest %s generation %d", result.Envelope.Revision.Value, result.Envelope.Provenance.SourceGeneration)
-	if err := r.updateModelStatus(ctx, &model, true, reasonReconciled, message, &result.Envelope); err != nil {
+	if err := report(true, reasonReconciled, message, &result.Envelope); err != nil {
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
@@ -396,7 +458,7 @@ type modelTenantContext struct {
 // AITenant before any ExternalModel serving state is published. A false
 // proceed result means status/cleanup work was completed and the caller must
 // stop this reconcile.
-func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.ExternalModel, namespace string) (modelTenantContext, bool, error) {
+func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.ExternalModel, namespace string, report modelStatusReporter) (modelTenantContext, bool, error) {
 	// Re-read the selector, handoff status, deletion state, and owner from the
 	// API server immediately before making the cleanup/apply decision. The
 	// informer copy can be behind an IPP switch or an AITenant replacement.
@@ -405,7 +467,16 @@ func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.Ext
 		return modelTenantContext{}, false, err
 	}
 	if live.missingConfig {
-		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "MaasTenantConfig/default-tenant is missing; retaining serving state and waiting for the owner to resolve", nil); err != nil {
+		if len(model.Spec.GatewayRefs) == 0 && !controllerutil.ContainsFinalizer(model, externalModelFinalizer) {
+			// Never served here: this namespace is not a tenant namespace.
+			// Do not choose another gateway; explicit gatewayRefs select one.
+			message := fmt.Sprintf("namespace %s has no MaasTenantConfig; set spec.gatewayRefs to attach this model to a tenant gateway", namespace)
+			if err := r.setModelStatus(ctx, model, modelPhasePending, false, reasonTenantNotResolved, message, ""); err != nil {
+				return modelTenantContext{}, false, err
+			}
+			return modelTenantContext{}, false, nil
+		}
+		if err := report(false, reasonTenantNotReady, "MaasTenantConfig/default-tenant is missing; retaining serving state and waiting for the owner to resolve", nil); err != nil {
 			return modelTenantContext{}, false, err
 		}
 		return modelTenantContext{}, false, nil
@@ -419,13 +490,13 @@ func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.Ext
 		return modelTenantContext{}, false, nil
 	}
 	if live.aitenant == nil {
-		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "owning AITenant is not yet resolvable for MaasTenantConfig", nil); err != nil {
+		if err := report(false, reasonTenantNotReady, "owning AITenant is not yet resolvable for MaasTenantConfig", nil); err != nil {
 			return modelTenantContext{}, false, err
 		}
 		return modelTenantContext{}, false, nil
 	}
 	if live.status != tenant.PayloadProcessingStatusSteady {
-		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "MaasTenantConfig selects Praxis but payload-processing-status is not steady", nil); err != nil {
+		if err := report(false, reasonTenantNotReady, "MaasTenantConfig selects Praxis but payload-processing-status is not steady", nil); err != nil {
 			return modelTenantContext{}, false, err
 		}
 		return modelTenantContext{}, false, nil
@@ -433,13 +504,13 @@ func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.Ext
 	ait := live.aitenant
 	gatewayName, gatewayNamespace, gatewayReady := tenant.GatewayRef(ait)
 	if !gatewayReady {
-		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "AITenant Gateway reference is not ready", nil); err != nil {
+		if err := report(false, reasonTenantNotReady, "AITenant Gateway reference is not ready", nil); err != nil {
 			return modelTenantContext{}, false, err
 		}
 		return modelTenantContext{}, false, nil
 	}
 	if !tenant.IsActive(ait) || !tenant.StatusIsCurrent(ait) {
-		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "AITenant is selected for Praxis but is not Active", nil); err != nil {
+		if err := report(false, reasonTenantNotReady, "AITenant is selected for Praxis but is not Active", nil); err != nil {
 			return modelTenantContext{}, false, err
 		}
 		return modelTenantContext{}, false, nil
@@ -478,7 +549,10 @@ func (r *Reconciler) cleanupUnselectedModel(ctx context.Context, model *v1alpha1
 	if err := r.cleanupOverlay(ctx, model.Namespace); err != nil {
 		return err
 	}
-	if controllerutil.ContainsFinalizer(model, externalModelFinalizer) {
+	// A live model with gatewayRefs keeps its finalizer for the cleanup of
+	// its attachments to other tenants.
+	if controllerutil.ContainsFinalizer(model, externalModelFinalizer) &&
+		(len(model.Spec.GatewayRefs) == 0 || !model.DeletionTimestamp.IsZero()) {
 		return r.removeExternalModelFinalizer(ctx, model)
 	}
 	return nil
@@ -549,16 +623,26 @@ func (r *Reconciler) handleModelLifecycle(ctx context.Context, model *v1alpha1.E
 		if !model.DeletionTimestamp.IsZero() {
 			return true, nil
 		}
-		base := model.DeepCopy()
-		controllerutil.AddFinalizer(model, externalModelFinalizer)
-		if err := r.Patch(ctx, model, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
-			return true, fmt.Errorf("add ExternalModel cleanup finalizer: %w", err)
+		if err := r.addExternalModelFinalizer(ctx, model); err != nil {
+			return true, err
 		}
 	}
 	if model.DeletionTimestamp.IsZero() {
 		return false, nil
 	}
 	return true, r.reconcileDeletedModel(ctx, model, ait)
+}
+
+func (r *Reconciler) addExternalModelFinalizer(ctx context.Context, model *v1alpha1.ExternalModel) error {
+	if controllerutil.ContainsFinalizer(model, externalModelFinalizer) {
+		return nil
+	}
+	base := model.DeepCopy()
+	controllerutil.AddFinalizer(model, externalModelFinalizer)
+	if err := r.Patch(ctx, model, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+		return fmt.Errorf("add ExternalModel cleanup finalizer: %w", err)
+	}
+	return nil
 }
 
 // reconcileDeletedModel republishes the namespace's remaining route set before
@@ -578,6 +662,16 @@ func (r *Reconciler) reconcileDeletedModel(ctx context.Context, deleted *v1alpha
 }
 
 func (r *Reconciler) reconcileDeletedModelWithIdentity(ctx context.Context, deleted *v1alpha1.ExternalModel, tenantID, gatewayName, gatewayNamespace string) error {
+	if err := r.republishHomeWithout(ctx, deleted, tenantID, gatewayName, gatewayNamespace); err != nil {
+		return err
+	}
+	return r.removeExternalModelFinalizer(ctx, deleted)
+}
+
+// republishHomeWithout republishes the tenant's own serving state without
+// the given model: its deletion, or its gatewayRefs no longer naming its own
+// tenant. Only the final served model may remove the shared serving state.
+func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1.ExternalModel, tenantID, gatewayName, gatewayNamespace string) error {
 	var models v1alpha1.ExternalModelList
 	if err := r.List(ctx, &models, client.InNamespace(deleted.Namespace)); err != nil {
 		return fmt.Errorf("list remaining ExternalModels for deletion: %w", err)
@@ -586,7 +680,7 @@ func (r *Reconciler) reconcileDeletedModelWithIdentity(ctx context.Context, dele
 	modelOwners := make(map[string]*v1alpha1.ExternalModel, len(models.Items))
 	for i := range models.Items {
 		m := &models.Items[i]
-		if m.Name == deleted.Name || !m.DeletionTimestamp.IsZero() {
+		if m.Name == deleted.Name || !m.DeletionTimestamp.IsZero() || !tenant.ServedByTenantGateway(m, gatewayName, gatewayNamespace) {
 			continue
 		}
 		modelPtrs = append(modelPtrs, m)
@@ -608,6 +702,29 @@ func (r *Reconciler) reconcileDeletedModelWithIdentity(ctx context.Context, dele
 		if len(modelPtrs) > 0 {
 			return err
 		}
+		home := attachmentTenant{
+			namespace: deleted.Namespace, tenantID: tenantID,
+			gateway: v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace},
+		}
+		attached, err := r.admittedAttachments(ctx, home, 0)
+		if err != nil {
+			return err
+		}
+		if len(servedAttachments(attached)) > 0 {
+			// Contributions from other namespaces keep the tenant's
+			// overlay and route filter; only the own transport is removed.
+			if err := r.writeExternalModelRouteFilter(ctx, tenantID, deleted.Namespace, gatewayName, gatewayNamespace, attachedRoutePatches(attached)); err != nil {
+				return err
+			}
+			if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenantID); err != nil {
+				return err
+			}
+			if err := r.cleanupTransport(ctx, deleted.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
+				return err
+			}
+			_, err := r.publishTenantOverlay(ctx, deleted.Namespace, gatewayName, nil, attached, nil, string(deleted.UID))
+			return err
+		}
 		if err := r.deleteExternalModelRouteFiltersForTenant(ctx, deleted.Namespace); err != nil {
 			return err
 		}
@@ -619,10 +736,7 @@ func (r *Reconciler) reconcileDeletedModelWithIdentity(ctx context.Context, dele
 		if err := r.cleanupTransport(ctx, deleted.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
 			return err
 		}
-		if err := r.cleanupOverlay(ctx, deleted.Namespace); err != nil {
-			return err
-		}
-		return r.removeExternalModelFinalizer(ctx, deleted)
+		return r.cleanupOverlay(ctx, deleted.Namespace)
 	}
 	if err != nil {
 		return fmt.Errorf("resolve remaining ExternalModels after deletion: %w", err)
@@ -630,7 +744,14 @@ func (r *Reconciler) reconcileDeletedModelWithIdentity(ctx context.Context, dele
 	if err := r.validateResolvedCredentials(ctx, set.Routes()); err != nil {
 		return fmt.Errorf("validate remaining ExternalModel credentials after deletion: %w", err)
 	}
-	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, tenantID, gatewayName, gatewayNamespace, modelOwners, providerOwners); err != nil {
+	attached, err := r.admittedAttachments(ctx, attachmentTenant{
+		namespace: deleted.Namespace, tenantID: tenantID,
+		gateway: v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace},
+	}, len(set.Routes()))
+	if err != nil {
+		return err
+	}
+	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, tenantID, gatewayName, gatewayNamespace, modelOwners, providerOwners, attached); err != nil {
 		return fmt.Errorf("rebuild transport after ExternalModel deletion: %w", err)
 	}
 	if err := r.cleanupExternalModelRouteFilters(ctx, deleted.Namespace, tenantID, gatewayName, gatewayNamespace); err != nil {
@@ -642,22 +763,10 @@ func (r *Reconciler) reconcileDeletedModelWithIdentity(ctx context.Context, dele
 	if err := r.cleanupTransport(ctx, deleted.Namespace, gatewayName, gatewayNamespace, set.Routes()); err != nil {
 		return err
 	}
-	pub, err := publisher.New(r.Client, publisher.Config{Namespace: deleted.Namespace, Name: r.ConfigMap})
-	if err != nil {
-		return err
-	}
-	publish := r.PublishOverlay
-	if publish == nil {
-		publish = pub.Publish
-	}
-	if _, err := publish(ctx, set, envelope.Scope{
-		Network: r.Network, Gateway: gatewayName, Namespace: deleted.Namespace, LocalSite: r.localSite(),
-	}, envelope.Options{
-		KnownClusters: r.KnownClusters, SourceUID: string(modelPtrs[0].UID), ProducerVersion: r.ProducerVersion,
-	}); err != nil {
+	if _, err := r.publishTenantOverlay(ctx, deleted.Namespace, gatewayName, set, attached, nil, string(modelPtrs[0].UID)); err != nil {
 		return fmt.Errorf("publish remaining overlay after ExternalModel deletion: %w", err)
 	}
-	return r.removeExternalModelFinalizer(ctx, deleted)
+	return nil
 }
 
 func (r *Reconciler) removeExternalModelFinalizer(ctx context.Context, model *v1alpha1.ExternalModel) error {
@@ -678,13 +787,25 @@ func (r *Reconciler) cleanupTransport(ctx context.Context, namespace, gatewayNam
 		providers[route.Provider] = true
 		models[route.Model] = true
 	}
+	// Gateway attachments from this namespace share its provider Services,
+	// ServiceEntries and selection sinks.
+	transportProviders, transportModels, err := r.attachmentTransportKeep(ctx, namespace, nil)
+	if err != nil {
+		return err
+	}
+	for provider := range providers {
+		transportProviders[provider] = true
+	}
+	for model := range models {
+		transportModels[model] = true
+	}
 	resources := []struct {
 		kind, group, version, label string
 		keep                        map[string]bool
 	}{
-		{"Service", "", "v1", "inference.opendatahub.io/external-provider", providers},
-		{"Service", "", "v1", "inference.opendatahub.io/external-model", models},
-		{"ServiceEntry", "networking.istio.io", "v1", "inference.opendatahub.io/external-provider", providers},
+		{"Service", "", "v1", "inference.opendatahub.io/external-provider", transportProviders},
+		{"Service", "", "v1", "inference.opendatahub.io/external-model", transportModels},
+		{"ServiceEntry", "networking.istio.io", "v1", "inference.opendatahub.io/external-provider", transportProviders},
 		{"DestinationRule", "networking.istio.io", "v1", "inference.opendatahub.io/external-provider", providers},
 		{"HTTPRoute", "gateway.networking.k8s.io", "v1", "inference.opendatahub.io/external-model", models},
 	}
@@ -711,6 +832,10 @@ func (r *Reconciler) cleanupTransport(ctx context.Context, namespace, gatewayNam
 				keep := resource.keep[name]
 				if resource.kind == "DestinationRule" {
 					labels := list.Items[i].GetLabels()
+					if _, attachment := labels[tenant.LabelAttachmentTenant]; attachment {
+						// Owned per tenant by the attachment that created it.
+						continue
+					}
 					// A provider name is not a sufficient keep key in a
 					// shared Gateway namespace. Keep only the copy rendered
 					// for this tenant's current Gateway. Empty routes are a
@@ -919,7 +1044,7 @@ func (r *Reconciler) namespaceAllowed(namespace string) bool {
 
 func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route, modelNamespace, tenantID, gatewayName,
 	gatewayNamespace string, modelOwners map[string]*v1alpha1.ExternalModel,
-	providerOwners map[string]*v1alpha1.ExternalProvider) error {
+	providerOwners map[string]*v1alpha1.ExternalProvider, attached []attachedModel) error {
 	resources := make([]unstructured.Unstructured, 0, len(routes)*3+len(routes))
 	seen := map[string]bool{}
 	for _, route := range routes {
@@ -983,10 +1108,8 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 			return err
 		}
 	}
-	if err := r.enableExternalModelRoutes(ctx, tenantID, modelNamespace, gatewayName, gatewayNamespace, routes); err != nil {
-		return err
-	}
-	return nil
+	patches := append(externalModelRoutePatches(modelNamespace, routes), attachedRoutePatches(attached)...)
+	return r.writeExternalModelRouteFilter(ctx, tenantID, modelNamespace, gatewayName, gatewayNamespace, patches)
 }
 
 // enableExternalModelRoutes owns a separate EnvoyFilter containing only the
@@ -994,8 +1117,14 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 // the base EnvoyFilter; keeping these objects separate prevents concurrent
 // tenant/model reconciles from overwriting configPatches.
 func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, modelNamespace, gatewayName, gatewayNamespace string, routes []resolver.Route) error {
+	return r.writeExternalModelRouteFilter(ctx, tenantID, modelNamespace, gatewayName, gatewayNamespace, externalModelRoutePatches(modelNamespace, routes))
+}
+
+// writeExternalModelRouteFilter applies the tenant's route filter with the
+// given patches, or deletes it when there are none.
+func (r *Reconciler) writeExternalModelRouteFilter(ctx context.Context, tenantID, modelNamespace, gatewayName, gatewayNamespace string, patches []any) error {
 	name := tenant.PayloadProcessingExternalModelEnvoyFilterName(tenantID)
-	if len(routes) == 0 {
+	if len(patches) == 0 {
 		return r.deleteExternalModelRouteFilters(ctx, name, modelNamespace)
 	}
 	filter := &unstructured.Unstructured{Object: map[string]any{
@@ -1021,8 +1150,18 @@ func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, mo
 			},
 		},
 	}}
-	kept := make([]any, 0, len(routes)*2+2)
+	if err := unstructured.SetNestedSlice(filter.Object, patches, "spec", "configPatches"); err != nil {
+		return fmt.Errorf("write ExternalModel EnvoyFilter route patches: %w", err)
+	}
+	if r.ApplyResource != nil {
+		return r.ApplyResource(ctx, r.Client, *filter)
+	}
+	return render.Apply(ctx, r.Client, []unstructured.Unstructured{*filter})
+}
 
+// externalModelRoutePatches enables the ExternalModel filters on the routes
+// the tenant serves from its own namespace.
+func externalModelRoutePatches(modelNamespace string, routes []resolver.Route) []any {
 	byModel := map[string]int{}
 	for _, route := range routes {
 		byModel[route.Model]++
@@ -1032,76 +1171,78 @@ func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, mo
 		models = append(models, model)
 	}
 	sort.Strings(models)
+	patches := make([]any, 0, len(routes)*2+2)
 	for _, model := range models {
 		// modelHTTPRouteSet emits two provider rules per route plus the
 		// canonical and header-only fail-closed sink rules.
-		count := byModel[model]*2 + 2
-		for index := 0; index < count; index++ {
-			kept = append(kept, map[string]any{
-				"applyTo": "HTTP_ROUTE",
-				"match": map[string]any{
-					"context": "GATEWAY",
-					"routeConfiguration": map[string]any{"vhost": map[string]any{
-						"route": map[string]any{
-							"name": fmt.Sprintf("%s.%s.%d", modelNamespace, modelRouteName(model), index),
-						},
-					}},
-				},
-				"patch": map[string]any{
-					"operation": "MERGE",
-					"value": map[string]any{"typed_per_filter_config": map[string]any{
-						externalModelPreExtProcFilter: map[string]any{
-							"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							"overrides": map[string]any{
-								"processing_mode": map[string]any{
-									"request_header_mode":   "SEND",
-									"request_body_mode":     "BUFFERED",
-									"response_header_mode":  "SKIP",
-									"response_body_mode":    "NONE",
-									"request_trailer_mode":  "SKIP",
-									"response_trailer_mode": "SKIP",
-								},
+		patches = append(patches, routeFilterPatches(modelNamespace, modelRouteName(model), byModel[model]*2+2)...)
+	}
+	return patches
+}
+
+// routeFilterPatches returns one HTTP_ROUTE patch per HTTPRoute rule. Istio
+// names Gateway routes <routeNamespace>.<routeName>.<ruleIndex>.
+func routeFilterPatches(routeNamespace, routeName string, count int) []any {
+	patches := make([]any, 0, count)
+	for index := 0; index < count; index++ {
+		patches = append(patches, map[string]any{
+			"applyTo": "HTTP_ROUTE",
+			"match": map[string]any{
+				"context": "GATEWAY",
+				"routeConfiguration": map[string]any{"vhost": map[string]any{
+					"route": map[string]any{
+						"name": fmt.Sprintf("%s.%s.%d", routeNamespace, routeName, index),
+					},
+				}},
+			},
+			"patch": map[string]any{
+				"operation": "MERGE",
+				"value": map[string]any{"typed_per_filter_config": map[string]any{
+					externalModelPreExtProcFilter: map[string]any{
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+						"overrides": map[string]any{
+							"processing_mode": map[string]any{
+								"request_header_mode":   "SEND",
+								"request_body_mode":     "BUFFERED",
+								"response_header_mode":  "SKIP",
+								"response_body_mode":    "NONE",
+								"request_trailer_mode":  "SKIP",
+								"response_trailer_mode": "SKIP",
 							},
 						},
-						externalModelExtProcFilter: map[string]any{
-							"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							// ExtProcPerRoute is disable-only when the
-							// vhost config is disabled. An overrides
-							// object is the supported way for this
-							// more-specific ExternalModel route to
-							// re-enable the filter.
-							"overrides": map[string]any{
-								"processing_mode": map[string]any{
-									"request_header_mode": "SEND",
-									// Praxis treats the omitted NONE enum as BUFFERED; STREAMED runs selection at headers.
-									"request_body_mode":     "STREAMED",
-									"response_header_mode":  "SEND",
-									"response_body_mode":    "NONE",
-									"request_trailer_mode":  "SKIP",
-									"response_trailer_mode": "SKIP",
-								},
+					},
+					externalModelExtProcFilter: map[string]any{
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+						// ExtProcPerRoute is disable-only when the
+						// vhost config is disabled. An overrides
+						// object is the supported way for this
+						// more-specific ExternalModel route to
+						// re-enable the filter.
+						"overrides": map[string]any{
+							"processing_mode": map[string]any{
+								"request_header_mode": "SEND",
+								// Praxis treats the omitted NONE enum as BUFFERED; STREAMED runs selection at headers.
+								"request_body_mode":     "STREAMED",
+								"response_header_mode":  "SEND",
+								"response_body_mode":    "NONE",
+								"request_trailer_mode":  "SKIP",
+								"response_trailer_mode": "SKIP",
 							},
 						},
-						"envoy.filters.http.ext_proc.ipp-pre": map[string]any{
-							"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							"disabled": true,
-						},
-						"envoy.filters.http.ext_proc.ipp": map[string]any{
-							"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							"disabled": true,
-						},
-					}},
-				},
-			})
-		}
+					},
+					"envoy.filters.http.ext_proc.ipp-pre": map[string]any{
+						"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+						"disabled": true,
+					},
+					"envoy.filters.http.ext_proc.ipp": map[string]any{
+						"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+						"disabled": true,
+					},
+				}},
+			},
+		})
 	}
-	if err := unstructured.SetNestedSlice(filter.Object, kept, "spec", "configPatches"); err != nil {
-		return fmt.Errorf("write ExternalModel EnvoyFilter route patches: %w", err)
-	}
-	if r.ApplyResource != nil {
-		return r.ApplyResource(ctx, r.Client, *filter)
-	}
-	return render.Apply(ctx, r.Client, []unstructured.Unstructured{*filter})
+	return patches
 }
 
 // deleteExternalModelRouteFilters removes only the controller-owned route
@@ -1247,7 +1388,11 @@ func (r *Reconciler) updateModelStatus(ctx context.Context, m *v1alpha1.External
 	m.Status.ObservedGeneration = m.Generation
 	if ready {
 		m.Status.Phase = resolver.PhaseReady
-		m.Status.HTTPRouteName = modelRouteName(m.Name)
+		// httpRouteName names the route of a single attachment only.
+		m.Status.HTTPRouteName = ""
+		if len(m.Spec.GatewayRefs) <= 1 {
+			m.Status.HTTPRouteName = modelRouteName(m.Name)
+		}
 		if env != nil {
 			m.Status.OverlayDigest = env.Revision.Value
 			m.Status.OverlayGeneration = env.Provenance.SourceGeneration
@@ -1422,7 +1567,7 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 			continue
 		}
 		seenProviders[candidate.Provider] = true
-		stableID := envelope.CandidateStableID(route.Model, candidate.Provider)
+		stableID := envelope.RouteStableID(candidate)
 		rules = append(rules, map[string]any{
 			"matches": []any{map[string]any{
 				"path":    map[string]any{"type": "PathPrefix", "value": path},
