@@ -37,6 +37,10 @@ API server, including on failure. The current kubeconfig is never used.
   configures its ExtProc workload. Deleting that model removes its route,
   overlay and workload, then releases its finalizer.
   Both paths require the shipped permission to patch model finalizers.
+- The shipped controller identity may create, patch and delete Secrets for
+  its credential copies and read ReferenceGrants, but cannot read Gateways or
+  Namespaces. Each permission is checked with a SubjectAccessReview, so it is
+  verified before any controller uses it.
 - Guardrail admission accepts positive Go durations and rejects invalid or
   non-positive values. Accepted values remain readable by typed Get/List.
   A typed fixture is converted to unstructured input and only its timeout is
