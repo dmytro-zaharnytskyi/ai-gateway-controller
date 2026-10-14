@@ -282,10 +282,12 @@ compatibility one-pager; this records how it is implemented.
   administrator-configured namespace selector. A model-name conflict (across
   namespaces only: the tenant's own models win, then the oldest), a resolution
   or credential failure, or more than 7 providers (`TooManyProviders`) excludes
-  the model and removes its route.
+  the model and removes its route, as does removing the Gateway from
+  `gatewayRefs`.
 - **Identifiers.** Attachment HTTPRoutes are named
-  `external-model-<model>-<hash12>`, carry identity annotations and are never
-  adopted or deleted when they do not match. Overlay candidates of models from
+  `external-model-<model>-<hash12>` (`external-model--<hash12>` above 253
+  characters, which no home route can match), carry identity annotations and
+  are never adopted or deleted when they do not match. Overlay candidates of models from
   other namespaces use `stable_id`
   `<modelNamespace>/<model>/<providerNamespace>/<provider>` (`sha256:` above 256
   bytes), disjoint from the existing form. Tenant-local cleanup keeps the

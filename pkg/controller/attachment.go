@@ -117,7 +117,9 @@ func attachmentRouteName(model *v1alpha1.ExternalModel, gateway v1alpha1.Namespa
 	if name := modelRouteName(model.Name) + "-" + hash; len(name) <= 253 {
 		return name
 	}
-	return modelRoutePrefix + hash
+	// ExternalModel names start with an alphanumeric, so the double dash
+	// never matches a home route.
+	return modelRoutePrefix + "-" + hash
 }
 
 func newHTTPRoute() *unstructured.Unstructured {
@@ -317,6 +319,9 @@ func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1
 				results[i] = failedAttachment(results[i], err)
 			}
 		}
+	}
+	if err := r.removeDetachedRoutes(ctx, model); err != nil {
+		errs = append(errs, err)
 	}
 
 	if home >= 0 && !homeReported {
@@ -785,6 +790,26 @@ func (r *Reconciler) removeAttachmentRoute(ctx context.Context, model *v1alpha1.
 	}
 	if err := client.IgnoreNotFound(r.Delete(ctx, route)); err != nil {
 		return fmt.Errorf("delete attachment HTTPRoute %s/%s: %w", route.GetNamespace(), route.GetName(), err)
+	}
+	return nil
+}
+
+// removeDetachedRoutes deletes the model's attachment HTTPRoutes for Gateways
+// its gatewayRefs no longer name.
+func (r *Reconciler) removeDetachedRoutes(ctx context.Context, model *v1alpha1.ExternalModel) error {
+	routes, err := r.listAttachmentRoutes(ctx, client.InNamespace(model.Namespace))
+	if err != nil {
+		return err
+	}
+	for i := range routes {
+		gatewayNamespace, gatewayName, ok := strings.Cut(routes[i].GetAnnotations()[annotationAttachmentGateway], "/")
+		gateway := v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace}
+		if !ok || routes[i].GetAnnotations()[annotationAttachmentModel] != model.Name || hasGatewayRef(model, gateway) {
+			continue
+		}
+		if err := r.removeAttachmentRoute(ctx, model, gateway); err != nil {
+			return err
+		}
 	}
 	return nil
 }

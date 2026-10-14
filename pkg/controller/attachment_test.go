@@ -558,3 +558,53 @@ func TestRebindingAwayFromDeselectedTenantCleansHomeRoute(t *testing.T) {
 		t.Fatalf("the deselected tenant's overlay survived: %v", err)
 	}
 }
+
+func TestAttachmentRouteFallbackNeverMatchesAHomeRoute(t *testing.T) {
+	model := attachmentModel(strings.Repeat("m", 240), "team", "chat-model", time.Unix(100, 0), gatewayB)
+	// ExternalModel names start with an alphanumeric, so no home route
+	// (modelRoutePrefix + name) starts with modelRoutePrefix + "-".
+	if name := attachmentRouteName(model, gatewayB); len(name) > 253 || !strings.HasPrefix(name, modelRoutePrefix+"-") {
+		t.Fatalf("fallback route name = %q, want %q followed by the hash", name, modelRoutePrefix+"-")
+	}
+}
+
+func TestRemovedGatewayRefRemovesOnlyItsAttachmentRoute(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB, gatewayC)
+	other := attachmentModel("other", "team", "other-model", time.Unix(100, 0), gatewayC)
+	objects := []client.Object{provider, secret, model, other}
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	objects = append(objects, attachmentTenantObjects("tenant-c", "tenant-c", gatewayC, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	reconcileModel(t, r, other)
+	setRefs := func(refs ...v1alpha1.NamespacedObjectReference) {
+		t.Helper()
+		got := getModel(t, r, model)
+		got.Spec.GatewayRefs = refs
+		if err := r.Update(context.Background(), got); err != nil {
+			t.Fatal(err)
+		}
+		reconcileModel(t, r, model)
+	}
+	routeExists := func(name string) bool {
+		t.Helper()
+		_, err := getUnstructured(r, httpRouteGVK, "team", name)
+		if err != nil && !apierrors.IsNotFound(err) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+	routeB, routeC, otherC := attachmentRouteName(model, gatewayB), attachmentRouteName(model, gatewayC), attachmentRouteName(other, gatewayC)
+
+	setRefs(gatewayB)
+	if routeExists(routeC) || !routeExists(routeB) || !routeExists(otherC) {
+		t.Fatalf("after removing gw-c: routes b=%v c=%v other=%v, want only the removed attachment gone",
+			routeExists(routeB), routeExists(routeC), routeExists(otherC))
+	}
+	setRefs()
+	if routeExists(routeB) || !routeExists(otherC) {
+		t.Fatalf("after removing every gatewayRef: routes b=%v other=%v, want the model's last attachment gone",
+			routeExists(routeB), routeExists(otherC))
+	}
+}

@@ -272,6 +272,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if len(model.Spec.GatewayRefs) > 0 {
 		return r.reconcileAttachedModel(ctx, &model)
 	}
+	// With every gatewayRef removed, no attachment route remains.
+	if err := r.removeDetachedRoutes(ctx, &model); err != nil {
+		return reconcile.Result{}, err
+	}
 	return r.reconcileHomeModel(ctx, req, &model, func(ready bool, reason, message string, env *envelope.Envelope) error {
 		return r.updateModelStatus(ctx, &model, ready, reason, message, env)
 	})
