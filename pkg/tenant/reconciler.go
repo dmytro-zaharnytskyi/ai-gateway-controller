@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -363,13 +364,13 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, nil
 	}
 	tenantNamespace := mtc.GetNamespace()
-	hasModels, err := r.hasActiveExternalModels(ctx, tenantNamespace)
+	hasModels, err := r.hasActiveExternalModels(ctx, tenantNamespace, gatewayName, gatewayNamespace)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	var runtimeCandidates []envelope.Candidate
 	if hasModels {
-		_, requiredProviders, providerErr := r.providersForTenant(ctx, tenantNamespace)
+		_, requiredProviders, providerErr := r.providersForTenant(ctx, tenantNamespace, gatewayName, gatewayNamespace)
 		if providerErr != nil {
 			return ctrl.Result{}, providerErr
 		}
@@ -381,7 +382,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 			log.Info("routing overlay is not ready for ExternalModel ExtProc", "reason", reason, "namespace", tenantNamespace)
 			return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 		}
-		runtimeCandidates, err = r.runtimeCandidates(ctx, tenantNamespace)
+		runtimeCandidates, err = r.runtimeCandidates(ctx, tenantNamespace, gatewayName, gatewayNamespace)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -477,13 +478,36 @@ func (r *Reconciler) deleteStandalonePraxis(ctx context.Context, tenantID, tenan
 	return nil
 }
 
-func (r *Reconciler) hasActiveExternalModels(ctx context.Context, namespace string) (bool, error) {
-	models := &v1alpha1.ExternalModelList{}
-	if err := r.Client.List(ctx, models, client.InNamespace(namespace)); err != nil {
-		return false, fmt.Errorf("list ExternalModels for cleanup: %w", err)
+// ServedByTenantGateway reports whether the tenant serves a model from its
+// own namespace: gatewayRefs omitted (tenant-local resolution) or naming the
+// tenant's Gateway. An explicit binding never falls back to that Gateway.
+func ServedByTenantGateway(model *v1alpha1.ExternalModel, gatewayName, gatewayNamespace string) bool {
+	return len(model.Spec.GatewayRefs) == 0 ||
+		slices.Contains(model.Spec.GatewayRefs, v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace})
+}
+
+// ownExternalModels lists the models the tenant serves from its namespace.
+func (r *Reconciler) ownExternalModels(ctx context.Context, namespace, gatewayName, gatewayNamespace string) ([]v1alpha1.ExternalModel, error) {
+	var models v1alpha1.ExternalModelList
+	if err := r.Client.List(ctx, &models, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("list tenant ExternalModels: %w", err)
 	}
+	own := make([]v1alpha1.ExternalModel, 0, len(models.Items))
 	for i := range models.Items {
-		if models.Items[i].GetDeletionTimestamp().IsZero() {
+		if ServedByTenantGateway(&models.Items[i], gatewayName, gatewayNamespace) {
+			own = append(own, models.Items[i])
+		}
+	}
+	return own, nil
+}
+
+func (r *Reconciler) hasActiveExternalModels(ctx context.Context, namespace, gatewayName, gatewayNamespace string) (bool, error) {
+	models, err := r.ownExternalModels(ctx, namespace, gatewayName, gatewayNamespace)
+	if err != nil {
+		return false, err
+	}
+	for i := range models {
+		if models[i].GetDeletionTimestamp().IsZero() {
 			return true, nil
 		}
 	}
@@ -512,19 +536,19 @@ func (r *Reconciler) cleanupExternalModelResources(ctx context.Context, tenantID
 	return nil
 }
 
-func (r *Reconciler) providersForTenant(ctx context.Context, namespace string) ([]v1alpha1.ExternalProvider, map[string]bool, error) {
+func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayName, gatewayNamespace string) ([]v1alpha1.ExternalProvider, map[string]bool, error) {
 	var providers v1alpha1.ExternalProviderList
 	if err := r.Client.List(ctx, &providers, client.InNamespace(namespace)); err != nil {
 		return nil, nil, fmt.Errorf("list tenant ExternalProviders: %w", err)
 	}
-	var models v1alpha1.ExternalModelList
-	if err := r.Client.List(ctx, &models, client.InNamespace(namespace)); err != nil {
-		return nil, nil, fmt.Errorf("list tenant ExternalModels: %w", err)
+	models, err := r.ownExternalModels(ctx, namespace, gatewayName, gatewayNamespace)
+	if err != nil {
+		return nil, nil, err
 	}
 	referenced := map[string]bool{}
 	required := map[string]bool{}
-	for i := range models.Items {
-		for _, ref := range models.Items[i].Spec.ExternalProviderRefs {
+	for i := range models {
+		for _, ref := range models[i].Spec.ExternalProviderRefs {
 			name := ref.Ref.Name
 			if name == "" {
 				continue
@@ -544,18 +568,18 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace string) (
 	return result, required, nil
 }
 
-func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace string) ([]envelope.Candidate, error) {
-	var models v1alpha1.ExternalModelList
-	if err := r.Client.List(ctx, &models, client.InNamespace(namespace)); err != nil {
-		return nil, fmt.Errorf("list ExternalModels for ExtProc runtime configuration: %w", err)
+func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayName, gatewayNamespace string) ([]envelope.Candidate, error) {
+	models, err := r.ownExternalModels(ctx, namespace, gatewayName, gatewayNamespace)
+	if err != nil {
+		return nil, err
 	}
 	var providers v1alpha1.ExternalProviderList
 	if err := r.Client.List(ctx, &providers, client.InNamespace(namespace)); err != nil {
 		return nil, fmt.Errorf("list ExternalProviders for ExtProc runtime configuration: %w", err)
 	}
-	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models.Items))
-	for i := range models.Items {
-		modelPtrs = append(modelPtrs, &models.Items[i])
+	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models))
+	for i := range models {
+		modelPtrs = append(modelPtrs, &models[i])
 	}
 	providerPtrs := make([]*v1alpha1.ExternalProvider, 0, len(providers.Items))
 	for i := range providers.Items {

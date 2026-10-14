@@ -149,14 +149,21 @@ func (r *Reconciler) tenantModels(ctx context.Context, ait *unstructured.Unstruc
 	if !r.namespaceAllowed(ns) {
 		return nil
 	}
-	return r.modelsInNamespace(ctx, ns)
+	return append(r.modelsInNamespace(ctx, ns), r.gatewayAttachedModels(ctx, ait)...)
 }
 
 func (r *Reconciler) maasTenantConfigModels(ctx context.Context, mtc *unstructured.Unstructured) []reconcile.Request {
 	if mtc.GetName() != tenant.MaasTenantConfigInstanceName || !r.namespaceAllowed(mtc.GetNamespace()) {
 		return nil
 	}
-	return r.modelsInNamespace(ctx, mtc.GetNamespace())
+	requests := r.modelsInNamespace(ctx, mtc.GetNamespace())
+	if name, namespace, ok := tenant.OwningAITenantRef(mtc); ok {
+		ait := tenant.NewAITenant()
+		if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, ait); err == nil {
+			requests = append(requests, r.gatewayAttachedModels(ctx, ait)...)
+		}
+	}
+	return requests
 }
 
 func (r *Reconciler) modelsInNamespace(ctx context.Context, namespace string) []reconcile.Request {
@@ -256,7 +263,24 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 		return reconcile.Result{}, nil
 	}
-	modelTenant, proceed, err := r.prepareModelTenant(ctx, &model, req.Namespace)
+	if len(model.Spec.GatewayRefs) > 0 {
+		return r.reconcileAttachedModel(ctx, &model)
+	}
+	return r.reconcileHomeModel(ctx, req, &model, func(ready bool, reason, message string, env *envelope.Envelope) error {
+		return r.updateModelStatus(ctx, &model, ready, reason, message, env)
+	})
+}
+
+// modelStatusReporter receives the home path's model status. Models with
+// gatewayRefs aggregate it with their other attachments into one write.
+type modelStatusReporter func(ready bool, reason, message string, env *envelope.Envelope) error
+
+// reconcileHomeModel serves the model through its own tenant: the tenant
+// whose MaasTenantConfig is in the model namespace. This is the existing
+// tenant-local path; it publishes every model the tenant serves from its own
+// namespace.
+func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Request, model *v1alpha1.ExternalModel, report modelStatusReporter) (reconcile.Result, error) {
+	modelTenant, proceed, err := r.prepareModelTenant(ctx, model, req.Namespace, report)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -276,6 +300,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models.Items))
 	modelOwners := make(map[string]*v1alpha1.ExternalModel, len(models.Items))
 	for i := range models.Items {
+		if !tenant.ServedByTenantGateway(&models.Items[i], gatewayName, gatewayNamespace) {
+			continue
+		}
 		modelPtrs = append(modelPtrs, &models.Items[i])
 		modelOwners[models.Items[i].Name] = &models.Items[i]
 	}
@@ -289,7 +316,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		if errors.Is(err, resolver.ErrNoRoutes) {
 			reason = reasonProviderNotReady
 		}
-		if statusErr := r.updateModelStatus(ctx, &model, false, reason, err.Error(), nil); statusErr != nil {
+		if statusErr := report(false, reason, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, err
@@ -299,7 +326,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		if errors.Is(err, errCredentialNotReady) {
 			reason = reasonProviderNotReady
 		}
-		if statusErr := r.updateModelStatus(ctx, &model, false, reason, err.Error(), nil); statusErr != nil {
+		if statusErr := report(false, reason, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, err
@@ -326,7 +353,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			return reconcile.Result{}, cleanupErr
 		}
 		message := "no ExternalModel provider references resolved to a Ready provider"
-		if statusErr := r.updateModelStatus(ctx, &model, false, reasonNoRoutes, message, nil); statusErr != nil {
+		if statusErr := report(false, reasonNoRoutes, message, nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, resolver.ErrNoRoutes
@@ -337,7 +364,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 				return reconcile.Result{}, statusErr
 			}
 		}
-		if statusErr := r.updateModelStatus(ctx, &model, false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
+		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, err
@@ -346,7 +373,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{}, err
 	}
 	if err := r.cleanupTransport(ctx, req.Namespace, gatewayName, gatewayNamespace, set.Routes()); err != nil {
-		if statusErr := r.updateModelStatus(ctx, &model, false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
+		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, err
@@ -371,14 +398,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		KnownClusters: r.KnownClusters, SourceUID: string(model.UID), ProducerVersion: r.ProducerVersion,
 	})
 	if err != nil {
-		if statusErr := r.updateModelStatus(ctx, &model, false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
+		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, err
 	}
 
 	message := fmt.Sprintf("distributed routing overlay digest %s generation %d", result.Envelope.Revision.Value, result.Envelope.Provenance.SourceGeneration)
-	if err := r.updateModelStatus(ctx, &model, true, reasonReconciled, message, &result.Envelope); err != nil {
+	if err := report(true, reasonReconciled, message, &result.Envelope); err != nil {
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
@@ -396,7 +423,7 @@ type modelTenantContext struct {
 // AITenant before any ExternalModel serving state is published. A false
 // proceed result means status/cleanup work was completed and the caller must
 // stop this reconcile.
-func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.ExternalModel, namespace string) (modelTenantContext, bool, error) {
+func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.ExternalModel, namespace string, report modelStatusReporter) (modelTenantContext, bool, error) {
 	// Re-read the selector, handoff status, deletion state, and owner from the
 	// API server immediately before making the cleanup/apply decision. The
 	// informer copy can be behind an IPP switch or an AITenant replacement.
@@ -405,7 +432,16 @@ func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.Ext
 		return modelTenantContext{}, false, err
 	}
 	if live.missingConfig {
-		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "MaasTenantConfig/default-tenant is missing; retaining serving state and waiting for the owner to resolve", nil); err != nil {
+		if len(model.Spec.GatewayRefs) == 0 && !controllerutil.ContainsFinalizer(model, externalModelFinalizer) {
+			// Never served here: this namespace is not a tenant namespace.
+			// Do not choose another gateway; explicit gatewayRefs select one.
+			message := fmt.Sprintf("namespace %s has no MaasTenantConfig; set spec.gatewayRefs to attach this model to a tenant gateway", namespace)
+			if err := r.setModelStatus(ctx, model, modelPhasePending, false, reasonTenantNotResolved, message, ""); err != nil {
+				return modelTenantContext{}, false, err
+			}
+			return modelTenantContext{}, false, nil
+		}
+		if err := report(false, reasonTenantNotReady, "MaasTenantConfig/default-tenant is missing; retaining serving state and waiting for the owner to resolve", nil); err != nil {
 			return modelTenantContext{}, false, err
 		}
 		return modelTenantContext{}, false, nil
@@ -419,13 +455,13 @@ func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.Ext
 		return modelTenantContext{}, false, nil
 	}
 	if live.aitenant == nil {
-		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "owning AITenant is not yet resolvable for MaasTenantConfig", nil); err != nil {
+		if err := report(false, reasonTenantNotReady, "owning AITenant is not yet resolvable for MaasTenantConfig", nil); err != nil {
 			return modelTenantContext{}, false, err
 		}
 		return modelTenantContext{}, false, nil
 	}
 	if live.status != tenant.PayloadProcessingStatusSteady {
-		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "MaasTenantConfig selects Praxis but payload-processing-status is not steady", nil); err != nil {
+		if err := report(false, reasonTenantNotReady, "MaasTenantConfig selects Praxis but payload-processing-status is not steady", nil); err != nil {
 			return modelTenantContext{}, false, err
 		}
 		return modelTenantContext{}, false, nil
@@ -433,13 +469,13 @@ func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.Ext
 	ait := live.aitenant
 	gatewayName, gatewayNamespace, gatewayReady := tenant.GatewayRef(ait)
 	if !gatewayReady {
-		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "AITenant Gateway reference is not ready", nil); err != nil {
+		if err := report(false, reasonTenantNotReady, "AITenant Gateway reference is not ready", nil); err != nil {
 			return modelTenantContext{}, false, err
 		}
 		return modelTenantContext{}, false, nil
 	}
 	if !tenant.IsActive(ait) || !tenant.StatusIsCurrent(ait) {
-		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "AITenant is selected for Praxis but is not Active", nil); err != nil {
+		if err := report(false, reasonTenantNotReady, "AITenant is selected for Praxis but is not Active", nil); err != nil {
 			return modelTenantContext{}, false, err
 		}
 		return modelTenantContext{}, false, nil
@@ -578,6 +614,16 @@ func (r *Reconciler) reconcileDeletedModel(ctx context.Context, deleted *v1alpha
 }
 
 func (r *Reconciler) reconcileDeletedModelWithIdentity(ctx context.Context, deleted *v1alpha1.ExternalModel, tenantID, gatewayName, gatewayNamespace string) error {
+	if err := r.republishHomeWithout(ctx, deleted, tenantID, gatewayName, gatewayNamespace); err != nil {
+		return err
+	}
+	return r.removeExternalModelFinalizer(ctx, deleted)
+}
+
+// republishHomeWithout republishes the tenant's own serving state without the
+// given model: its deletion, or its gatewayRefs no longer naming its own
+// tenant. Only the final served model may remove the shared serving state.
+func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1.ExternalModel, tenantID, gatewayName, gatewayNamespace string) error {
 	var models v1alpha1.ExternalModelList
 	if err := r.List(ctx, &models, client.InNamespace(deleted.Namespace)); err != nil {
 		return fmt.Errorf("list remaining ExternalModels for deletion: %w", err)
@@ -586,7 +632,7 @@ func (r *Reconciler) reconcileDeletedModelWithIdentity(ctx context.Context, dele
 	modelOwners := make(map[string]*v1alpha1.ExternalModel, len(models.Items))
 	for i := range models.Items {
 		m := &models.Items[i]
-		if m.Name == deleted.Name || !m.DeletionTimestamp.IsZero() {
+		if m.Name == deleted.Name || !m.DeletionTimestamp.IsZero() || !tenant.ServedByTenantGateway(m, gatewayName, gatewayNamespace) {
 			continue
 		}
 		modelPtrs = append(modelPtrs, m)
@@ -619,10 +665,7 @@ func (r *Reconciler) reconcileDeletedModelWithIdentity(ctx context.Context, dele
 		if err := r.cleanupTransport(ctx, deleted.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
 			return err
 		}
-		if err := r.cleanupOverlay(ctx, deleted.Namespace); err != nil {
-			return err
-		}
-		return r.removeExternalModelFinalizer(ctx, deleted)
+		return r.cleanupOverlay(ctx, deleted.Namespace)
 	}
 	if err != nil {
 		return fmt.Errorf("resolve remaining ExternalModels after deletion: %w", err)
@@ -657,7 +700,7 @@ func (r *Reconciler) reconcileDeletedModelWithIdentity(ctx context.Context, dele
 	}); err != nil {
 		return fmt.Errorf("publish remaining overlay after ExternalModel deletion: %w", err)
 	}
-	return r.removeExternalModelFinalizer(ctx, deleted)
+	return nil
 }
 
 func (r *Reconciler) removeExternalModelFinalizer(ctx context.Context, model *v1alpha1.ExternalModel) error {
@@ -1247,7 +1290,11 @@ func (r *Reconciler) updateModelStatus(ctx context.Context, m *v1alpha1.External
 	m.Status.ObservedGeneration = m.Generation
 	if ready {
 		m.Status.Phase = resolver.PhaseReady
-		m.Status.HTTPRouteName = modelRouteName(m.Name)
+		// httpRouteName names the route of a single attachment only.
+		m.Status.HTTPRouteName = ""
+		if len(m.Spec.GatewayRefs) <= 1 {
+			m.Status.HTTPRouteName = modelRouteName(m.Name)
+		}
 		if env != nil {
 			m.Status.OverlayDigest = env.Revision.Value
 			m.Status.OverlayGeneration = env.Provenance.SourceGeneration

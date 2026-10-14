@@ -243,7 +243,8 @@ doc comment for the full state machine this mirrors. In short:
   `Conflict` and re-evaluates.
 - Status itself is the durable claim — apply failures after a successful
   claim resume on the next reconcile because status is already `steady`.
-- If `MaasTenantConfig/default-tenant` itself is temporarily missing, the
+- If a tenant namespace's `MaasTenantConfig` (always named `default-tenant`,
+  in every tenant namespace) is temporarily missing, the
   ExternalModel reconciler treats selection as unknown: it retains existing
   serving state, does not infer a backend from `AITenant`, and waits for the
   owner to recreate the config. Cleanup is performed only after an explicit
@@ -252,6 +253,31 @@ doc comment for the full state machine this mirrors. In short:
 - After a full, successful switch-off cleanup (`Reconciler.cleanup`), this
   controller writes `cleanup-complete` (`MarkPayloadProcessingCleanupComplete`)
   so maas-controller may claim to absent and (re)deploy legacy IPP.
+
+### Gateway attachments
+
+`spec.gatewayRefs` ([RHOAIENG-90801](https://redhat.atlassian.net/browse/RHOAIENG-90801))
+serves a model through explicitly selected tenant Gateways, including models in
+user namespaces and models shared by several tenants
+(`pkg/controller/attachment.go`). The contract is the RHOAIENG-90800
+compatibility one-pager; this records how it is implemented.
+
+- **Home attachment.** The tenant whose `MaasTenantConfig` is in the model
+  namespace serves the model when `gatewayRefs` is omitted or names its
+  Gateway, through the existing tenant-local path with unchanged resources,
+  identifiers and deletion. A model without `gatewayRefs` in a namespace with no
+  `MaasTenantConfig` gets no serving state (`Pending`, `TenantNotResolved`). An
+  explicit binding never falls back to another Gateway.
+- **Extra attachments** resolve Gateway → owning `AITenant`
+  (`status.gatewayRef`) → its `MaasTenantConfig` (`GatewayNotManaged`,
+  `AmbiguousTenant`) and are gated per tenant by the handshake above: Praxis and
+  `steady`, otherwise `TenantNotSteady` (existing state retained) or
+  `TenantNotPraxis`. Status reports the first failing attachment in
+  `gatewayRefs` order; per-Gateway status is [RHOAIENG-90802](https://redhat.atlassian.net/browse/RHOAIENG-90802).
+
+Serving a model through another tenant's Gateway follows in the next changes:
+until then such an attachment reports `AttachmentPending` and receives no
+serving state.
 
 ## Scope
 
