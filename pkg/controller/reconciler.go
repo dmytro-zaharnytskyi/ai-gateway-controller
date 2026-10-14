@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 
@@ -106,6 +107,11 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels), builder.WithPredicates(inScope)).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewMaasTenantConfig(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.maasTenantConfigModels))).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewAITenant(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.tenantModels))).
+		// Gateway attachments: route acceptance is reported in HTTPRoute
+		// status, and a model-name change can decide a conflict on another
+		// namespace's attachment.
+		WatchesRawSource(source.Kind(mgr.GetCache(), newHTTPRoute(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.attachmentRouteModels))).
+		Watches(&v1alpha1.ExternalModel{}, handler.EnqueueRequestsFromMapFunc(r.sameNameModels), builder.WithPredicates(inScope)).
 		Complete(r)
 }
 
@@ -721,13 +727,21 @@ func (r *Reconciler) cleanupTransport(ctx context.Context, namespace, gatewayNam
 		providers[route.Provider] = true
 		models[route.Model] = true
 	}
+	// Gateway attachments from this namespace share its provider Services,
+	// ServiceEntries and selection sinks.
+	transportProviders, transportModels, err := r.attachmentTransportKeep(ctx, namespace)
+	if err != nil {
+		return err
+	}
+	maps.Copy(transportProviders, providers)
+	maps.Copy(transportModels, models)
 	resources := []struct {
 		kind, group, version, label string
 		keep                        map[string]bool
 	}{
-		{"Service", "", "v1", "inference.opendatahub.io/external-provider", providers},
-		{"Service", "", "v1", "inference.opendatahub.io/external-model", models},
-		{"ServiceEntry", "networking.istio.io", "v1", "inference.opendatahub.io/external-provider", providers},
+		{"Service", "", "v1", "inference.opendatahub.io/external-provider", transportProviders},
+		{"Service", "", "v1", "inference.opendatahub.io/external-model", transportModels},
+		{"ServiceEntry", "networking.istio.io", "v1", "inference.opendatahub.io/external-provider", transportProviders},
 		{"DestinationRule", "networking.istio.io", "v1", "inference.opendatahub.io/external-provider", providers},
 		{"HTTPRoute", "gateway.networking.k8s.io", "v1", "inference.opendatahub.io/external-model", models},
 	}
@@ -1469,7 +1483,7 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 			continue
 		}
 		seenProviders[candidate.Provider] = true
-		stableID := envelope.CandidateStableID(route.Model, candidate.Provider)
+		stableID := envelope.RouteStableID(candidate)
 		rules = append(rules, map[string]any{
 			"matches": []any{map[string]any{
 				"path":    map[string]any{"type": "PathPrefix", "value": path},

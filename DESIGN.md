@@ -272,12 +272,29 @@ compatibility one-pager; this records how it is implemented.
   (`status.gatewayRef`) → its `MaasTenantConfig` (`GatewayNotManaged`,
   `AmbiguousTenant`) and are gated per tenant by the handshake above: Praxis and
   `steady`, otherwise `TenantNotSteady` (existing state retained) or
-  `TenantNotPraxis`. Status reports the first failing attachment in
-  `gatewayRefs` order; per-Gateway status is [RHOAIENG-90802](https://redhat.atlassian.net/browse/RHOAIENG-90802).
+  `TenantNotPraxis` (a cleanup request: the attachment's route is removed).
+  Status reports the first failing attachment in `gatewayRefs` order; per-Gateway
+  status is [RHOAIENG-90802](https://redhat.atlassian.net/browse/RHOAIENG-90802).
+- **Authorization.** The attachment's HTTPRoute is created in the model
+  namespace first and the Gateway enforces its listener `allowedRoutes`;
+  `Accepted=False` reports the Gateway's reason. Default MaaS Gateways use
+  `allowedRoutes.from: Same`, so user-namespace models need an
+  administrator-configured namespace selector. A model-name conflict (across
+  namespaces only: the tenant's own models win, then the oldest), a resolution
+  or credential failure, or more than 7 providers (`TooManyProviders`) excludes
+  the model and removes its route.
+- **Identifiers.** Attachment HTTPRoutes are named
+  `external-model-<model>-<hash12>`, carry identity annotations and are never
+  adopted or deleted when they do not match. Overlay candidates of models from
+  other namespaces use `stable_id`
+  `<modelNamespace>/<model>/<providerNamespace>/<provider>` (`sha256:` above 256
+  bytes), disjoint from the existing form. Tenant-local cleanup keeps the
+  model-namespace transport that attachment routes use.
 
-Serving a model through another tenant's Gateway follows in the next changes:
-until then such an attachment reports `AttachmentPending` and receives no
-serving state.
+Publishing into the tenant (DestinationRules, credential copies and overlay
+entries, only after the Gateway accepts the route) follows in the next change;
+until then an accepted attachment reports `AttachmentPending` and carries no
+traffic.
 
 ## Scope
 

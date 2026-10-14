@@ -1,0 +1,66 @@
+package envelope
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
+)
+
+func TestScopedStableIDFormsAreDisjointFromExistingForm(t *testing.T) {
+	existing := CandidateStableID("model", "openai")
+	scoped := ScopedStableID("team", "model", "team", "openai")
+	if scoped != "team/model/team/openai" {
+		t.Fatalf("scoped stable_id = %q", scoped)
+	}
+	long := strings.Repeat("m", 253)
+	hashed := ScopedStableID(strings.Repeat("n", 63), long, strings.Repeat("p", 63), long)
+	if !strings.HasPrefix(hashed, "sha256:") || len(hashed) != len("sha256:")+64 || len(hashed) > maxStableIDBytes {
+		t.Fatalf("over-limit stable_id = %q", hashed)
+	}
+	if IsScopedStableID(existing) || !IsScopedStableID(scoped) || !IsScopedStableID(hashed) {
+		t.Fatalf("form detection: existing=%t scoped=%t hashed=%t", IsScopedStableID(existing), IsScopedStableID(scoped), IsScopedStableID(hashed))
+	}
+	// Length prefixes keep field boundaries in the hash input.
+	if ScopedStableID("a", long+"b", "c", long) == ScopedStableID("a", long, "bc", long) {
+		t.Fatal("hash form must not depend on field concatenation only")
+	}
+}
+
+func TestRenderUsesRouteOverridesAndPreservedCandidates(t *testing.T) {
+	r := route("model", "openai", 1)
+	r.StableID = ScopedStableID("team", "model", "team", "openai")
+	r.SecretName, r.SecretNamespace = "agc-cred-0123456789ab", "tenant-b"
+	preserved := Candidate{Cluster: "provider-own", StableID: "own/provider-own", Kind: "inference_model", Name: "own", Site: "site-a", Fresh: true}
+	env, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "team/model", Routes: []resolver.Route{r}}), scope(), Revision{},
+		Options{PreservedCandidates: []Candidate{preserved}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates := env.Overlay.Candidates
+	if len(candidates) != 2 || candidates[0] != preserved {
+		t.Fatalf("candidates = %#v, want the preserved candidate first", candidates)
+	}
+	if candidates[1].StableID != r.StableID || candidates[1].Credential.SecretRef != (SecretRef{Name: r.SecretName, Namespace: "tenant-b", Key: "api-key"}) {
+		t.Fatalf("rendered candidate = %#v", candidates[1])
+	}
+}
+
+func TestValidateModelMatchesRenderRejections(t *testing.T) {
+	unqualified := route("model", "openai", 1)
+	unqualified.APIFormat = "messages"
+	for name, m := range map[string]resolver.ModelRoutes{
+		"weights":    {ModelRef: "team/model", Routes: []resolver.Route{route("model", "a", 1), route("model", "b", 2)}},
+		"credential": {ModelRef: "team/model", Routes: []resolver.Route{unqualified}},
+	} {
+		if err := ValidateModel(m, Options{}); err == nil {
+			t.Fatalf("%s: ValidateModel accepted a model Render rejects", name)
+		}
+		if _, err := Render(routeSet(m), scope(), Revision{}, Options{}); err == nil {
+			t.Fatalf("%s: Render accepted the model", name)
+		}
+	}
+	if err := ValidateModel(resolver.ModelRoutes{Routes: []resolver.Route{route("model", "a", 1)}}, Options{KnownClusters: []string{"provider-b"}}); err == nil {
+		t.Fatal("ValidateModel accepted an unknown cluster")
+	}
+}

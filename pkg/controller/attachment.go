@@ -2,41 +2,61 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"slices"
+	"sort"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
 )
 
 // Gateway attachments (spec.gatewayRefs). The home attachment is the one
 // whose tenant's MaasTenantConfig is in the model namespace; it keeps the
-// existing tenant-local path unchanged. Every other attachment is resolved to
-// the tenant that owns its Gateway and gated by that tenant's backend
-// handshake on its own.
+// existing tenant-local path unchanged. Every other attachment contributes the
+// model to a tenant from another namespace: an HTTPRoute in the model
+// namespace, and, only after the Gateway accepts that route, a hashed
+// DestinationRule in the Gateway namespace, credential copies in the tenant
+// namespace and the tenant's overlay entries.
 const (
 	reasonTenantNotResolved = "TenantNotResolved"
 	reasonGatewayNotManaged = "GatewayNotManaged"
 	reasonAmbiguousTenant   = "AmbiguousTenant"
 	reasonTenantNotPraxis   = "TenantNotPraxis"
 	reasonTenantNotSteady   = "TenantNotSteady"
+	reasonModelNameConflict = "ModelNameConflict"
+	reasonTooManyProviders  = "TooManyProviders"
 	reasonAttachmentPending = "AttachmentPending"
 
 	modelPhasePending = "Pending"
 	modelPhaseFailed  = "Failed"
 
+	// maxAttachedProviders keeps an attached model's HTTPRoute within the
+	// Gateway API limit of 16 rules: two per provider plus two sink rules.
+	maxAttachedProviders = 7
+
 	attachmentRequeueInterval = 5 * time.Second
+
+	annotationAttachmentModel     = "inference.opendatahub.io/attachment-model"
+	annotationAttachmentGateway   = "inference.opendatahub.io/attachment-gateway"
+	annotationAttachmentProviders = "inference.opendatahub.io/attachment-providers"
 )
 
 var httpRouteGVK = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"}
@@ -60,12 +80,44 @@ type attachmentResult struct {
 	env *envelope.Envelope
 }
 
+// attachedModel is one model from another namespace attached to a tenant.
+// A non-empty reason excludes it from the tenant.
+type attachedModel struct {
+	model     *v1alpha1.ExternalModel
+	routeName string
+	routes    []resolver.Route // stable IDs and credentials rewritten for the tenant
+	reason    string
+	message   string
+}
+
 func gatewayKey(gateway v1alpha1.NamespacedObjectReference) string {
 	return gateway.Namespace + "/" + gateway.Name
 }
 
 func hasGatewayRef(model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference) bool {
 	return slices.Contains(model.Spec.GatewayRefs, gateway)
+}
+
+func clientModelName(model *v1alpha1.ExternalModel) string {
+	if model.Spec.ModelName != "" {
+		return model.Spec.ModelName
+	}
+	return model.Name
+}
+
+func shortHash(parts ...string) string {
+	sum := sha256.Sum256([]byte(strings.Join(parts, "/")))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+// attachmentRouteName names an extra attachment's HTTPRoute in the model
+// namespace. The home attachment keeps modelRouteName.
+func attachmentRouteName(model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference) string {
+	hash := shortHash(model.Namespace, model.Name, gateway.Namespace, gateway.Name)
+	if name := modelRouteName(model.Name) + "-" + hash; len(name) <= 253 {
+		return name
+	}
+	return modelRoutePrefix + hash
 }
 
 func newHTTPRoute() *unstructured.Unstructured {
@@ -90,6 +142,40 @@ func (r *Reconciler) gatewayAttachedModels(ctx context.Context, ait *unstructure
 	for i := range models.Items {
 		if r.namespaceAllowed(models.Items[i].Namespace) && hasGatewayRef(&models.Items[i], gateway) {
 			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&models.Items[i])})
+		}
+	}
+	return requests
+}
+
+// attachmentRouteModels maps an attachment HTTPRoute to its model.
+func (r *Reconciler) attachmentRouteModels(_ context.Context, route *unstructured.Unstructured) []reconcile.Request {
+	if _, ok := route.GetLabels()[tenant.LabelAttachmentTenant]; !ok {
+		return nil
+	}
+	model := route.GetAnnotations()[annotationAttachmentModel]
+	if model == "" || !r.namespaceAllowed(route.GetNamespace()) {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: route.GetNamespace(), Name: model}}}
+}
+
+// sameNameModels enqueues attached models in other namespaces with the same
+// client-facing name, so a model-name conflict is re-decided for them.
+func (r *Reconciler) sameNameModels(ctx context.Context, obj client.Object) []reconcile.Request {
+	changed, ok := obj.(*v1alpha1.ExternalModel)
+	if !ok {
+		return nil
+	}
+	var models v1alpha1.ExternalModelList
+	if err := r.List(ctx, &models); err != nil {
+		r.Log.Error(err, "list models for model-name conflict", "model", changed.Name)
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range models.Items {
+		m := &models.Items[i]
+		if m.Namespace != changed.Namespace && len(m.Spec.GatewayRefs) > 0 && r.namespaceAllowed(m.Namespace) && clientModelName(m) == clientModelName(changed) {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(m)})
 		}
 	}
 	return requests
@@ -213,17 +299,23 @@ func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1
 		if target.tenantNamespace == "" {
 			continue
 		}
-		_, gated, _, err := r.gateAttachmentTenant(ctx, target.ait, target.tenantNamespace, target.result)
+		t, gated, cleanup, err := r.gateAttachmentTenant(ctx, target.ait, target.tenantNamespace, target.result)
 		results[i] = gated
 		switch {
 		case err != nil:
 			errs = append(errs, err)
 			results[i] = failedAttachment(gated, err)
+		case cleanup:
+			// An explicit non-Praxis selection is the existing cleanup
+			// command: the attachment's route is removed.
+			if err := r.removeAttachmentRoute(ctx, model, gated.gateway); err != nil {
+				errs = append(errs, err)
+			}
 		case gated.ready:
-			// Serving through another tenant's Gateway follows; until then
-			// the attachment is reported and never served.
-			results[i].ready, results[i].reason = false, reasonAttachmentPending
-			results[i].message = "serving through another tenant's Gateway is not implemented yet"
+			if results[i], err = r.reconcileAttachment(ctx, model, t); err != nil {
+				errs = append(errs, err)
+				results[i] = failedAttachment(results[i], err)
+			}
 		}
 	}
 
@@ -357,4 +449,371 @@ func (r *Reconciler) setModelStatus(ctx context.Context, m *v1alpha1.ExternalMod
 		return fmt.Errorf("update model status %s/%s: %w", m.Namespace, m.Name, err)
 	}
 	return nil
+}
+
+// reconcileAttachment serves the model through a steady Praxis tenant of
+// another namespace.
+func (r *Reconciler) reconcileAttachment(ctx context.Context, model *v1alpha1.ExternalModel, t attachmentTenant) (attachmentResult, error) {
+	result := attachmentResult{gateway: t.gateway, routeName: attachmentRouteName(model, t.gateway)}
+	candidates, err := r.attachmentCandidates(ctx, t)
+	if err != nil {
+		return result, err
+	}
+	idx := slices.IndexFunc(candidates, func(c attachedModel) bool { return c.model.UID == model.UID })
+	if idx < 0 {
+		result.pending, result.reason, result.message = true, reasonAttachmentPending, "waiting for the model to be observed"
+		return result, nil
+	}
+	self := candidates[idx]
+	if self.reason != "" {
+		// A model-name conflict, a resolution or credential failure (such
+		// as a deleted source Secret) and too many providers all exclude the
+		// model: no route, overlay entry or transport on this Gateway.
+		result.reason, result.message = self.reason, self.message
+		return result, r.removeAttachmentRoute(ctx, model, t.gateway)
+	}
+	providers, _, validProviders, err := r.providerInputs(ctx, model.Namespace)
+	if err != nil {
+		return result, err
+	}
+	providerOwners := make(map[string]*v1alpha1.ExternalProvider, len(providers.Items))
+	for i := range providers.Items {
+		providerOwners[providers.Items[i].Name] = &providers.Items[i]
+	}
+	if err := r.applyAttachmentRoute(ctx, self, t, providerOwners); err != nil {
+		return result, err
+	}
+	tenantNamespace, err := r.isTenantNamespace(ctx, model.Namespace)
+	if err != nil {
+		return result, err
+	}
+	for _, p := range validProviders {
+		// In a tenant namespace the tenant-local path writes provider status.
+		if !tenantNamespace && slices.ContainsFunc(self.routes, func(route resolver.Route) bool { return route.Provider == p.Name }) {
+			if err := r.updateProviderStatus(ctx, p, true, reasonReconciled, "provider Secret reference and transport resources are ready"); err != nil {
+				return result, err
+			}
+		}
+	}
+
+	route, err := r.getAttachmentRoute(ctx, model.Namespace, self.routeName)
+	if err != nil {
+		return result, err
+	}
+	if accepted, reason, message := routeAccepted(route, t.gateway); !accepted {
+		result.reason, result.message = reason, message
+		result.pending = reason == reasonAttachmentPending
+		return result, nil
+	}
+	// Publishing into the tenant (DestinationRule, credential copies and
+	// overlay entry) follows; until then the route carries no traffic.
+	result.reason, result.message = reasonAttachmentPending, "the Gateway accepted the attachment HTTPRoute; publishing into the tenant is not implemented yet"
+	return result, nil
+}
+
+// ownServedModels lists the models the tenant serves from its own namespace.
+func (r *Reconciler) ownServedModels(ctx context.Context, t attachmentTenant) ([]*v1alpha1.ExternalModel, error) {
+	var models v1alpha1.ExternalModelList
+	if err := r.List(ctx, &models, client.InNamespace(t.namespace)); err != nil {
+		return nil, fmt.Errorf("list tenant ExternalModels in %s: %w", t.namespace, err)
+	}
+	own := make([]*v1alpha1.ExternalModel, 0, len(models.Items))
+	for i := range models.Items {
+		if tenant.ServedByTenantGateway(&models.Items[i], t.gateway.Name, t.gateway.Namespace) {
+			own = append(own, &models.Items[i])
+		}
+	}
+	return own, nil
+}
+
+// attachmentCandidates returns every model from another namespace attached
+// to the tenant's Gateway, oldest first, with model-name conflicts and
+// per-model resolution decided. Failures exclude only that model.
+func (r *Reconciler) attachmentCandidates(ctx context.Context, t attachmentTenant) ([]attachedModel, error) {
+	if r.Namespace != "" {
+		// A single-namespace controller serves no other namespaces.
+		return nil, nil
+	}
+	own, err := r.ownServedModels(ctx, t)
+	if err != nil {
+		return nil, err
+	}
+	winners := map[string]string{}
+	for _, m := range own {
+		if m.DeletionTimestamp.IsZero() {
+			// The tenant's own models always keep their model name.
+			winners[clientModelName(m)] = m.Namespace + "/" + m.Name
+		}
+	}
+	var models v1alpha1.ExternalModelList
+	if err := r.List(ctx, &models); err != nil {
+		return nil, fmt.Errorf("list ExternalModels attached to Gateway %s: %w", gatewayKey(t.gateway), err)
+	}
+	attached := make([]*v1alpha1.ExternalModel, 0)
+	for i := range models.Items {
+		m := &models.Items[i]
+		if m.Namespace != t.namespace && m.DeletionTimestamp.IsZero() && hasGatewayRef(m, t.gateway) {
+			attached = append(attached, m)
+		}
+	}
+	sort.SliceStable(attached, func(i, j int) bool {
+		if !attached[i].CreationTimestamp.Equal(&attached[j].CreationTimestamp) {
+			return attached[i].CreationTimestamp.Before(&attached[j].CreationTimestamp)
+		}
+		return attached[i].Namespace+"/"+attached[i].Name < attached[j].Namespace+"/"+attached[j].Name
+	})
+	candidates := make([]attachedModel, 0, len(attached))
+	for _, m := range attached {
+		candidate := attachedModel{model: m, routeName: attachmentRouteName(m, t.gateway)}
+		name := clientModelName(m)
+		if winner, taken := winners[name]; taken {
+			candidate.reason = reasonModelNameConflict
+			candidate.message = fmt.Sprintf("model name %q is served on this Gateway by ExternalModel %s", name, winner)
+		} else {
+			winners[name] = m.Namespace + "/" + m.Name
+			if err := r.resolveAttachedModel(ctx, &candidate); err != nil {
+				return nil, err
+			}
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates, nil
+}
+
+// resolveAttachedModel resolves one attached model against the providers of
+// its own namespace and rewrites its routes for the tenant with scoped stable
+// IDs.
+func (r *Reconciler) resolveAttachedModel(ctx context.Context, candidate *attachedModel) error {
+	m := candidate.model
+	var providers v1alpha1.ExternalProviderList
+	if err := r.List(ctx, &providers, client.InNamespace(m.Namespace)); err != nil {
+		return fmt.Errorf("list ExternalProviders in %s: %w", m.Namespace, err)
+	}
+	providerPtrs := make([]*v1alpha1.ExternalProvider, 0, len(providers.Items))
+	for i := range providers.Items {
+		if r.validateProvider(ctx, &providers.Items[i]) != nil {
+			continue
+		}
+		ready := providers.Items[i].DeepCopy()
+		ready.Status.Phase = resolver.PhaseReady
+		providerPtrs = append(providerPtrs, ready)
+	}
+	set, err := resolver.Resolve([]*v1alpha1.ExternalModel{m}, providerPtrs)
+	if err == nil {
+		err = r.validateResolvedCredentials(ctx, set.Routes())
+	}
+	if transientReadError(err) {
+		// A failed Secret read is not the model's own failure: retry
+		// instead of excluding, and so withdrawing, a served attachment.
+		return err
+	}
+	if err != nil {
+		candidate.reason, candidate.message = reasonReconcileFailed, err.Error()
+		if errors.Is(err, resolver.ErrNoRoutes) || errors.Is(err, errCredentialNotReady) {
+			candidate.reason = reasonProviderNotReady
+		}
+		return nil
+	}
+	routes := set.Routes()
+	distinct := map[string]bool{}
+	for _, route := range routes {
+		distinct[route.Provider] = true
+	}
+	if len(distinct) > maxAttachedProviders {
+		candidate.reason = reasonTooManyProviders
+		candidate.message = fmt.Sprintf("%d providers exceed the limit of %d for an attached model", len(distinct), maxAttachedProviders)
+		return nil
+	}
+	if err := envelope.ValidateModel(set.Models[0], envelope.Options{KnownClusters: r.KnownClusters}); err != nil {
+		candidate.reason, candidate.message = reasonReconcileFailed, err.Error()
+		return nil //nolint:nilerr // excludes only this model
+	}
+	for i := range routes {
+		route := &routes[i]
+		route.StableID = envelope.ScopedStableID(m.Namespace, m.Name, route.Namespace, route.Provider)
+	}
+	candidate.routes = routes
+	return nil
+}
+
+// transientReadError reports an API read that failed for a reason other than
+// the object being absent.
+func transientReadError(err error) bool {
+	if err == nil || apierrors.IsNotFound(err) {
+		return false
+	}
+	var status apierrors.APIStatus
+	var urlErr *url.Error
+	return errors.As(err, &status) || errors.As(err, &urlErr) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// applyAttachmentRoute applies the model-namespace transport and the
+// attachment's HTTPRoute. Provider Services, ServiceEntries and the selection
+// sink are shared with the model's other attachments.
+func (r *Reconciler) applyAttachmentRoute(ctx context.Context, a attachedModel, t attachmentTenant, providerOwners map[string]*v1alpha1.ExternalProvider) error {
+	m := a.model
+	route := modelHTTPRouteSet(a.routes, m.Namespace, t.gateway.Name, t.gateway.Namespace)
+	providers := make([]string, 0, len(a.routes))
+	var resources []unstructured.Unstructured
+	for _, provider := range a.routes {
+		if slices.Contains(providers, provider.Provider) {
+			continue
+		}
+		providers = append(providers, provider.Provider)
+		for _, obj := range []unstructured.Unstructured{providerService(provider, m.Namespace), providerServiceEntry(provider, m.Namespace)} {
+			if owner := providerOwners[provider.Provider]; owner != nil {
+				setOwnerReference(&obj, owner)
+			}
+			resources = append(resources, obj)
+		}
+	}
+	sink := providerSelectionSink(a.routes[0], m.Namespace)
+	setOwnerReference(&sink, m)
+	route.SetName(a.routeName)
+	route.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "ai-gateway-controller", tenant.LabelAttachmentTenant: t.namespace})
+	route.SetAnnotations(map[string]string{
+		annotationAttachmentModel:     m.Name,
+		annotationAttachmentGateway:   gatewayKey(t.gateway),
+		annotationAttachmentProviders: strings.Join(providers, ","),
+	})
+	setOwnerReference(&route, m)
+	if existing, err := r.getAttachmentRoute(ctx, m.Namespace, a.routeName); err != nil {
+		return err
+	} else if existing != nil && !isAttachmentRoute(existing, m, t.gateway) {
+		return fmt.Errorf("HTTPRoute %s/%s exists with a different identity; refusing to adopt it", m.Namespace, a.routeName)
+	}
+	return r.applyResources(ctx, append(resources, sink, route))
+}
+
+func (r *Reconciler) applyResources(ctx context.Context, resources []unstructured.Unstructured) error {
+	for _, resource := range resources {
+		if r.ApplyResource != nil {
+			if err := r.ApplyResource(ctx, r.Client, resource); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := render.Apply(ctx, r.Client, []unstructured.Unstructured{resource}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// getAttachmentRoute returns the HTTPRoute at an attachment route name, or nil.
+func (r *Reconciler) getAttachmentRoute(ctx context.Context, namespace, name string) (*unstructured.Unstructured, error) {
+	route := newHTTPRoute()
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, route); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get attachment HTTPRoute %s/%s: %w", namespace, name, err)
+	}
+	return route, nil
+}
+
+// isAttachmentRoute verifies a hashed route name against its identity
+// annotations before AGC adopts or deletes the route.
+func isAttachmentRoute(route *unstructured.Unstructured, model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference) bool {
+	annotations := route.GetAnnotations()
+	return annotations[annotationAttachmentModel] == model.Name && annotations[annotationAttachmentGateway] == gatewayKey(gateway)
+}
+
+// routeAccepted reads the route's parent status for the Gateway. The Gateway
+// enforces listener allowedRoutes; its Accepted=False reason is reported
+// unchanged.
+func routeAccepted(route *unstructured.Unstructured, gateway v1alpha1.NamespacedObjectReference) (bool, string, string) {
+	if route == nil {
+		return false, reasonAttachmentPending, "waiting for the attachment HTTPRoute"
+	}
+	namespace := route.GetNamespace()
+	parents, _, _ := unstructured.NestedSlice(route.Object, "status", "parents")
+	reason, message := reasonAttachmentPending, "waiting for the Gateway to accept the attachment HTTPRoute"
+	for _, raw := range parents {
+		parent, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		parentName, _, _ := unstructured.NestedString(parent, "parentRef", "name")
+		parentNamespace, _, _ := unstructured.NestedString(parent, "parentRef", "namespace")
+		if parentNamespace == "" {
+			parentNamespace = namespace
+		}
+		if parentName != gateway.Name || parentNamespace != gateway.Namespace {
+			continue
+		}
+		conditions, _, _ := unstructured.NestedSlice(parent, "conditions")
+		for _, rawCondition := range conditions {
+			condition, ok := rawCondition.(map[string]any)
+			if !ok || condition["type"] != "Accepted" {
+				continue
+			}
+			if condition["status"] == string(metav1.ConditionTrue) {
+				return true, "", ""
+			}
+			if gatewayReason, _ := condition["reason"].(string); gatewayReason != "" {
+				reason = gatewayReason
+			}
+			if gatewayMessage, _ := condition["message"].(string); gatewayMessage != "" {
+				message = gatewayMessage
+			} else {
+				message = "the Gateway did not accept the attachment HTTPRoute"
+			}
+		}
+	}
+	return false, reason, message
+}
+
+// listAttachmentRoutes lists controller-owned attachment HTTPRoutes.
+func (r *Reconciler) listAttachmentRoutes(ctx context.Context, opts ...client.ListOption) ([]unstructured.Unstructured, error) {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(httpRouteGVK.GroupVersion().WithKind("HTTPRouteList"))
+	opts = append(opts, client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller"}, client.HasLabels{tenant.LabelAttachmentTenant})
+	if err := r.List(ctx, list, opts...); err != nil {
+		return nil, fmt.Errorf("list attachment HTTPRoutes: %w", err)
+	}
+	return list.Items, nil
+}
+
+// removeAttachmentRoute deletes the model's identity-verified HTTPRoute for
+// one Gateway.
+func (r *Reconciler) removeAttachmentRoute(ctx context.Context, model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference) error {
+	route, err := r.getAttachmentRoute(ctx, model.Namespace, attachmentRouteName(model, gateway))
+	if err != nil || route == nil || !isAttachmentRoute(route, model, gateway) {
+		return err
+	}
+	if err := client.IgnoreNotFound(r.Delete(ctx, route)); err != nil {
+		return fmt.Errorf("delete attachment HTTPRoute %s/%s: %w", route.GetNamespace(), route.GetName(), err)
+	}
+	return nil
+}
+
+// attachmentTransportKeep returns the providers and models whose
+// model-namespace transport the namespace's attachment HTTPRoutes use.
+func (r *Reconciler) attachmentTransportKeep(ctx context.Context, namespace string) (map[string]bool, map[string]bool, error) {
+	routes, err := r.listAttachmentRoutes(ctx, client.InNamespace(namespace))
+	if err != nil {
+		return nil, nil, err
+	}
+	providers, models := map[string]bool{}, map[string]bool{}
+	for i := range routes {
+		annotations := routes[i].GetAnnotations()
+		models[annotations[annotationAttachmentModel]] = true
+		for _, provider := range strings.Split(annotations[annotationAttachmentProviders], ",") {
+			providers[provider] = true
+		}
+	}
+	return providers, models, nil
+}
+
+func (r *Reconciler) isTenantNamespace(ctx context.Context, namespace string) (bool, error) {
+	mtc := tenant.NewMaasTenantConfig()
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: tenant.MaasTenantConfigInstanceName}, mtc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get MaasTenantConfig %s: %w", namespace, err)
+	}
+	return true, nil
 }

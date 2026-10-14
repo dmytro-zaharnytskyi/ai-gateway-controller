@@ -101,6 +101,27 @@ func getUnstructured(r *Reconciler, gvk schema.GroupVersionKind, namespace, name
 
 var destinationRuleGVK = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"}
 
+// setRouteParentStatus writes the Gateway's parent status on an attachment
+// HTTPRoute, as the Gateway controller would.
+func setRouteParentStatus(t *testing.T, r *Reconciler, model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference, status metav1.ConditionStatus, reason string) {
+	t.Helper()
+	route, err := getUnstructured(r, httpRouteGVK, model.Namespace, attachmentRouteName(model, gateway))
+	if err != nil {
+		t.Fatalf("attachment HTTPRoute: %v", err)
+	}
+	parents := []any{map[string]any{
+		"parentRef":      map[string]any{"name": gateway.Name, "namespace": gateway.Namespace},
+		"controllerName": "istio.io/gateway-controller",
+		"conditions":     []any{map[string]any{"type": "Accepted", "status": string(status), "reason": reason}},
+	}}
+	if err := unstructured.SetNestedSlice(route.Object, parents, "status", "parents"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Update(context.Background(), route); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func overlayEnvelope(t *testing.T, r *Reconciler, namespace string) envelope.Envelope {
 	t.Helper()
 	var cm corev1.ConfigMap
@@ -114,6 +135,98 @@ func overlayEnvelope(t *testing.T, r *Reconciler, namespace string) envelope.Env
 	return env
 }
 
+func TestUserNamespaceModelServedOnlyAfterRouteAcceptance(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	objects := append([]client.Object{provider, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+
+	reconcileModel(t, r, model)
+	routeName := attachmentRouteName(model, gatewayB)
+	if !strings.HasPrefix(routeName, "external-model-chat-") || len(routeName) != len("external-model-chat-")+12 {
+		t.Fatalf("attachment route name = %q", routeName)
+	}
+	route, err := getUnstructured(r, httpRouteGVK, "team", routeName)
+	if err != nil {
+		t.Fatalf("attachment HTTPRoute was not created first: %v", err)
+	}
+	parent := nestedMapAt(t, nestedSlice(t, route.Object, "spec", "parentRefs"), 0)
+	if parent["name"] != "gw-b" || parent["namespace"] != "gateway-b" {
+		t.Fatalf("parentRef = %#v, want gateway-b/gw-b", parent)
+	}
+	if route.GetLabels()[tenant.LabelAttachmentTenant] != "tenant-b" || route.GetLabels()["inference.opendatahub.io/external-model"] != "" {
+		t.Fatalf("attachment route labels = %#v", route.GetLabels())
+	}
+	if _, err := getUnstructured(r, schema.GroupVersionKind{Version: "v1", Kind: "Service"}, "team", "provider-openai"); err != nil {
+		t.Fatalf("model-namespace provider Service: %v", err)
+	}
+	assertAttachmentUnpublished := func() {
+		t.Helper()
+		rules := &unstructured.UnstructuredList{}
+		rules.SetGroupVersionKind(destinationRuleGVK.GroupVersion().WithKind("DestinationRuleList"))
+		if err := r.List(context.Background(), rules, client.InNamespace("gateway-b")); err != nil || len(rules.Items) != 0 {
+			t.Fatalf("DestinationRule published into the tenant: %v %v", err, rules.Items)
+		}
+		var secrets corev1.SecretList
+		if err := r.List(context.Background(), &secrets, client.InNamespace("tenant-b")); err != nil || len(secrets.Items) != 0 {
+			t.Fatalf("credential copy published into the tenant: %v %v", err, secrets.Items)
+		}
+		var overlay corev1.ConfigMap
+		if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
+			t.Fatalf("overlay published before acceptance: %v", err)
+		}
+	}
+	assertAttachmentUnpublished()
+	if got := getModel(t, r, model); got.Status.Phase != modelPhasePending || readyReason(got) != reasonAttachmentPending {
+		t.Fatalf("pending status = %q/%q", got.Status.Phase, readyReason(got))
+	}
+
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionFalse, "NotAllowedByListeners")
+	reconcileModel(t, r, model)
+	assertAttachmentUnpublished()
+	if got := getModel(t, r, model); got.Status.Phase != modelPhaseFailed || readyReason(got) != "NotAllowedByListeners" {
+		t.Fatalf("rejected status = %q/%q, want the Gateway's reason", got.Status.Phase, readyReason(got))
+	}
+
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	// Publishing into the tenant follows; an accepted route alone serves nothing.
+	assertAttachmentUnpublished()
+	if got := getModel(t, r, model); got.Status.Phase == resolver.PhaseReady || readyReason(got) != reasonAttachmentPending {
+		t.Fatalf("accepted status = %q/%q, want %q", got.Status.Phase, readyReason(got), reasonAttachmentPending)
+	}
+}
+
+func TestSharedModelAttachesToTenantsInIsolation(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB, gatewayC)
+	objects := []client.Object{provider, secret, model}
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	objects = append(objects, attachmentTenantObjects("tenant-c", "tenant-c", gatewayC, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	setRouteParentStatus(t, r, model, gatewayC, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+
+	routeB, routeC := attachmentRouteName(model, gatewayB), attachmentRouteName(model, gatewayC)
+	if routeB == routeC {
+		t.Fatalf("attachments share HTTPRoute name %q", routeB)
+	}
+	for _, tc := range []struct {
+		gateway v1alpha1.NamespacedObjectReference
+		route   string
+	}{{gatewayB, routeB}, {gatewayC, routeC}} {
+		route, err := getUnstructured(r, httpRouteGVK, "team", tc.route)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if parent := nestedMapAt(t, nestedSlice(t, route.Object, "spec", "parentRefs"), 0); parent["name"] != tc.gateway.Name || parent["namespace"] != tc.gateway.Namespace {
+			t.Fatalf("route %s parentRef = %#v", tc.route, parent)
+		}
+	}
+}
+
 func TestUnsupportedAttachmentDoesNotBlockOtherAttachments(t *testing.T) {
 	provider, secret := attachmentProvider("team")
 	unmanaged := v1alpha1.NamespacedObjectReference{Name: "unmanaged", Namespace: "elsewhere"}
@@ -123,7 +236,17 @@ func TestUnsupportedAttachmentDoesNotBlockOtherAttachments(t *testing.T) {
 	objects = append(objects, attachmentTenantObjects("tenant-c", "tenant-c", gatewayC, "ipp")...)
 	r := attachmentReconciler(t, objects...)
 	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
 
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB)); err != nil {
+		t.Fatalf("the Praxis tenant attachment must get its route: %v", err)
+	}
+	for _, gateway := range []v1alpha1.NamespacedObjectReference{gatewayC, unmanaged} {
+		if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gateway)); !apierrors.IsNotFound(err) {
+			t.Fatalf("unsupported attachment %s received a route: %v", gatewayKey(gateway), err)
+		}
+	}
 	var overlay corev1.ConfigMap
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-c", Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
 		t.Fatalf("non-Praxis tenant received an overlay: %v", err)
@@ -139,6 +262,41 @@ func TestUnsupportedAttachmentDoesNotBlockOtherAttachments(t *testing.T) {
 	reconcileModel(t, r, unmanagedOnly)
 	if got := getModel(t, r, unmanagedOnly); readyReason(got) != reasonGatewayNotManaged {
 		t.Fatalf("status reason = %q, want %q", readyReason(got), reasonGatewayNotManaged)
+	}
+}
+
+func TestModelNameConflictKeepsTenantModelThenOldest(t *testing.T) {
+	tenantProvider, tenantSecret := attachmentProvider("tenant-b")
+	ownModel := attachmentModel("own", "tenant-b", "chat-model", time.Unix(300, 0))
+	providerOne, secretOne := attachmentProvider("team-one")
+	providerTwo, secretTwo := attachmentProvider("team-two")
+	conflicting := attachmentModel("chat", "team-one", "chat-model", time.Unix(100, 0), gatewayB)
+	older := attachmentModel("older", "team-one", "shared-name", time.Unix(100, 0), gatewayB)
+	newer := attachmentModel("newer", "team-two", "shared-name", time.Unix(200, 0), gatewayB)
+	objects := []client.Object{tenantProvider, tenantSecret, ownModel, providerOne, secretOne, providerTwo, secretTwo, conflicting, older, newer}
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, ownModel)
+	for _, model := range []*v1alpha1.ExternalModel{conflicting, older, newer} {
+		reconcileModel(t, r, model)
+	}
+	setRouteParentStatus(t, r, older, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, older)
+
+	for _, loser := range []*v1alpha1.ExternalModel{conflicting, newer} {
+		got := getModel(t, r, loser)
+		if readyReason(got) != reasonModelNameConflict {
+			t.Fatalf("%s reason = %q, want %q", loser.Name, readyReason(got), reasonModelNameConflict)
+		}
+		if _, err := getUnstructured(r, httpRouteGVK, loser.Namespace, attachmentRouteName(loser, gatewayB)); !apierrors.IsNotFound(err) {
+			t.Fatalf("conflict loser %s received a route: %v", loser.Name, err)
+		}
+	}
+	if msg := apiMeta.FindStatusCondition(getModel(t, r, conflicting).Status.Conditions, conditionReady).Message; !strings.Contains(msg, "tenant-b/own") {
+		t.Fatalf("conflict message %q does not name the winner", msg)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team-one", attachmentRouteName(older, gatewayB)); err != nil {
+		t.Fatalf("the oldest attached model lost its route: %v", err)
 	}
 }
 
@@ -224,6 +382,31 @@ func TestTenantModelBoundElsewhereIsNotServedByItsOwnTenant(t *testing.T) {
 	}
 }
 
+func TestTooManyProvidersExcludesOnlyThatModel(t *testing.T) {
+	objects := attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")
+	model := attachmentModel("wide", "team", "wide-model", time.Unix(100, 0), gatewayB)
+	model.Spec.ExternalProviderRefs = nil
+	for _, name := range []string{"p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"} {
+		provider, secret := attachmentProvider("team")
+		provider.Name, provider.UID = name, types.UID("uid-"+name)
+		objects = append(objects, provider)
+		if name == "p1" {
+			objects = append(objects, secret)
+		}
+		model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, v1alpha1.ExternalProviderRef{
+			Ref: v1alpha1.ExternalProviderReference{Name: name}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		})
+	}
+	r := attachmentReconciler(t, append(objects, model)...)
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); readyReason(got) != reasonTooManyProviders {
+		t.Fatalf("reason = %q, want %q", readyReason(got), reasonTooManyProviders)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB)); !apierrors.IsNotFound(err) {
+		t.Fatalf("over-budget model received a route: %v", err)
+	}
+}
+
 func TestUnservedHomeAttachmentBlocksAggregateReady(t *testing.T) {
 	gatewayA := v1alpha1.NamespacedObjectReference{Name: "gw-a", Namespace: "gateway-a"}
 	provider, secret := attachmentProvider("tenant-a")
@@ -232,6 +415,8 @@ func TestUnservedHomeAttachmentBlocksAggregateReady(t *testing.T) {
 	objects = append(objects, attachmentTenantObjects("tenant-a", "tenant-a", gatewayA, "ipp")...)
 	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
 	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
 	reconcileModel(t, r, model)
 	if got := getModel(t, r, model); got.Status.Phase == resolver.PhaseReady || readyReason(got) != reasonTenantNotPraxis {
 		t.Fatalf("status = %q/%q, want the unserved home attachment reported", got.Status.Phase, readyReason(got))
