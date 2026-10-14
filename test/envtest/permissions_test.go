@@ -3,15 +3,25 @@
 package envtest_test
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	authv1 "k8s.io/api/authorization/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const gatewayAPIGroup = "gateway.networking.k8s.io"
+
+// Namespaces whose access is checked. A SubjectAccessReview does not need them to exist.
+const (
+	// tenantNamespace runs a tenant's external-model ExtProc, which mounts the credential copies.
+	tenantNamespace = "permissions-tenant"
+	// providerNamespace holds a shared ExternalProvider and the ReferenceGrants authorizing it.
+	providerNamespace = "permissions-provider"
+)
 
 // testShippedPermissions asks the API server what the shipped ClusterRole lets
 // the controller do, so packaged permissions are verified even before a
@@ -21,17 +31,20 @@ func testShippedPermissions(t *testing.T, c client.Client) {
 	// Controller-owned credential copies are applied and deleted in tenant namespaces.
 	for _, verb := range []string{"create", "patch", "delete"} {
 		assertAccess(t, c, true, authv1.ResourceAttributes{
-			Namespace: maasNamespace, Resource: "secrets", Verb: verb,
+			Namespace: tenantNamespace, Resource: "secrets", Verb: verb,
 		})
 	}
 	for _, verb := range []string{"get", "list", "watch"} {
-		// ReferenceGrants authorize cross-namespace ExternalProvider references.
-		assertAccess(t, c, true, authv1.ResourceAttributes{
-			Group: gatewayAPIGroup, Resource: "referencegrants", Verb: verb,
-		})
+		// ReferenceGrants in the provider namespace authorize cross-namespace
+		// ExternalProvider references; the manager cache watches all namespaces.
+		for _, namespace := range []string{providerNamespace, metav1.NamespaceAll} {
+			assertAccess(t, c, true, authv1.ResourceAttributes{
+				Namespace: namespace, Group: gatewayAPIGroup, Resource: "referencegrants", Verb: verb,
+			})
+		}
 		// Gateway attachment is authorized through HTTPRoute parent status.
 		assertAccess(t, c, false, authv1.ResourceAttributes{
-			Group: gatewayAPIGroup, Resource: "gateways", Verb: verb,
+			Namespace: gatewayNamespace, Group: gatewayAPIGroup, Resource: "gateways", Verb: verb,
 		})
 		assertAccess(t, c, false, authv1.ResourceAttributes{
 			Resource: "namespaces", Verb: verb,
@@ -39,6 +52,8 @@ func testShippedPermissions(t *testing.T, c client.Client) {
 	}
 }
 
+// assertAccess also requires an error-free evaluation, so a failed check is
+// never mistaken for a denial.
 func assertAccess(t *testing.T, c client.Client, want bool, attributes authv1.ResourceAttributes) {
 	t.Helper()
 	review := &authv1.SubjectAccessReview{Spec: authv1.SubjectAccessReviewSpec{
@@ -47,6 +62,8 @@ func assertAccess(t *testing.T, c client.Client, want bool, attributes authv1.Re
 		ResourceAttributes: &attributes,
 	}}
 	require.NoError(t, c.Create(t.Context(), review))
-	assert.Equal(t, want, review.Status.Allowed, "%s %s.%s in namespace %q: %s",
-		attributes.Verb, attributes.Resource, attributes.Group, attributes.Namespace, review.Status.Reason)
+	request := fmt.Sprintf("%s %s.%s in namespace %q",
+		attributes.Verb, attributes.Resource, attributes.Group, attributes.Namespace)
+	assert.Empty(t, review.Status.EvaluationError, request)
+	assert.Equal(t, want, review.Status.Allowed, "%s: %s", request, review.Status.Reason)
 }
