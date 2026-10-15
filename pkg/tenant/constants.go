@@ -185,9 +185,9 @@ const (
 	// ManagedByAIGatewayController is the LabelManagedBy value on praxis resources.
 	ManagedByAIGatewayController = "ai-gateway-controller"
 
-	// LabelAttachmentTenant marks the HTTPRoutes and Gateway-namespace
-	// DestinationRules an ExternalModel contributes to a tenant from another
-	// namespace. Its value is the tenant (MaasTenantConfig) namespace.
+	// LabelAttachmentTenant marks the HTTPRoutes an ExternalModel contributes
+	// to a tenant from another namespace. Its value is the tenant
+	// (MaasTenantConfig) namespace.
 	LabelAttachmentTenant = "inference.opendatahub.io/attachment-tenant"
 
 	// maxKubernetesNameLength is the Kubernetes object name limit (RFC 1123

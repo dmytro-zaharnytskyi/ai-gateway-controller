@@ -84,7 +84,7 @@ type attachmentResult struct {
 type attachedModel struct {
 	model     *v1alpha1.ExternalModel
 	routeName string
-	routes    []resolver.Route // stable IDs and credentials rewritten for the tenant
+	routes    []resolver.Route // stable IDs rewritten for the tenant
 	reason    string
 	message   string
 }
@@ -583,7 +583,7 @@ func (r *Reconciler) resolveAttachedModel(ctx context.Context, candidate *attach
 	}
 	providerPtrs := make([]*v1alpha1.ExternalProvider, 0, len(providers.Items))
 	for i := range providers.Items {
-		if r.validateProvider(ctx, &providers.Items[i]) != nil {
+		if !providers.Items[i].DeletionTimestamp.IsZero() || r.validateProvider(ctx, &providers.Items[i]) != nil {
 			continue
 		}
 		ready := providers.Items[i].DeepCopy()

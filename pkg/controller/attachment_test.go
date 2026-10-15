@@ -309,6 +309,26 @@ func TestModelNameConflictKeepsTenantModelThenOldest(t *testing.T) {
 	}
 }
 
+func TestDeletingProviderExcludesAttachedModel(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	provider.Finalizers = []string{"example.com/hold"}
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	objects := []client.Object{provider, secret, model}
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	if err := r.Delete(context.Background(), provider); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+	if reason := readyReason(getModel(t, r, model)); reason != reasonProviderNotReady {
+		t.Fatalf("reason = %q, want %q", reason, reasonProviderNotReady)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB)); !apierrors.IsNotFound(err) {
+		t.Fatalf("a model whose provider is being deleted kept its route: %v", err)
+	}
+}
+
 func TestOwnTenantGatewayRefChangesNoResources(t *testing.T) {
 	render := func(gateways ...v1alpha1.NamespacedObjectReference) (*Reconciler, *v1alpha1.ExternalModel) {
 		provider, secret := attachmentProvider("tenant-b")

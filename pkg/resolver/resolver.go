@@ -93,9 +93,6 @@ type Route struct {
 	// contributed to a tenant from another namespace. Empty keeps the
 	// existing <model>/provider-<provider> form.
 	StableID string
-	// SecretNamespace is SecretName's namespace when it is a controller-owned
-	// credential copy in the tenant namespace. Empty means Namespace.
-	SecretNamespace string
 }
 
 // ModelRoutes is the per-model outcome: resolved routes in ref order (the
