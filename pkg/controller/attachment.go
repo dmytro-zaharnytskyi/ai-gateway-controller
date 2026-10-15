@@ -54,9 +54,8 @@ const (
 
 	attachmentRequeueInterval = 5 * time.Second
 
-	annotationAttachmentModel     = "inference.opendatahub.io/attachment-model"
-	annotationAttachmentGateway   = "inference.opendatahub.io/attachment-gateway"
-	annotationAttachmentProviders = "inference.opendatahub.io/attachment-providers"
+	annotationAttachmentModel   = "inference.opendatahub.io/attachment-model"
+	annotationAttachmentGateway = "inference.opendatahub.io/attachment-gateway"
 )
 
 var httpRouteGVK = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"}
@@ -477,9 +476,9 @@ func (r *Reconciler) reconcileAttachment(ctx context.Context, model *v1alpha1.Ex
 		result.reason, result.message = self.reason, self.message
 		return result, r.removeAttachmentRoute(ctx, model, t.gateway)
 	}
-	providers, _, validProviders, err := r.providerInputs(ctx, model.Namespace)
-	if err != nil {
-		return result, err
+	var providers v1alpha1.ExternalProviderList
+	if err := r.List(ctx, &providers, client.InNamespace(model.Namespace)); err != nil {
+		return result, fmt.Errorf("list ExternalProviders in %s: %w", model.Namespace, err)
 	}
 	providerOwners := make(map[string]*v1alpha1.ExternalProvider, len(providers.Items))
 	for i := range providers.Items {
@@ -487,18 +486,6 @@ func (r *Reconciler) reconcileAttachment(ctx context.Context, model *v1alpha1.Ex
 	}
 	if err := r.applyAttachmentRoute(ctx, self, t, providerOwners); err != nil {
 		return result, err
-	}
-	tenantNamespace, err := r.isTenantNamespace(ctx, model.Namespace)
-	if err != nil {
-		return result, err
-	}
-	for _, p := range validProviders {
-		// In a tenant namespace the tenant-local path writes provider status.
-		if !tenantNamespace && slices.ContainsFunc(self.routes, func(route resolver.Route) bool { return route.Provider == p.Name }) {
-			if err := r.updateProviderStatus(ctx, p, true, reasonReconciled, "provider Secret reference and transport resources are ready"); err != nil {
-				return result, err
-			}
-		}
 	}
 
 	route, err := r.getAttachmentRoute(ctx, model.Namespace, self.routeName)
@@ -678,9 +665,8 @@ func (r *Reconciler) applyAttachmentRoute(ctx context.Context, a attachedModel, 
 	route.SetName(a.routeName)
 	route.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "ai-gateway-controller", tenant.LabelAttachmentTenant: t.namespace})
 	route.SetAnnotations(map[string]string{
-		annotationAttachmentModel:     m.Name,
-		annotationAttachmentGateway:   gatewayKey(t.gateway),
-		annotationAttachmentProviders: strings.Join(providers, ","),
+		annotationAttachmentModel:   m.Name,
+		annotationAttachmentGateway: gatewayKey(t.gateway),
 	})
 	setOwnerReference(&route, m)
 	if existing, err := r.getAttachmentRoute(ctx, m.Namespace, a.routeName); err != nil {
@@ -814,31 +800,16 @@ func (r *Reconciler) removeDetachedRoutes(ctx context.Context, model *v1alpha1.E
 	return nil
 }
 
-// attachmentTransportKeep returns the providers and models whose
-// model-namespace transport the namespace's attachment HTTPRoutes use.
-func (r *Reconciler) attachmentTransportKeep(ctx context.Context, namespace string) (map[string]bool, map[string]bool, error) {
+// attachedModelSinks returns the models whose selection sinks the
+// namespace's attachment HTTPRoutes use.
+func (r *Reconciler) attachedModelSinks(ctx context.Context, namespace string) (map[string]bool, error) {
 	routes, err := r.listAttachmentRoutes(ctx, client.InNamespace(namespace))
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	providers, models := map[string]bool{}, map[string]bool{}
+	models := map[string]bool{}
 	for i := range routes {
-		annotations := routes[i].GetAnnotations()
-		models[annotations[annotationAttachmentModel]] = true
-		for _, provider := range strings.Split(annotations[annotationAttachmentProviders], ",") {
-			providers[provider] = true
-		}
+		models[routes[i].GetAnnotations()[annotationAttachmentModel]] = true
 	}
-	return providers, models, nil
-}
-
-func (r *Reconciler) isTenantNamespace(ctx context.Context, namespace string) (bool, error) {
-	mtc := tenant.NewMaasTenantConfig()
-	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: tenant.MaasTenantConfigInstanceName}, mtc); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("get MaasTenantConfig %s: %w", namespace, err)
-	}
-	return true, nil
+	return models, nil
 }
