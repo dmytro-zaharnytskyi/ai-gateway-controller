@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-selection-proof-a
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: external-model-e2e
+    external-model-e2e/purpose: provider-selection-proof
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: provider-selection-proof-a}
+  template:
+    metadata:
+      labels: {app: provider-selection-proof-a}
+    spec:
+      containers:
+      - name: recorder
+        image: provider-recorder:issue28-kind
+        imagePullPolicy: Never
+        env:
+        - {name: PROVIDER_NAME, value: proof-a}
+        - {name: EXPECTED_HOST, value: provider-proof-a-ext.maas-system.svc.cluster.local}
+        - {name: CREDENTIAL_FILE, value: /etc/provider-credentials/api-key}
+        ports: [{name: https, containerPort: 8443}]
+        readinessProbe:
+          httpGet: {scheme: HTTPS, path: /healthz, port: https}
+          periodSeconds: 2
+        volumeMounts:
+        - {name: tls, mountPath: /etc/provider/tls, readOnly: true}
+        - {name: credential, mountPath: /etc/provider-credentials, readOnly: true}
+      volumes:
+      - name: tls
+        secret: {secretName: provider-proof-a-tls}
+      - name: credential
+        secret:
+          secretName: provider-proof-a-backend-credential
+          items: [{key: api-key, path: api-key}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-proof-a-ext
+  namespace: maas-system
+  labels: {app.kubernetes.io/managed-by: external-model-e2e}
+spec:
+  selector: {app: provider-selection-proof-a}
+  ports: [{name: https, port: 443, targetPort: https}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-selection-proof-b
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: external-model-e2e
+    external-model-e2e/purpose: provider-selection-proof
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: provider-selection-proof-b}
+  template:
+    metadata:
+      labels: {app: provider-selection-proof-b}
+    spec:
+      containers:
+      - name: recorder
+        image: provider-recorder:issue28-kind
+        imagePullPolicy: Never
+        env:
+        - {name: PROVIDER_NAME, value: proof-b}
+        - {name: EXPECTED_HOST, value: provider-proof-b-ext.maas-system.svc.cluster.local}
+        - {name: CREDENTIAL_FILE, value: /etc/provider-credentials/api-key}
+        ports: [{name: https, containerPort: 8443}]
+        readinessProbe:
+          httpGet: {scheme: HTTPS, path: /healthz, port: https}
+          periodSeconds: 2
+        volumeMounts:
+        - {name: tls, mountPath: /etc/provider/tls, readOnly: true}
+        - {name: credential, mountPath: /etc/provider-credentials, readOnly: true}
+      volumes:
+      - name: tls
+        secret: {secretName: provider-proof-b-tls}
+      - name: credential
+        secret:
+          secretName: provider-proof-b-backend-credential
+          items: [{key: api-key, path: api-key}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-proof-b-ext
+  namespace: maas-system
+  labels: {app.kubernetes.io/managed-by: external-model-e2e}
+spec:
+  selector: {app: provider-selection-proof-b}
+  ports: [{name: https, port: 443, targetPort: https}]

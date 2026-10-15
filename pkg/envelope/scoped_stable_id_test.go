@@ -52,6 +52,7 @@ func TestValidateModelMatchesRenderRejections(t *testing.T) {
 	for name, m := range map[string]resolver.ModelRoutes{
 		"weights":    {ModelRef: "team/model", Routes: []resolver.Route{route("model", "a", 1), route("model", "b", 2)}},
 		"credential": {ModelRef: "team/model", Routes: []resolver.Route{unqualified}},
+		"duplicate":  {ModelRef: "team/model", Routes: []resolver.Route{route("model", "a", 1), route("model", "a", 1)}},
 	} {
 		if err := ValidateModel(m, Options{}); err == nil {
 			t.Fatalf("%s: ValidateModel accepted a model Render rejects", name)

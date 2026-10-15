@@ -82,12 +82,15 @@ type Candidate struct {
 	// StableID is the trusted provider-handoff value emitted by ExtProc.
 	// It is explicit so the Envoy route match and the overlay use one
 	// content-addressed identity rather than separate derivations.
-	StableID   string      `json:"stable_id,omitempty"`
-	Kind       string      `json:"kind"` // inference_model | mcp_tool
-	Name       string      `json:"name"`
-	Site       string      `json:"site"`
-	Fresh      bool        `json:"fresh"`
-	Credential *Credential `json:"credential,omitempty"`
+	StableID string `json:"stable_id,omitempty"`
+	Kind     string `json:"kind"` // inference_model | mcp_tool
+	Name     string `json:"name"`
+	Site     string `json:"site"`
+	Fresh    bool   `json:"fresh"`
+	// SelectionGroup is scoped by (kind, name). A pointer is required so
+	// group zero is emitted instead of being omitted by encoding/json.
+	SelectionGroup *uint32     `json:"selection_group,omitempty"`
+	Credential     *Credential `json:"credential,omitempty"`
 }
 
 // Provenance records who rendered this envelope and from what source state.
@@ -117,11 +120,10 @@ type Digest struct {
 }
 
 // Overlay is the swappable payload: scope-independent serving facts.
-// SelectionPolicy is the picker policy for selection groups (praxis #731);
-// its exact wire shape is pinned with the M1 selection-group work (Q3
-// lands there), so it rides as raw JSON. When present it participates in
-// the digest — matching compute_semantic_digest in praxis-ai overlay.rs,
-// which hashes it iff present.
+// SelectionPolicy is the picker policy for selection groups (praxis #731).
+// When present it participates in the digest — matching
+// compute_semantic_digest in praxis-ai overlay.rs, which hashes it iff
+// present.
 type Overlay struct {
 	Network         string          `json:"network"`
 	LocalSite       string          `json:"local_site"`
@@ -133,6 +135,7 @@ type Overlay struct {
 // with a stable reason, and is what E2E failure-injection asserts against.
 var (
 	ErrWeightUnsupported     = errors.New("envelope: non-uniform (proportional) weights are not supported in 3.6; use uniform weights or a single provider (proportional canaries: known 3.6 limitation, see ADR 0001 D5)")
+	ErrDuplicateProvider     = errors.New("envelope: a client model cannot bind the same provider more than once")
 	ErrUnknownCluster        = errors.New("envelope: candidate references cluster absent from load_balancer config")
 	ErrScopeMismatch         = errors.New("envelope: scope fields must be non-empty")
 	ErrGenerationRegression  = errors.New("envelope: source_generation must strictly increase on content change")
@@ -151,10 +154,6 @@ type Options struct {
 	ProducerVersion string
 	// RenderedAt is injected (RFC3339) to keep Render deterministic under test.
 	RenderedAt string
-	// SelectionPolicy stamps the overlay picker policy (praxis #731). Its
-	// exact shape is pinned with the M1 selection-group work; nil omits
-	// the field (deterministic first-admitted default).
-	SelectionPolicy json.RawMessage
 	// PreservedCandidates are already-published candidates kept verbatim
 	// ahead of the rendered routes. A tenant's own candidates are preserved
 	// this way when only contributions from other namespaces change.
@@ -162,11 +161,12 @@ type Options struct {
 }
 
 // Render validates the resolved route set and emits the envelope with its
-// revision. Weight guard (port plan R1): within a model, after resolver
-// dropped weight<=0 refs, all surviving weights must be pairwise equal
-// (nil normalized to 1 upstream) — a non-uniform group is refused loudly
-// with ErrWeightUnsupported so a weighted canary fails at apply time
-// instead of silently routing evenly.
+// revision. Distinct providers with equal positive weights sharing a
+// client-visible model name are assigned selection group zero and use
+// Praxis' global random policy. Singleton model capabilities remain ungrouped
+// and deterministic.
+// Unequal weights and repeated providers are rejected because this controller
+// does not implement proportional routing or deduplication of bindings.
 //
 // Revision rule: digest equal to prev → prev returned unchanged (no bump);
 // digest changed → Generation = prev.Generation + 1.
@@ -179,6 +179,10 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 	}
 	if routes == nil {
 		return Envelope{}, fmt.Errorf("%w: nil route set", ErrScopeMismatch)
+	}
+	selection, err := deriveSelectionMetadata(routes)
+	if err != nil {
+		return Envelope{}, err
 	}
 
 	candidates := append(make([]Candidate, 0, len(opts.PreservedCandidates)), opts.PreservedCandidates...)
@@ -204,6 +208,10 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 				Site:     scope.LocalSite,
 				Fresh:    true,
 			}
+			if group, ok := selection.groups[selectionRouteKey{modelRef: m.ModelRef, model: r.Model, provider: r.Provider, cluster: r.Cluster}]; ok {
+				group := group
+				cand.SelectionGroup = &group
+			}
 			// ValidateModel has already qualified the strategy.
 			if strategy, _ := StrategyFor(r); strategy != "" {
 				cand.Credential = &Credential{
@@ -223,7 +231,7 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 		Network:         scope.Network,
 		LocalSite:       scope.LocalSite,
 		Candidates:      candidates,
-		SelectionPolicy: opts.SelectionPolicy,
+		SelectionPolicy: selection.policy,
 	}
 	digest, err := ComputeDigest(overlay)
 	if err != nil {
@@ -259,6 +267,82 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 		},
 		Overlay: overlay,
 	}, nil
+}
+
+type selectionRouteKey struct {
+	modelRef string
+	model    string
+	provider string
+	cluster  string
+}
+
+type selectionCapability struct {
+	count      int
+	firstRoute resolver.Route
+}
+
+type selectionMetadata struct {
+	policy json.RawMessage
+	groups map[selectionRouteKey]uint32
+}
+
+// deriveSelectionMetadata is the single policy derivation used by both
+// normal publication and deletion-time republishing (both pass through
+// Render). Praxis scopes groups by (kind, name), so provider candidates for
+// distinct client-visible names never share a group.
+func deriveSelectionMetadata(routes *resolver.ResolvedRouteSet) (selectionMetadata, error) {
+	capabilities := map[string]*selectionCapability{}
+	providerBindings := map[string]bool{}
+	for _, model := range routes.Models {
+		if err := checkUniformWeights(model); err != nil {
+			return selectionMetadata{}, err
+		}
+		for _, route := range model.Routes {
+			key := "inference_model\x00" + route.ClientName
+			binding := key + "\x00" + route.Provider
+			if providerBindings[binding] {
+				return selectionMetadata{}, fmt.Errorf("%w: client model %s provider %s", ErrDuplicateProvider, route.ClientName, route.Provider)
+			}
+			providerBindings[binding] = true
+			capability := capabilities[key]
+			if capability == nil {
+				capability = &selectionCapability{firstRoute: route}
+				capabilities[key] = capability
+			} else if route.Weight != capability.firstRoute.Weight {
+				return selectionMetadata{}, fmt.Errorf("%w: client model %s has weights %d and %d across providers",
+					ErrWeightUnsupported, route.ClientName, capability.firstRoute.Weight, route.Weight)
+			}
+			capability.count++
+		}
+	}
+	metadata := selectionMetadata{groups: make(map[selectionRouteKey]uint32)}
+	for _, model := range routes.Models {
+		for _, route := range model.Routes {
+			capability := capabilities["inference_model\x00"+route.ClientName]
+			if capability.count > 1 {
+				metadata.groups[selectionRouteKey{modelRef: model.ModelRef, model: route.Model, provider: route.Provider, cluster: route.Cluster}] = 0
+			}
+		}
+	}
+	for _, capability := range capabilities {
+		if capability.count > 1 {
+			metadata.policy = json.RawMessage(`{"mode":"random"}`)
+			break
+		}
+	}
+	return metadata, nil
+}
+
+// ValidateSelectionMetadata rejects unequal positive weights for routes that
+// resolve to the same client-visible model. Render uses the same derivation to
+// generate the wire metadata; the controller calls this before applying
+// transport resources so invalid weights do not change serving state.
+func ValidateSelectionMetadata(routes *resolver.ResolvedRouteSet) error {
+	if routes == nil {
+		return fmt.Errorf("%w: nil route set", ErrScopeMismatch)
+	}
+	_, err := deriveSelectionMetadata(routes)
+	return err
 }
 
 // StrategyFor maps only the currently qualified provider API-key contracts to
@@ -350,12 +434,13 @@ func routeSecretNamespace(route resolver.Route) string {
 	return route.Namespace
 }
 
-// ValidateModel applies Render's per-model checks: uniform weights, known
-// clusters and qualified credential strategies. The controller also runs it
-// on a contribution from another namespace in isolation, so a model Render
-// would reject is excluded before it can fail the whole tenant overlay.
+// ValidateModel applies Render's per-model checks: provider selection (equal
+// weights, no repeated provider), known clusters and qualified credential
+// strategies. The controller also runs it on a contribution from another
+// namespace in isolation, so a model Render would reject is excluded before it
+// can fail the whole tenant overlay.
 func ValidateModel(m resolver.ModelRoutes, opts Options) error {
-	if err := checkUniformWeights(m); err != nil {
+	if _, err := deriveSelectionMetadata(&resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{m}}); err != nil {
 		return err
 	}
 	known := make(map[string]bool, len(opts.KnownClusters))

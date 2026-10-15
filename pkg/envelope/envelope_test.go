@@ -7,6 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 )
 
@@ -224,6 +227,166 @@ func TestRender_WeightGuardIsPerModel(t *testing.T) {
 	}
 }
 
+func TestRender_EqualProvidersUseRandomGroupZero(t *testing.T) {
+	for _, count := range []int{1, 2, 3} {
+		t.Run(strconv.Itoa(count)+"-providers", func(t *testing.T) {
+			routes := make([]resolver.Route, 0, count)
+			for i := 0; i < count; i++ {
+				routes = append(routes, route("m1", "p"+strconv.Itoa(i+1), 1))
+			}
+			env, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: routes}), scope(), Revision{}, Options{})
+			if err != nil {
+				t.Fatalf("Render: %v", err)
+			}
+			if count == 1 {
+				if len(env.Overlay.SelectionPolicy) != 0 || env.Overlay.Candidates[0].SelectionGroup != nil {
+					t.Fatalf("singleton must remain deterministic and ungrouped: policy=%s candidate=%+v", env.Overlay.SelectionPolicy, env.Overlay.Candidates[0])
+				}
+				return
+			}
+			if string(env.Overlay.SelectionPolicy) != `{"mode":"random"}` {
+				t.Fatalf("selection_policy = %s, want random", env.Overlay.SelectionPolicy)
+			}
+			for i, candidate := range env.Overlay.Candidates {
+				if candidate.SelectionGroup == nil || *candidate.SelectionGroup != 0 {
+					t.Fatalf("candidate %d selection_group = %v, want numeric zero", i, candidate.SelectionGroup)
+				}
+			}
+			wire, err := json.Marshal(env.Overlay)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(wire), `"selection_group":0`) {
+				t.Fatalf("group zero missing from wire: %s", wire)
+			}
+		})
+	}
+}
+
+func TestRender_ResolvedOmittedAndExplicitWeightsSelectTogether(t *testing.T) {
+	weightOne, weightZero := 1, 0
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns1", Name: "m1"},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{
+			{Ref: v1alpha1.ExternalProviderReference{Name: "p1"}, TargetModel: "target", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+			{Ref: v1alpha1.ExternalProviderReference{Name: "p2"}, TargetModel: "target", APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: &weightOne},
+			{Ref: v1alpha1.ExternalProviderReference{Name: "disabled"}, TargetModel: "target", APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: &weightZero},
+		}},
+	}
+	providers := make([]*v1alpha1.ExternalProvider, 0, 3)
+	for _, name := range []string{"p1", "p2", "disabled"} {
+		providers = append(providers, &v1alpha1.ExternalProvider{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns1", Name: name},
+			Spec: v1alpha1.ExternalProviderSpec{
+				Provider: "openai", Endpoint: name + ".example.com",
+				Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: name + "-key"}},
+			},
+			Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
+		})
+	}
+
+	set, err := resolver.Resolve([]*v1alpha1.ExternalModel{model}, providers)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if len(set.Routes()) != 2 || len(set.Models[0].Skips) != 1 || set.Models[0].Skips[0].Reason != resolver.SkipWeightDisabled {
+		t.Fatalf("resolved routes/skips = %+v, want two active routes and one disabled zero-weight ref", set.Models)
+	}
+	for _, route := range set.Routes() {
+		if route.Weight != 1 {
+			t.Fatalf("provider %s normalized weight = %d, want 1", route.Provider, route.Weight)
+		}
+	}
+
+	env, err := Render(set, scope(), Revision{}, Options{})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if string(env.Overlay.SelectionPolicy) != `{"mode":"random"}` || len(env.Overlay.Candidates) != 2 {
+		t.Fatalf("selection policy/candidates = %s/%d, want random and two eligible providers", env.Overlay.SelectionPolicy, len(env.Overlay.Candidates))
+	}
+	for _, candidate := range env.Overlay.Candidates {
+		if candidate.SelectionGroup == nil || *candidate.SelectionGroup != 0 {
+			t.Fatalf("candidate %s selection_group = %v, want numeric zero", candidate.Cluster, candidate.SelectionGroup)
+		}
+	}
+}
+
+func TestRender_RandomGroupsAreScopedPerClientModel(t *testing.T) {
+	set := routeSet(
+		resolver.ModelRoutes{ModelRef: "ns1/a", Routes: []resolver.Route{route("a", "p1", 2), route("a", "p2", 2)}},
+		resolver.ModelRoutes{ModelRef: "ns1/b", Routes: []resolver.Route{route("b", "p3", 7)}},
+	)
+	env, err := Render(set, scope(), Revision{}, Options{})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if len(env.Overlay.Candidates) != 3 || string(env.Overlay.SelectionPolicy) != `{"mode":"random"}` {
+		t.Fatalf("overlay metadata = policy %s candidates %#v", env.Overlay.SelectionPolicy, env.Overlay.Candidates)
+	}
+	for i := range env.Overlay.Candidates[:2] {
+		if env.Overlay.Candidates[i].SelectionGroup == nil || *env.Overlay.Candidates[i].SelectionGroup != 0 {
+			t.Fatalf("multi-provider model candidate %d is not in group zero: %+v", i, env.Overlay.Candidates[i])
+		}
+	}
+	if env.Overlay.Candidates[2].SelectionGroup != nil {
+		t.Fatalf("singleton model must remain ungrouped: %+v", env.Overlay.Candidates[2])
+	}
+}
+
+func TestRender_RejectsUnequalWeightsAcrossSameClientModel(t *testing.T) {
+	set := routeSet(
+		resolver.ModelRoutes{ModelRef: "ns1/a", Routes: []resolver.Route{route("shared", "p1", 2)}},
+		resolver.ModelRoutes{ModelRef: "ns1/b", Routes: []resolver.Route{route("shared", "p2", 1)}},
+	)
+	if _, err := Render(set, scope(), Revision{}, Options{}); !errors.Is(err, ErrWeightUnsupported) {
+		t.Fatalf("Render error = %v, want ErrWeightUnsupported", err)
+	}
+}
+
+func TestRender_RejectsRepeatedProviderAcrossSameClientModel(t *testing.T) {
+	set := routeSet(
+		resolver.ModelRoutes{ModelRef: "ns1/a", Routes: []resolver.Route{route("shared", "p1", 1), route("shared", "p2", 1)}},
+		resolver.ModelRoutes{ModelRef: "ns1/b", Routes: []resolver.Route{route("shared", "p1", 1)}},
+	)
+	if _, err := Render(set, scope(), Revision{}, Options{}); !errors.Is(err, ErrDuplicateProvider) {
+		t.Fatalf("Render error = %v, want ErrDuplicateProvider", err)
+	}
+}
+
+func TestRender_AllowsSharedProviderAcrossDifferentClientModels(t *testing.T) {
+	set := routeSet(
+		resolver.ModelRoutes{ModelRef: "ns1/a", Routes: []resolver.Route{route("a", "p1", 1)}},
+		resolver.ModelRoutes{ModelRef: "ns1/b", Routes: []resolver.Route{route("b", "p1", 1)}},
+	)
+	if _, err := Render(set, scope(), Revision{}, Options{}); err != nil {
+		t.Fatalf("different client models may share a provider: %v", err)
+	}
+}
+
+func TestRender_SelectionMetadataChangesDigestAndNoopKeepsGeneration(t *testing.T) {
+	single := routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{route("m1", "p1", 1)}})
+	first, err := Render(single, scope(), Revision{}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	multiple := routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{route("m1", "p1", 1), route("m1", "p2", 1)}})
+	changed, err := Render(multiple, scope(), Revision{Generation: first.Provenance.SourceGeneration, Digest: first.Revision.Value}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Revision.Value == first.Revision.Value || changed.Provenance.SourceGeneration != first.Provenance.SourceGeneration+1 {
+		t.Fatalf("selection change revision = %s generation %d; prior=%s generation %d", changed.Revision.Value, changed.Provenance.SourceGeneration, first.Revision.Value, first.Provenance.SourceGeneration)
+	}
+	noop, err := Render(multiple, scope(), Revision{Generation: changed.Provenance.SourceGeneration, Digest: changed.Revision.Value}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if noop.Revision.Value != changed.Revision.Value || noop.Provenance.SourceGeneration != changed.Provenance.SourceGeneration {
+		t.Fatalf("semantic no-op changed revision: prior=%s/%d next=%s/%d", changed.Revision.Value, changed.Provenance.SourceGeneration, noop.Revision.Value, noop.Provenance.SourceGeneration)
+	}
+}
+
 func TestRender_UnknownCluster(t *testing.T) {
 	set := routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{route("m1", "p1", 1)}})
 	_, err := Render(set, scope(), Revision{}, Options{KnownClusters: []string{"provider-other"}})
@@ -318,6 +481,16 @@ func TestComputeDigest_StableAndOrderSensitive(t *testing.T) {
 	if d4 == d1a {
 		t.Error("selection_policy must affect digest when present")
 	}
+	group := uint32(0)
+	c1Grouped := c1
+	c1Grouped.SelectionGroup = &group
+	d7, err := ComputeDigest(ov([]Candidate{c1Grouped}, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d7 == d1a {
+		t.Error("selection_group zero must affect digest when present")
+	}
 	// nil vs empty candidates marshal identically ([]), never null
 	d5, _ := ComputeDigest(ov(nil, ""))
 	d6, _ := ComputeDigest(ov([]Candidate{}, ""))
@@ -392,8 +565,11 @@ func TestComputeDigest_KnownVectors(t *testing.T) {
 }
 
 func TestRender_SelectionPolicyOnWire(t *testing.T) {
-	set := routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{route("m1", "p1", 1)}})
-	env, err := Render(set, scope(), Revision{}, Options{SelectionPolicy: json.RawMessage(`{"mode":"random"}`)})
+	set := routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{
+		route("m1", "p1", 1),
+		route("m1", "p2", 1),
+	}})
+	env, err := Render(set, scope(), Revision{}, Options{})
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -402,10 +578,19 @@ func TestRender_SelectionPolicyOnWire(t *testing.T) {
 		t.Fatalf("marshal overlay: %v", err)
 	}
 	if !strings.Contains(string(raw), `"selection_policy":{"mode":"random"}`) {
-		t.Errorf("selection_policy must serialize verbatim: %s", raw)
+		t.Errorf("equal-provider policy must serialize: %s", raw)
 	}
-	// absent by default
-	env2, _ := Render(set, scope(), Revision{}, Options{})
+	for i, candidate := range env.Overlay.Candidates {
+		if candidate.SelectionGroup == nil || *candidate.SelectionGroup != 0 {
+			t.Errorf("candidate %d selection_group = %v, want numeric zero", i, candidate.SelectionGroup)
+		}
+	}
+	// A singleton derives no policy and remains deterministic.
+	singleton := routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{route("m1", "p1", 1)}})
+	env2, err := Render(singleton, scope(), Revision{}, Options{})
+	if err != nil {
+		t.Fatalf("Render singleton: %v", err)
+	}
 	raw2, err := json.Marshal(env2.Overlay)
 	if err != nil {
 		t.Fatalf("marshal overlay: %v", err)

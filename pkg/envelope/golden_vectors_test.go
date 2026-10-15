@@ -265,8 +265,7 @@ func TestRender_DigestPathsAgree(t *testing.T) {
 		Routes:   []resolver.Route{route("m1", "p1", 1), route("m1", "p2", 1)},
 	})
 	env, err := Render(set, scope(), Revision{}, Options{
-		KnownClusters:   []string{"provider-p1", "provider-p2"},
-		SelectionPolicy: json.RawMessage(`{"mode":"random"}`),
+		KnownClusters: []string{"provider-p1", "provider-p2"},
 	})
 	if err != nil {
 		t.Fatal(err)

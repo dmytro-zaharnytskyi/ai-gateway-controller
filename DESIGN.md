@@ -51,6 +51,20 @@ an operator must perform a targeted manual migration after identifying its
 owner. New controller-owned rules are unambiguous and are cleaned up by the
 normal handoff/finalizer path.
 
+For one client-visible model, equal positive ExternalProvider weights are
+eligible together and use Praxis' uniform `random` selection policy. An
+omitted weight means one, weight zero disables that reference, and unequal
+positive weights fail with `WeightUnsupported`. A single eligible provider
+remains deterministic. Repeating the same provider across `ExternalModel`
+objects with the same client-visible model name is rejected; otherwise that
+provider would receive extra random-selection entries. This change adds overlay
+selection metadata and checks compatibility before transport changes. It does
+not add controller/ExtProc rollout coordination, proportional weighting,
+health-aware selection, or retries. Final-provider withdrawal and empty-overlay
+behavior remain outside this change in issue #106. Partial provider withdrawal
+ordering remains a separate issue tracked in
+[#108](https://github.com/opendatahub-io/ai-gateway-controller/issues/108).
+
 If a deleting ExternalModel has no resolvable `MaasTenantConfig`/`AITenant` and
 there are sibling models, deletion is conservative: it will not rebuild shared
 Praxis serving state without a live, steady tenant handoff. The ExternalModel
