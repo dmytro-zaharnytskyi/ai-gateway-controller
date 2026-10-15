@@ -560,12 +560,18 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 		}
 	}
 	result := make([]v1alpha1.ExternalProvider, 0, len(providers.Items))
+	availableRequired := make(map[string]bool, len(required))
 	for i := range providers.Items {
 		if referenced[providers.Items[i].Name] {
 			result = append(result, providers.Items[i])
+			if required[providers.Items[i].Name] {
+				availableRequired[providers.Items[i].Name] = true
+			}
 		}
 	}
-	return result, required, nil
+	// A stale reference to a deleted provider cannot appear in the serving
+	// overlay. Do not let it prevent the remaining providers from loading.
+	return result, availableRequired, nil
 }
 
 func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayName, gatewayNamespace string) ([]envelope.Candidate, error) {

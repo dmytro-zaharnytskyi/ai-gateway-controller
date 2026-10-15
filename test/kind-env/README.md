@@ -32,6 +32,24 @@ qualification. Istio, Kuadrant, and the MaaS platform remain
 explicit prerequisites for the full authenticated chain; the provisioner
 records a failure rather than silently substituting them.
 
+### How this differs from a full RHOAI deployment
+
+This is a focused integration environment on Kind, not a deployment of RHOAI on
+OpenShift. The harness installs Gateway API, cert-manager, Istio, and Kuadrant,
+applies KServe CRDs, and deploys the selected MaaS and AI Gateway controller
+sources with Kind-specific patches. It does not install the ODH/RHOAI operator
+chain or exercise `DataScienceCluster`-managed installation and upgrades; the
+tenant, Gateway, and test workloads are assembled by the harness.
+
+Kind uses test certificates, container images, and HTTPS provider recorders
+with test credentials. These checks cover a focused provider request path and
+its test transport, but do not qualify the
+OpenShift admission and security context, Routes and platform certificate
+provisioning, RHOAI operator lifecycle, supported release matrix, or real
+provider credentials and endpoints. A passing Kind run is diagnostic evidence;
+RHOAI/OpenShift qualification with the released images is still required for
+deployment readiness.
+
 The executable qualification records numbered routing assertions. In addition to the
 core transport, routing, hot-reload, digest, and last-known-good checks, it
 proves semantic no-op stability after a real provider watch event and provider

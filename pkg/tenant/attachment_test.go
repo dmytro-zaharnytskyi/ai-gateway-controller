@@ -21,7 +21,12 @@ func TestTenantProvidersExcludeModelsBoundToOtherGateways(t *testing.T) {
 	elsewhere := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "elsewhere", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalModelSpec{
 		ExternalProviderRefs: ref("elsewhere"), GatewayRefs: []v1alpha1.NamespacedObjectReference{{Name: "gw-b", Namespace: "gateway-b"}},
 	}}
-	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(local, own, elsewhere).Build()}
+	provider := func(name string) *v1alpha1.ExternalProvider {
+		return &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tenant-a"}}
+	}
+	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(
+		local, own, elsewhere, provider("local"), provider("own"), provider("elsewhere"),
+	).Build()}
 	_, required, err := r.providersForTenant(context.Background(), "tenant-a", "gw-a", "gateway-a")
 	if err != nil {
 		t.Fatal(err)

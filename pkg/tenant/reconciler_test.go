@@ -18,6 +18,7 @@ package tenant
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
@@ -37,7 +38,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 )
 
 // manifestPath points at the controller-owned composition of the pinned
@@ -70,6 +73,92 @@ func TestMaasTenantConfigForNamespaceMapsExternalModelEvents(t *testing.T) {
 	want := ctrl.Request{NamespacedName: client.ObjectKey{Namespace: "tenant-a", Name: MaasTenantConfigInstanceName}}
 	if len(requests) != 1 || requests[0] != want {
 		t.Fatalf("ExternalModel event enqueued %#v, want %#v", requests, want)
+	}
+}
+
+func TestDeletedProviderReferenceDoesNotBlockTenantOverlayReadiness(t *testing.T) {
+	ctx := context.Background()
+	const namespace = "tenant-ns"
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: namespace},
+		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{
+			{Ref: v1alpha1.ExternalProviderReference{Name: "live"}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+			{Ref: v1alpha1.ExternalProviderReference{Name: "deleted"}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+			{Ref: v1alpha1.ExternalProviderReference{Name: "later"}, TargetModel: "gpt", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+		}},
+	}
+	provider := func(name string) *v1alpha1.ExternalProvider {
+		return &v1alpha1.ExternalProvider{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: name + ".example.com",
+				Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: name + "-key"}}},
+			Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
+		}
+	}
+	live, later := provider("live"), provider("later")
+	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(model, live).Build()
+	r := &Reconciler{Client: fakeClient}
+	writeOverlay := func(providers ...*v1alpha1.ExternalProvider) {
+		t.Helper()
+		set, err := resolver.Resolve([]*v1alpha1.ExternalModel{model}, providers)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env, err := envelope.Render(set, envelope.Scope{Network: "test", Gateway: "gateway", Namespace: namespace, LocalSite: "site"}, envelope.Revision{}, envelope.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		configMap := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: praxisOverlayName, Namespace: namespace,
+			Labels: map[string]string{managedByLabel: render.FieldOwner}}, Data: map[string]string{praxisOverlayDataKey: string(raw)}}
+		var existing corev1.ConfigMap
+		if err := fakeClient.Get(ctx, client.ObjectKeyFromObject(configMap), &existing); apierrors.IsNotFound(err) {
+			if err := fakeClient.Create(ctx, configMap); err != nil {
+				t.Fatal(err)
+			}
+		} else if err != nil {
+			t.Fatal(err)
+		} else {
+			configMap.ResourceVersion = existing.ResourceVersion
+			if err := fakeClient.Update(ctx, configMap); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	writeOverlay(live)
+	_, required, err := r.providersForTenant(ctx, namespace, "gateway", "gateway-system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(required) != 1 || !required["live"] {
+		t.Fatalf("required providers with stale refs = %#v, want only live", required)
+	}
+	if ready, reason, err := r.routingOverlayReady(ctx, namespace, required); err != nil || !ready {
+		t.Fatalf("overlay with live provider: ready=%t reason=%q err=%v", ready, reason, err)
+	}
+	if err := fakeClient.Create(ctx, later); err != nil {
+		t.Fatal(err)
+	}
+	_, required, err = r.providersForTenant(ctx, namespace, "gateway", "gateway-system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(required) != 2 || !required["live"] || !required["later"] {
+		t.Fatalf("required providers after add = %#v, want live and later", required)
+	}
+	if ready, _, err := r.routingOverlayReady(ctx, namespace, required); err != nil || ready {
+		t.Fatalf("overlay before later provider publication: ready=%t err=%v", ready, err)
+	}
+	writeOverlay(live, later)
+	if ready, reason, err := r.routingOverlayReady(ctx, namespace, required); err != nil || !ready {
+		t.Fatalf("overlay after later provider publication: ready=%t reason=%q err=%v", ready, reason, err)
+	}
+	candidates, err := r.runtimeCandidates(ctx, namespace, "gateway", "gateway-system")
+	if err != nil || len(candidates) != 2 {
+		t.Fatalf("ExtProc runtime candidates = %#v, err=%v; want live and later", candidates, err)
 	}
 }
 
