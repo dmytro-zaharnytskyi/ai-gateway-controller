@@ -1,0 +1,47 @@
+# Kind-only network egress for MaaS API pods.
+#
+# MaaS's production policy selects OpenShift's openshift-dns namespace. Kind
+# runs CoreDNS in kube-system, so this additive policy allows only DNS traffic
+# from the API pods to the run cluster's CoreDNS pods. The production database
+# policy selects app=postgres, while the Kind fixture uses app=maas-postgres;
+# this rule allows API pods to reach only that database on PostgreSQL's port.
+# It does not widen production network policy or permit general egress.
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: maas-api-kind-network
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: local-env
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: api
+      app.kubernetes.io/name: maas-api
+      app.kubernetes.io/part-of: models-as-a-service
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: maas-system
+          podSelector:
+            matchLabels:
+              app: maas-postgres
+      ports:
+        - protocol: TCP
+          port: 5432

@@ -12,12 +12,17 @@ spec:
       labels:
         app: payload-processing
     spec:
+      terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
       containers:
         - name: payload-processing
           image: praxis-extproc
           imagePullPolicy: IfNotPresent
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -53,8 +58,9 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 20
           readinessProbe:
-            tcpSocket:
-              port: health
+            grpc:
+              port: 50052
+              service: envoy.service.ext_proc.v3.ExternalProcessor
             initialDelaySeconds: 5
             periodSeconds: 10
           volumeMounts:
