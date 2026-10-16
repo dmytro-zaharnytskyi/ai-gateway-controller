@@ -43,7 +43,7 @@ import (
 )
 
 // notReadyRequeueInterval is used when a MaasTenantConfig has opted into
-// praxis but is not yet ready for it (see IsActive / GatewayRef), or when a
+// praxis but is not yet ready for it (see GatewayRef / gatewayExists), or when a
 // transition-in is blocked on the IPP migration marker. This is a "come
 // back shortly" wait, distinct from ResyncInterval's steady-state resync.
 const notReadyRequeueInterval = 10 * time.Second
@@ -57,10 +57,9 @@ const notReadyRequeueInterval = 10 * time.Second
 // maas-controller's own TenantReconciler owns their legacy IPP deployment.
 //
 // Reconciler still Gets a tenant's owning AITenant (see
-// OwningAITenantRef / GatewayRef / IsActive) — status.gatewayRef and
-// status.phase live there, not on MaasTenantConfig — but no longer watches
-// AITenant as its primary trigger; it only watches AITenant secondarily, to
-// react to gatewayRef/phase changes that AnnotationPayloadProcessingType
+// OwningAITenantRef / GatewayRef) — status.gatewayRef and status.phase live
+// there, not on MaasTenantConfig — but it only watches AITenant secondarily,
+// to react to gatewayRef/phase changes that AnnotationPayloadProcessingType
 // alone would miss.
 //
 // Reconciler does not write AITenant at all (status or otherwise). It does
@@ -74,10 +73,10 @@ type Reconciler struct {
 	// (and reads AITenant).
 	Client client.Client
 	// APIReader reads directly from the API server, bypassing the informer
-	// cache. The AITenant identity/ownership/readiness decision must be made
-	// against live state: a cache-backed read can lag a delete+recreate during
-	// a watch disruption, letting the UID fence compare stale-to-stale and
-	// adopt a replaced tenant.
+	// cache. Live reads are required for the AITenant identity/ownership/
+	// readiness fence (cache lag can compare stale-to-stale across a
+	// delete+recreate) and for the plugins ConfigMap migration guard (cache
+	// lag can miss a leftover IPP-shaped ConfigMap before ForceOwnership apply).
 	APIReader client.Reader
 	// ManifestPath is the controller-owned kustomize entrypoint, e.g.
 	// config/manifests/external-model/overlays/odh. It composes the pinned
@@ -221,21 +220,30 @@ func (r *Reconciler) resolveOwnedAITenant(ctx context.Context, mtc *unstructured
 	return aitenant, nil
 }
 
-// resolveOwningAITenant is resolveOwnedAITenant plus the Active readiness
-// gate used by the praxis apply path.
+// resolveOwningAITenant is resolveOwnedAITenant plus a readiness bool for
+// the praxis apply path. ready follows DeployReady: current Ready
+// observedGeneration and not Failed. maas writes status.gatewayRef before the
+// exclusive gateway claim, so gatewayRef alone is not enough.
 func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructured.Unstructured) (aitenant *unstructured.Unstructured, ready bool, err error) {
 	aitenant, err = r.resolveOwnedAITenant(ctx, mtc)
 	if err != nil || aitenant == nil {
 		return aitenant, false, err
 	}
-	// Require both an Active phase and status observed for the current spec
-	// generation: an Active phase whose gatewayRef still reflects a superseded
-	// generation (maas-controller mid-reconcile after a spec change) must not
-	// drive a praxis-extproc install against a stale Gateway.
-	if !IsActive(aitenant) || !StatusIsCurrent(aitenant) {
-		return aitenant, false, nil
+	return aitenant, DeployReady(aitenant), nil
+}
+
+// gatewayExists verifies the Gateway API object named by status.gatewayRef
+// is present.
+func (r *Reconciler) gatewayExists(ctx context.Context, namespace, name string) error {
+	gw := &unstructured.Unstructured{}
+	gw.SetGroupVersionKind(gvkGateway)
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, gw); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("gateway %s/%s not found: the specified Gateway must exist before applying praxis-extproc", namespace, name)
+		}
+		return fmt.Errorf("failed to look up gateway %s/%s: %w", namespace, name, err)
 	}
-	return aitenant, true, nil
+	return nil
 }
 
 // aiTenantStillValidForApply re-reads the owning AITenant live (via APIReader,
@@ -244,16 +252,16 @@ func (r *Reconciler) resolveOwningAITenant(ctx context.Context, mtc *unstructure
 // reconcile resolved and rendered against. It is the TOCTOU (Time-of-Check to
 // Time-of-Use) fence for the apply path (RHAI-2514): between the cached resolve
 // and the write, the AITenant may have been deleted, recreated with a new UID,
-// re-homed to a different gateway, or had its spec bumped ahead of maas. Any of
-// those means the resources computed from the resolved copy would target the
-// wrong tenant/gateway or a superseded generation, so it must requeue.
+// or re-homed to a different gateway. Any of those means the resources
+// computed from the resolved copy would target the wrong tenant/gateway, so
+// it must requeue.
 //
 // It returns false (transient ⇒ requeue, not an error) when, read live, the
 // AITenant: is gone; has a different metadata.uid than wantUID; no longer binds
-// this MaasTenantConfig (status.tenantNamespace); is not Active; is not current
-// for its generation (StatusIsCurrent); or no longer publishes the same
-// status.gatewayRef this reconcile rendered against. An empty wantUID disables
-// the check, so a live object always carries a UID and only tests can opt out.
+// this MaasTenantConfig (status.tenantNamespace); no longer publishes the same
+// status.gatewayRef this reconcile rendered against; or has a non-zero
+// deletionTimestamp (delete already in flight). An empty wantUID disables the
+// check, so a live object always carries a UID and only tests can opt out.
 // This guards the apply path only: delete/cleanup must run regardless of
 // identity (see resolveOwnedAITenant).
 func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstructured.Unstructured, wantUID types.UID, wantGatewayName, wantGatewayNamespace string) (bool, error) {
@@ -277,8 +285,8 @@ func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstru
 	}
 	// Terminating: the owner's delete/cleanup is already in flight, so a fresh
 	// apply would provision for a tenant on its way out. deletionTimestamp is the
-	// only signal that flips here — uid/bind/active/current/gatewayRef can all
-	// still pass while the object is finalizing.
+	// signal — uid/bind/gatewayRef can all still pass while the object is
+	// finalizing.
 	if !aitenant.GetDeletionTimestamp().IsZero() {
 		return false, nil
 	}
@@ -291,17 +299,16 @@ func (r *Reconciler) aiTenantStillValidForApply(ctx context.Context, mtc *unstru
 	if ns, ok := ConfigNamespace(aitenant); !ok || ns != mtc.GetNamespace() {
 		return false, nil
 	}
-	// Readiness + generation currency against live state: an Active tenant
-	// whose status lags a spec change (StatusIsCurrent false) must not drive an
-	// install against a superseded generation.
-	if !IsActive(aitenant) || !StatusIsCurrent(aitenant) {
-		return false, nil
-	}
 	// The gateway we rendered against must still be the live one: a re-home
 	// (new status.gatewayRef for the same object) must not be applied against
 	// the old gateway.
 	gwName, gwNamespace, gwReady := GatewayRef(aitenant)
 	if !gwReady || gwName != wantGatewayName || gwNamespace != wantGatewayNamespace {
+		return false, nil
+	}
+	// Re-check DeployReady live: a GatewayClaimFailed (or stale Ready stamp)
+	// that landed after resolve must not proceed to apply.
+	if !DeployReady(aitenant) {
 		return false, nil
 	}
 	return true, nil
@@ -321,13 +328,17 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, err
 	}
 	if !ready {
-		log.Info("MaasTenantConfig opted into praxis but owning AITenant is not Active for its current generation yet; will retry")
+		log.Info("MaasTenantConfig opted into praxis but owning AITenant is not DeployReady yet (missing/Failed/stale Ready stamp); will retry")
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
 	gatewayName, gatewayNamespace, gwReady := GatewayRef(aitenant)
 	if !gwReady {
-		log.Info("owning AITenant is Active but status.gatewayRef is not populated; will retry")
+		log.Info("owning AITenant status.gatewayRef is not populated; will retry")
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+	}
+	if err := r.gatewayExists(ctx, gatewayNamespace, gatewayName); err != nil {
+		log.Info("owning AITenant gatewayRef Gateway object is not ready; will retry", "error", err)
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 
@@ -421,6 +432,13 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	}
 	if err := r.waitForForeignOwnership(ctx, resources); err != nil {
 		log.Info("praxis-extproc resources are still owned by another controller; waiting for handoff", "error", err)
+		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+	}
+
+	// RHOAIENG-98846: do not ForceOwnership-overwrite a leftover IPP plugins
+	// ConfigMap unless the operator force-annotated the MaasTenantConfig.
+	if err := r.ensurePluginsConfigMapMigrationAllowed(ctx, mtc, gatewayNamespace, tenantID); err != nil {
+		log.Info("waiting for plugins ConfigMap migration gate before applying praxis-extproc", "error", err)
 		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 	}
 

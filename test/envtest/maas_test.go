@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
@@ -23,6 +24,22 @@ type maasFixture struct {
 func (m maasFixture) existingPraxisTenant(t *testing.T, namespace string) {
 	t.Helper()
 	createNamespace(t, m.client, namespace)
+	// gatewayExists looks up the Gateway API object named by status.gatewayRef;
+	// the CRD is vendored in testdata/crds and the namespace is created in suite setup.
+	gateway := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "gateway.networking.k8s.io/v1",
+		"kind":       "Gateway",
+		"metadata":   map[string]any{"name": gatewayName, "namespace": gatewayNamespace},
+		"spec": map[string]any{
+			"gatewayClassName": "istio",
+			"listeners": []any{map[string]any{
+				"name": "http", "protocol": "HTTP", "port": int64(80),
+				"allowedRoutes": map[string]any{"namespaces": map[string]any{"from": "All"}},
+			}},
+		},
+	}}
+	require.NoError(t, m.client.Create(t.Context(), gateway))
+
 	ait := tenant.NewAITenant()
 	ait.SetName(namespace)
 	ait.SetNamespace(maasNamespace)
@@ -34,7 +51,7 @@ func (m maasFixture) existingPraxisTenant(t *testing.T, namespace string) {
 	ait.Object["status"] = map[string]any{
 		"phase": tenant.AITenantPhaseActive, "tenantNamespace": namespace,
 		"gatewayRef": map[string]any{"name": gatewayName, "namespace": gatewayNamespace},
-		// The tenant controller installs only once Ready reports the current generation.
+		// DeployReady requires a Ready stamp for the current generation.
 		"conditions": []any{map[string]any{
 			"type": tenant.AITenantConditionReady, "status": "True",
 			"reason": "Reconciled", "message": "AITenant bootstrap resources are reconciled",

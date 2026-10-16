@@ -208,3 +208,29 @@ Across Gateway → standard mode, preserve at least:
 
 For control-plane deployment topology (operators, tenant fan-out, IPP vs
 Praxis selection), see [DESIGN.md](../DESIGN.md).
+
+## IPP → Praxis plugins ConfigMap migration gate (3.6)
+
+Upgrades that flip `maas.opendatahub.io/payload-processing-type=praxis` must
+not silently rewrite customized `payload-processing-plugins` ConfigMaps
+([RHOAIENG-98846](https://issues.redhat.com/browse/RHOAIENG-98846)).
+
+| Live ConfigMap | Migration |
+| --- | --- |
+| Product default (response processors empty) | Auto |
+| Default + response `api-translation` enabled | Auto |
+| Default + legacy metering plugin | TBD until a real 3.5 example is collected |
+| Any other customization | **Blocked** until force annotation |
+
+**Force annotation** (on `MaasTenantConfig`):
+
+```bash
+kubectl annotate maastenantconfig default-tenant -n <tenant-namespace> \
+  maas.opendatahub.io/force-payload-processing-migration=true --overwrite
+```
+
+While blocked, maas-controller sets
+`maas.opendatahub.io/payload-processing-migration=blocked` and keeps the
+tenant `Ready=False` with a message pointing at the force annotation.
+ai-gateway-controller will not `ForceOwnership`-overwrite a leftover
+IPP-shaped plugins ConfigMap without the same annotation.

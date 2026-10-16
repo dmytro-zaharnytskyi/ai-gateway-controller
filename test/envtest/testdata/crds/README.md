@@ -5,7 +5,7 @@ Gateway API and Istio match the kind environment; MaaS matches `test/maas-e2e.lo
 
 | CRDs | Pinned source |
 | --- | --- |
-| HTTPRoute | [Gateway API v1.5.1](https://raw.githubusercontent.com/kubernetes-sigs/gateway-api/v1.5.1/config/crd/standard/gateway.networking.k8s.io_httproutes.yaml) |
+| Gateway, HTTPRoute | [Gateway API v1.5.1](https://raw.githubusercontent.com/kubernetes-sigs/gateway-api/v1.5.1/config/crd/standard/) (`gateway.networking.k8s.io_gateways.yaml`, `gateway.networking.k8s.io_httproutes.yaml`) |
 | DestinationRule, EnvoyFilter, ServiceEntry | [Istio 1.27.3 CRD bundle](https://raw.githubusercontent.com/istio/istio/1.27.3/manifests/charts/base/files/crd-all.gen.yaml) |
 | AITenant | [MaaS at 26e3116f](https://raw.githubusercontent.com/opendatahub-io/models-as-a-service/26e3116f6ddbe50a73fe9c31b61fbd6d3c817411/deployment/base/maas-controller/crd/bases/maas.opendatahub.io_aitenants.yaml) |
 | MaasTenantConfig | [MaaS at 26e3116f](https://raw.githubusercontent.com/opendatahub-io/models-as-a-service/26e3116f6ddbe50a73fe9c31b61fbd6d3c817411/deployment/base/maas-controller/crd/bases/maas.opendatahub.io_maastenantconfigs.yaml) |

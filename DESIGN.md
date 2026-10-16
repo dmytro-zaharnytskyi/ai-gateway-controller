@@ -206,14 +206,18 @@ cross-object propagation lag between them.
 `MaasTenantConfig`, so this controller also Gets a tenant's owning `AITenant`
 (via the `aitenant-name`/`aitenant-namespace` annotations maas-controller's
 own `AITenantReconciler` already stamps onto every AITenant-managed
-`MaasTenantConfig`) and gates apply on `status.phase == "Active"` there, so
-nothing is applied before maas-controller has actually validated the
-Gateway and finished bootstrapping the tenant. Both CRDs are read as
-`unstructured.Unstructured` against hardcoded `schema.GroupVersionKind`s
-rather than by importing `models-as-a-service/maas-controller`'s Go types:
-that module's `go.mod` pulls in `kserve`, `knative`, `KEDA`, `openshift/api`,
-and more, none of which this controller needs to keep its own dependency
-graph minimal.
+`MaasTenantConfig`) and gates apply on a populated `status.gatewayRef` plus
+`DeployReady` (Ready `observedGeneration` matches generation, and phase is
+not `Failed` — maas writes `gatewayRef` before the exclusive gateway claim,
+so `Failed`/`GatewayClaimFailed` must not get EnvoyFilters or ExternalModel
+routes). Pending with a current Ready stamp is enough (do not wait for
+`Active`, which deadlocks on MTC Ready). Praxis-extproc also requires Gateway
+existence / handshake; ExternalModel publish also requires `steady`. Both
+CRDs are read as `unstructured.Unstructured` against hardcoded
+`schema.GroupVersionKind`s rather than by importing
+`models-as-a-service/maas-controller`'s Go types: that module's `go.mod`
+pulls in `kserve`, `knative`, `KEDA`, `openshift/api`, and more, none of
+which this controller needs to keep its own dependency graph minimal.
 
 A `PraxisCleanupFinalizer` on the `MaasTenantConfig` (not `AITenant`)
 guarantees a chance to delete what was applied when a tenant switches away
@@ -267,6 +271,18 @@ doc comment for the full state machine this mirrors. In short:
 - After a full, successful switch-off cleanup (`Reconciler.cleanup`), this
   controller writes `cleanup-complete` (`MarkPayloadProcessingCleanupComplete`)
   so maas-controller may claim to absent and (re)deploy legacy IPP.
+
+### Plugins ConfigMap migration gate (RHOAIENG-98846)
+
+maas-controller fingerprints the live `payload-processing-plugins` ConfigMap
+**before** IPP cleanup and only auto-migrates known-good baselines (product
+default, or default with response `api-translation` enabled). Non-standard
+ConfigMaps block cleanup until the operator sets
+`maas.opendatahub.io/force-payload-processing-migration=true` on
+`MaasTenantConfig` (after reviewing release notes). This controller adds
+defense-in-depth: if an IPP-shaped plugins ConfigMap is still present at
+Praxis apply time without that force annotation, apply waits rather than
+`ForceOwnership`-overwriting custom plugin edits.
 
 ### Gateway attachments
 
@@ -335,12 +351,15 @@ traffic.
   renders and applies a dedicated, per-tenant-named copy of the
   praxis-extproc resources (`{base}-{tenantID}`, the default/legacy tenant
   keeps the unsuffixed names) into that tenant's owning `AITenant`'s
-  `status.gatewayRef` namespace, once that `AITenant`'s `status.phase` is
-  `Active`. A secondary `AITenant` watch reacts to gatewayRef/phase changes
-  that a `MaasTenantConfig`-only watch would miss. Tenants explicitly set to
-  `ipp` are untouched — `maas-controller`'s own
-  `TenantReconciler` owns their IPP deployment. The current product default is
-  Praxis when the selector is absent; explicit `ipp` is the opt-out.
+  `status.gatewayRef` namespace once `status.gatewayRef` is populated,
+  `DeployReady` holds (current Ready stamp, not Failed), the referenced
+  Gateway object exists, and the payload-processing handshake allows deploy
+  (`cleanup-complete` / `steady`). A secondary `AITenant` watch reacts to
+  gatewayRef/phase changes that a
+  `MaasTenantConfig`-only watch would miss. Tenants explicitly set to `ipp`
+  are untouched — `maas-controller`'s own `TenantReconciler` owns their IPP
+  deployment. The current product default is Praxis when the selector is
+  absent; explicit `ipp` is the opt-out.
   `PraxisCleanupFinalizer` (on `MaasTenantConfig`) deletes a tenant's
   praxis-extproc resources when it switches away from `praxis` or its
   `MaasTenantConfig` is deleted; `--deletion-timeout` bounds how long that
@@ -428,7 +447,7 @@ ai-gateway-controller/
 ├── pkg/tenant/                          # per-tenant MaasTenantConfig -> praxis-extproc fan-out (Phase 2)
 │   ├── constants.go, naming.go          # MaasTenantConfigGVK, AITenantGVK, base resource names, "{base}-{tenantID}" naming
 │   ├── maastenantconfig.go              # unstructured MaasTenantConfig field accessors (no Go type import)
-│   ├── aitenant.go                      # unstructured AITenant field accessors (status.gatewayRef / status.phase only)
+│   ├── aitenant.go                      # unstructured AITenant accessors (gatewayRef, DeployReady)
 │   ├── migration.go                     # payload-processing backend swap handshake (existence-check + CAS claim)
 │   ├── ownership.go                     # field-manager/label ownership check for cleanup deletes
 │   ├── rename.go                        # Rename(): per-tenant resource rename + internal-reference patch
@@ -475,11 +494,6 @@ alone:
 
 ## Open questions (non-blocking, tracked)
 
-- `pkg/tenant.Reconciler` does not write any status
-  (condition/phase) on `MaasTenantConfig` or `AITenant` reflecting whether
-  the per-tenant praxis-extproc install succeeded — maas-controller's own
-  reconcilers own `status` on both objects today, so this would need a
-  careful merge strategy, not a blind `Status().Update()`.
 - A computed per-tenant resource name over 63 characters (possible even
   within the CRD's 41-character `AITenant` name limit, since that limit
   was sized against maas-controller's own longest base name, not

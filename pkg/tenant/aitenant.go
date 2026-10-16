@@ -20,23 +20,12 @@ import "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 // NewAITenant returns an empty unstructured object with the AITenant GVK
 // set, ready for Get. This controller only ever Gets a specific AITenant by
-// name/namespace (to resolve status.gatewayRef / status.phase for the
+// name/namespace (to resolve status.gatewayRef / deploy readiness for the
 // MaasTenantConfig it primarily watches).
 func NewAITenant() *unstructured.Unstructured {
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(AITenantGVK)
 	return u
-}
-
-// IsActive reports whether maas-controller's AITenant reconciler has
-// finished validating and bootstrapping this tenant (status.phase ==
-// "Active": its Gateway is validated, and its namespace, MaasTenantConfig,
-// and RBAC exist). Used as the readiness gate instead of GatewayRef alone,
-// since status.gatewayRef is populated optimistically from spec before any
-// of that validation happens.
-func IsActive(aitenant *unstructured.Unstructured) bool {
-	phase, _, _ := unstructured.NestedString(aitenant.Object, "status", "phase")
-	return phase == AITenantPhaseActive
 }
 
 // GatewayRef reads status.gatewayRef.{name,namespace}. ok is false until
@@ -49,19 +38,26 @@ func GatewayRef(aitenant *unstructured.Unstructured) (name, namespace string, ok
 	return name, namespace, name != "" && namespace != ""
 }
 
+// Phase reads status.phase.
+func Phase(aitenant *unstructured.Unstructured) string {
+	phase, _, _ := unstructured.NestedString(aitenant.Object, "status", "phase")
+	return phase
+}
+
+// IsFailed reports status.phase == Failed. maas writes status.gatewayRef
+// before the exclusive gateway claim; GatewayClaimFailed (and other Failed
+// reasons) leave gatewayRef pointing at a gateway this tenant does not own.
+func IsFailed(aitenant *unstructured.Unstructured) bool {
+	return Phase(aitenant) == AITenantPhaseFailed
+}
+
 // StatusIsCurrent reports whether the AITenant's Ready condition was computed
 // for the object's current spec generation — i.e. status.phase and
 // status.gatewayRef reflect the live spec, not an in-flight older one that
 // maas-controller has not reconciled yet. It looks for the
 // AITenantConditionReady condition and requires its observedGeneration to
 // equal metadata.generation; maas-controller stamps that on every phase
-// transition (setAITenantPhase), and AITenantStatus exposes no top-level
-// observedGeneration to rely on instead.
-//
-// Used together with IsActive as the readiness gate: acting on an Active phase
-// whose gatewayRef still reflects a superseded generation would install
-// praxis-extproc against a stale Gateway. A false result is a transient
-// not-ready state (requeue), not an error.
+// transition (setAITenantPhase), including Pending and Failed.
 func StatusIsCurrent(aitenant *unstructured.Unstructured) bool {
 	conditions, _, _ := unstructured.NestedSlice(aitenant.Object, "status", "conditions")
 	for _, entry := range conditions {
@@ -77,6 +73,16 @@ func StatusIsCurrent(aitenant *unstructured.Unstructured) bool {
 		return ok && observed == aitenant.GetGeneration()
 	}
 	return false
+}
+
+// DeployReady reports whether praxis-extproc apply / ExternalModel publish may
+// target this AITenant. It requires a Ready condition stamped for the current
+// generation (Pending is fine — that is what breaks the Active↔MTC Ready
+// deadlock) and rejects Failed so a GatewayClaimFailed re-home does not place
+// EnvoyFilters or routes next to another tenant's claim. Callers still require
+// a populated gatewayRef (and handshake / Gateway existence as appropriate).
+func DeployReady(aitenant *unstructured.Unstructured) bool {
+	return StatusIsCurrent(aitenant) && !IsFailed(aitenant)
 }
 
 // nestedInt64 reads an integer field that may have been decoded as int64
