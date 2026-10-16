@@ -151,8 +151,8 @@ func (r *Reconciler) gateAttachmentTenant(ctx context.Context, ait *unstructured
 		result.reason, result.message = reasonTenantNotSteady, "the tenant's owning AITenant is changing"
 	case live.status != tenant.PayloadProcessingStatusSteady:
 		result.reason, result.message = reasonTenantNotSteady, "the tenant's payload-processing-status is not steady"
-	case !tenant.IsActive(live.aitenant) || !tenant.StatusIsCurrent(live.aitenant):
-		result.reason, result.message = reasonTenantNotSteady, "the tenant's AITenant is not Active"
+	case !tenant.DeployReady(live.aitenant):
+		result.reason, result.message = reasonTenantNotSteady, "the tenant's AITenant is not DeployReady"
 	default:
 		if name, namespace, ok := tenant.GatewayRef(live.aitenant); !ok || name != t.gateway.Name || namespace != t.gateway.Namespace {
 			result.reason, result.message = reasonTenantNotSteady, "the tenant's Gateway reference changed"
@@ -316,7 +316,7 @@ func (r *Reconciler) leaveHomeTenant(ctx context.Context, model *v1alpha1.Extern
 	}
 	if live.aitenant == nil || live.status != tenant.PayloadProcessingStatusSteady ||
 		!live.mtc.GetDeletionTimestamp().IsZero() || !live.aitenant.GetDeletionTimestamp().IsZero() ||
-		!tenant.IsActive(live.aitenant) || !tenant.StatusIsCurrent(live.aitenant) {
+		!tenant.DeployReady(live.aitenant) {
 		return nil
 	}
 	gatewayName, gatewayNamespace, ok := tenant.GatewayRef(live.aitenant)

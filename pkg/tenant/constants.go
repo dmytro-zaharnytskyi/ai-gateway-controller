@@ -120,21 +120,20 @@ const (
 
 	// AITenantPhaseActive is the AITenant status.phase value maas-controller's
 	// AITenant reconciler sets only after it has validated the tenant's
-	// Gateway, and created its namespace, MaasTenantConfig, and RBAC. Used
-	// as the readiness gate before installing praxis-extproc: status.gatewayRef
-	// alone is not sufficient, since AITenantReconciler populates it
-	// optimistically (from spec, unvalidated) before that work happens.
+	// Gateway, and created its namespace, MaasTenantConfig, and RBAC.
 	AITenantPhaseActive = "Active"
+
+	// AITenantPhaseFailed is status.phase when maas-controller cannot finish
+	// bootstrap (including GatewayClaimFailed). gatewayRef may still name the
+	// contested gateway; DeployReady rejects Failed.
+	AITenantPhaseFailed = "Failed"
 
 	// AITenantConditionReady is the AITenant status condition type
 	// maas-controller's AITenant reconciler stamps together with status.phase
 	// (mirrors maasv1alpha1.AITenantConditionReady, set by
 	// AITenantReconciler.setAITenantPhase), carrying ObservedGeneration set to
-	// the AITenant's metadata.generation. It is the only place a per-generation
-	// marker is exposed: AITenantStatus has no top-level observedGeneration
-	// field. Reads of status.phase / status.gatewayRef are only trustworthy for
-	// the current spec when this condition's observedGeneration matches
-	// metadata.generation — see StatusIsCurrent.
+	// the AITenant's metadata.generation. StatusIsCurrent / DeployReady use
+	// that stamp so phase and gatewayRef are only trusted for the live spec.
 	AITenantConditionReady = "Ready"
 
 	// PraxisCleanupFinalizer is added to every MaasTenantConfig this controller
@@ -205,4 +204,5 @@ var (
 	gvkEnvoyFilter        = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"}
 	gvkDestinationRule    = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"}
 	gvkClusterRoleBinding = schema.GroupVersionKind{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding"}
+	gvkGateway            = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"}
 )

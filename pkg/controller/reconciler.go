@@ -612,8 +612,12 @@ func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.Ext
 		}
 		return modelTenantContext{}, false, nil
 	}
-	if !tenant.IsActive(ait) || !tenant.StatusIsCurrent(ait) {
-		if err := report(false, reasonTenantNotReady, "AITenant is selected for Praxis but is not Active", nil); err != nil {
+	// DeployReady (current Ready stamp, not Failed) — not Active. maas writes
+	// gatewayRef before the exclusive gateway claim; Failed/GatewayClaimFailed
+	// still publishes the contested ref. Pending with a current stamp is enough
+	// so ExternalModel publish does not wait on Active↔MTC Ready.
+	if !tenant.DeployReady(ait) {
+		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "AITenant is not ready for ExternalModel publish (Failed or status not current for this generation)", nil); err != nil {
 			return modelTenantContext{}, false, err
 		}
 		return modelTenantContext{}, false, nil
@@ -675,11 +679,10 @@ func (r *Reconciler) reconcileDeletingModel(ctx context.Context, model *v1alpha1
 	}
 	if live.missingConfig || live.mtc == nil || live.aitenant == nil ||
 		!live.mtc.GetDeletionTimestamp().IsZero() || !live.aitenant.GetDeletionTimestamp().IsZero() ||
-		live.status != tenant.PayloadProcessingStatusSteady || !tenant.IsActive(live.aitenant) ||
-		!tenant.StatusIsCurrent(live.aitenant) {
+		live.status != tenant.PayloadProcessingStatusSteady {
 		return r.reconcileDeletedModelWithoutOwner(ctx, model)
 	}
-	if _, _, ready := tenant.GatewayRef(live.aitenant); !ready {
+	if _, _, ready := tenant.GatewayRef(live.aitenant); !ready || !tenant.DeployReady(live.aitenant) {
 		return r.reconcileDeletedModelWithoutOwner(ctx, model)
 	}
 	return r.reconcileDeletedModel(ctx, model, live.aitenant)
@@ -1039,10 +1042,8 @@ func providerTenantReadinessMessage(live tenantResolution) string {
 		return "owning AITenant is being deleted"
 	case live.status != tenant.PayloadProcessingStatusSteady:
 		return fmt.Sprintf("MaasTenantConfig selects Praxis but payload-processing-status is %q, expected %q", live.status, tenant.PayloadProcessingStatusSteady)
-	case !tenant.IsActive(live.aitenant):
-		return "owning AITenant phase is not Active"
-	case !tenant.StatusIsCurrent(live.aitenant):
-		return "owning AITenant Ready condition does not observe its current generation"
+	case !tenant.DeployReady(live.aitenant):
+		return "owning AITenant is not DeployReady (Failed or Ready stamp not current for this generation)"
 	default:
 		return ""
 	}
@@ -1138,11 +1139,8 @@ func (r *Reconciler) livePraxisBeforeWrite(ctx context.Context, namespace string
 	if want.aitenantUID != "" && live.aitenant.GetUID() != want.aitenantUID {
 		return false, nil
 	}
-	if !tenant.IsActive(live.aitenant) || !tenant.StatusIsCurrent(live.aitenant) {
-		return false, nil
-	}
 	gatewayName, gatewayNamespace, ok := tenant.GatewayRef(live.aitenant)
-	return ok && gatewayName == want.gatewayName && gatewayNamespace == want.gatewayNamespace, nil
+	return ok && tenant.DeployReady(live.aitenant) && gatewayName == want.gatewayName && gatewayNamespace == want.gatewayNamespace, nil
 }
 
 // praxisTenantForNamespace is retained for callers/tests that need the

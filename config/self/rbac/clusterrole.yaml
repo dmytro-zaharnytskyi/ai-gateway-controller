@@ -92,10 +92,15 @@ rules:
   resources: ["httproutes"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 # A cross-namespace ExternalProvider reference must be authorized by a
-# ReferenceGrant in the provider namespace. Gateway attachment uses HTTPRoute
-# parent status instead, so no Gateway or Namespace read is granted.
+# ReferenceGrant in the provider namespace. ExternalModel Gateway attachment
+# uses HTTPRoute parent status, so no Namespace read is granted.
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["referencegrants"]
+  verbs: ["get", "list", "watch"]
+# The tenant reconciler checks that an AITenant's status.gatewayRef names an
+# existing Gateway before applying praxis-extproc.
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["gateways"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["networking.istio.io"]
   resources: ["serviceentries"]

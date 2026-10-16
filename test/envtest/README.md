@@ -39,8 +39,8 @@ API server, including on failure. The current kubeconfig is never used.
   Both paths require the shipped permission to patch model finalizers.
 - The shipped controller identity may create, patch and delete Secrets in a
   tenant namespace for its credential copies, and read ReferenceGrants in a
-  provider namespace and across all namespaces. It cannot read Gateways in the
-  gateway namespace or read Namespaces. Each permission is checked with a
+  provider namespace and across all namespaces. It can read Gateways in the
+  gateway namespace but cannot read Namespaces. Each permission is checked with a
   SubjectAccessReview that must evaluate without error, so it is verified
   before any controller uses it.
 - Guardrail admission accepts positive Go durations and rejects invalid or

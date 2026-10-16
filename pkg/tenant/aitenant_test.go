@@ -39,42 +39,14 @@ func aitenantFixture(phase, gatewayName, gatewayNamespace string) *unstructured.
 	return u
 }
 
-func TestNewAITenantSetsGVK(t *testing.T) {
-	u := NewAITenant()
-	if got := u.GroupVersionKind(); got != AITenantGVK {
-		t.Fatalf("GVK = %v, want %v", got, AITenantGVK)
-	}
-}
-
-func TestIsActive(t *testing.T) {
-	cases := []struct {
-		name  string
-		phase string
-		want  bool
-	}{
-		{"absent phase", "", false},
-		{"Pending", "Pending", false},
-		{"Active", "Active", true},
-		{"Failed", "Failed", false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := IsActive(aitenantFixture(c.phase, "", "")); got != c.want {
-				t.Errorf("IsActive(phase=%q) = %v, want %v", c.phase, got, c.want)
-			}
-		})
-	}
-}
-
 // aitenantWithReady builds an AITenant carrying the AITenantConditionReady
 // condition maas-controller writes alongside status.phase, with an explicit
-// metadata.generation and the condition's observedGeneration, so the
-// generation fence can be exercised directly.
-func aitenantWithReady(generation, observedGeneration int64, readyStatus string) *unstructured.Unstructured {
+// metadata.generation and the condition's observedGeneration.
+func aitenantWithReady(phase string, generation, observedGeneration int64, readyStatus string) *unstructured.Unstructured {
 	u := NewAITenant()
 	u.SetGeneration(generation)
 	u.Object["status"] = map[string]any{
-		"phase": "Active",
+		"phase": phase,
 		"conditions": []any{
 			map[string]any{
 				"type":               AITenantConditionReady,
@@ -86,6 +58,22 @@ func aitenantWithReady(generation, observedGeneration int64, readyStatus string)
 	return u
 }
 
+func TestNewAITenantSetsGVK(t *testing.T) {
+	u := NewAITenant()
+	if got := u.GroupVersionKind(); got != AITenantGVK {
+		t.Fatalf("GVK = %v, want %v", got, AITenantGVK)
+	}
+}
+
+func TestIsFailed(t *testing.T) {
+	if IsFailed(aitenantFixture("Pending", "", "")) {
+		t.Fatal("IsFailed(Pending) = true, want false")
+	}
+	if !IsFailed(aitenantFixture(AITenantPhaseFailed, "", "")) {
+		t.Fatal("IsFailed(Failed) = false, want true")
+	}
+}
+
 func TestStatusIsCurrent(t *testing.T) {
 	t.Run("no conditions", func(t *testing.T) {
 		if StatusIsCurrent(aitenantFixture("Active", "", "")) {
@@ -94,22 +82,19 @@ func TestStatusIsCurrent(t *testing.T) {
 	})
 
 	t.Run("ready observedGeneration matches generation", func(t *testing.T) {
-		if !StatusIsCurrent(aitenantWithReady(3, 3, "True")) {
+		if !StatusIsCurrent(aitenantWithReady("Pending", 3, 3, "False")) {
 			t.Fatal("StatusIsCurrent = false, want true when Ready observedGeneration == generation")
 		}
 	})
 
 	t.Run("ready observedGeneration lags generation", func(t *testing.T) {
-		if StatusIsCurrent(aitenantWithReady(4, 3, "True")) {
+		if StatusIsCurrent(aitenantWithReady("Active", 4, 3, "True")) {
 			t.Fatal("StatusIsCurrent = true, want false when Ready observedGeneration < generation")
 		}
 	})
 
 	t.Run("generation currency is independent of ready status", func(t *testing.T) {
-		// StatusIsCurrent gates on generation only; IsActive (phase) covers
-		// the True/False dimension. A current-but-False condition is still
-		// "current".
-		if !StatusIsCurrent(aitenantWithReady(2, 2, "False")) {
+		if !StatusIsCurrent(aitenantWithReady("Pending", 2, 2, "False")) {
 			t.Fatal("StatusIsCurrent = false, want true when observedGeneration matches, regardless of condition status")
 		}
 	})
@@ -142,6 +127,24 @@ func TestStatusIsCurrent(t *testing.T) {
 		}
 		if !StatusIsCurrent(u) {
 			t.Fatal("StatusIsCurrent = false, want true when observedGeneration is a float64 matching generation")
+		}
+	})
+}
+
+func TestDeployReady(t *testing.T) {
+	t.Run("pending current", func(t *testing.T) {
+		if !DeployReady(aitenantWithReady("Pending", 1, 1, "False")) {
+			t.Fatal("DeployReady(Pending, current) = false, want true")
+		}
+	})
+	t.Run("failed current", func(t *testing.T) {
+		if DeployReady(aitenantWithReady(AITenantPhaseFailed, 1, 1, "False")) {
+			t.Fatal("DeployReady(Failed, current) = true, want false")
+		}
+	})
+	t.Run("active stale", func(t *testing.T) {
+		if DeployReady(aitenantWithReady(AITenantPhaseActive, 2, 1, "True")) {
+			t.Fatal("DeployReady(Active, stale) = true, want false")
 		}
 	})
 }

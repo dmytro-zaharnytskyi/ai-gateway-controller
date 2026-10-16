@@ -120,7 +120,8 @@ for req in \
   "${MAAS_CHECKOUT_ROOT}/scripts/deployment-helpers.sh" \
   "${MAAS_CHECKOUT_ROOT}/scripts/deploy.sh" \
   "${MAAS_E2E_DIR}/requirements.txt" \
-  "${MAAS_E2E_DIR}/pyproject.toml"
+  "${MAAS_E2E_DIR}/pyproject.toml" \
+  "${MAAS_E2E_DIR}/scripts/ensure_e2e_python.sh"
 do
   if [[ ! -f "${req}" ]]; then
     echo "ERROR: MaaS checkout missing required file: ${req}" >&2

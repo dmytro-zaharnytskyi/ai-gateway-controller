@@ -42,10 +42,11 @@ func testShippedPermissions(t *testing.T, c client.Client) {
 				Namespace: namespace, Group: gatewayAPIGroup, Resource: "referencegrants", Verb: verb,
 			})
 		}
-		// Gateway attachment is authorized through HTTPRoute parent status.
-		assertAccess(t, c, false, authv1.ResourceAttributes{
+		// The tenant reconciler checks that the AITenant's Gateway exists.
+		assertAccess(t, c, true, authv1.ResourceAttributes{
 			Namespace: gatewayNamespace, Group: gatewayAPIGroup, Resource: "gateways", Verb: verb,
 		})
+		// ExternalModel Gateway attachment is authorized through HTTPRoute parent status.
 		assertAccess(t, c, false, authv1.ResourceAttributes{
 			Resource: "namespaces", Verb: verb,
 		})
