@@ -816,7 +816,7 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 				return err
 			}
 		}
-		if err := r.cleanupTransport(ctx, deleted.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
+		if err := r.cleanupModelTransport(ctx, deleted.Namespace, nil); err != nil {
 			return err
 		}
 		if err := r.cleanupOverlay(ctx, deleted.Namespace); err != nil {
