@@ -39,10 +39,20 @@ if [[ "$E2E_PARALLEL_WORKERS" -gt 1 ]]; then
     export E2E_MULTITENANCY_PHASE_TIMEOUT="${E2E_MULTITENANCY_PHASE_TIMEOUT:-180}"
 fi
 
+# MaaS pytest 9 needs Python >= 3.10. Group-test UBI9 still ships python3=3.9;
+# ensure_e2e_python.sh (from the pinned checkout) installs/selects 3.11 when needed.
+# shellcheck source=/dev/null
+source "${TEST_DIR}/scripts/ensure_e2e_python.sh"
+
 VENV_DIR="${PROJECT_ROOT}/test/e2e/.venv"
+if [[ -d "$VENV_DIR" ]] \
+    && ! "$VENV_DIR/bin/python" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+    echo "Recreating e2e venv (existing interpreter is older than Python 3.10)..."
+    rm -rf "$VENV_DIR"
+fi
 if [[ ! -d "$VENV_DIR" ]]; then
-    echo "Creating Python venv for e2e tests..."
-    python3 -m venv "$VENV_DIR" --upgrade-deps
+    echo "Creating Python venv for e2e tests ($E2E_PYTHON)..."
+    "$E2E_PYTHON" -m venv "$VENV_DIR" --upgrade-deps
 fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"

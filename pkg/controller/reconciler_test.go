@@ -1211,6 +1211,7 @@ func TestExternalModelDeletionRepublishesRemainingRoutes(t *testing.T) {
 				Provider: "openai", Endpoint: name + ".example.com",
 				Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: name + "-credentials"}},
 			},
+			Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
 		}
 		if err := r.Create(context.Background(), provider); err != nil {
 			t.Fatal(err)
@@ -1219,6 +1220,9 @@ func TestExternalModelDeletionRepublishesRemainingRoutes(t *testing.T) {
 		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name + "-credentials", Namespace: model.Namespace}, Data: map[string][]byte{"api-key": []byte("fixture-only-secret")}}
 		if err := r.Create(context.Background(), secret); err != nil {
 			t.Fatal(err)
+		}
+		if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+			t.Fatalf("ReconcileProvider %s: %v", name, err)
 		}
 	}
 	sibling := &v1alpha1.ExternalModel{
@@ -1375,6 +1379,15 @@ func TestReconcileAppliesCandidateTransportBeforePublishingRandomSelection(t *te
 		}
 		return render.Apply(ctx, r.Client, []unstructured.Unstructured{object})
 	}
+	// Provider transport is owned by ReconcileProvider (#128); model reconcile
+	// only publishes once those Services/ServiceEntries/DestinationRules exist.
+	for _, name := range []string{"provider", "provider-b"} {
+		if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{
+			NamespacedName: client.ObjectKey{Namespace: model.Namespace, Name: name},
+		}); err != nil {
+			t.Fatalf("ReconcileProvider %s: %v", name, err)
+		}
+	}
 	pub, err := publisher.New(r.Client, publisher.Config{Namespace: model.Namespace, Name: "routing-overlay"})
 	if err != nil {
 		t.Fatal(err)
@@ -1487,6 +1500,7 @@ func TestUnequalWeightModelDoesNotFailOrBlockHealthySiblingDeletion(t *testing.T
 		ObjectMeta: metav1.ObjectMeta{Name: "provider-b", Namespace: healthy.Namespace, UID: "provider-b-uid"},
 		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "b.example.com",
 			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-b-credentials"}}},
+		Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
 	}
 	if err := r.Create(ctx, providerB); err != nil {
 		t.Fatal(err)
@@ -1495,6 +1509,9 @@ func TestUnequalWeightModelDoesNotFailOrBlockHealthySiblingDeletion(t *testing.T
 	if err := r.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-b-credentials", Namespace: healthy.Namespace},
 		Data: map[string][]byte{"api-key": []byte("fixture-only-secret")}}); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(providerB)}); err != nil {
+		t.Fatalf("ReconcileProvider provider-b: %v", err)
 	}
 	weightOne, weightTwo := 1, 2
 	bad := healthy.DeepCopy()
@@ -1567,7 +1584,8 @@ func TestCrossModelSelectionConflictsDoNotBlockUnrelatedModel(t *testing.T) {
 			r, healthy := reconcilerFixture(t)
 			providerB := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "provider-b", Namespace: healthy.Namespace, UID: "provider-b-uid"},
 				Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "b.example.com",
-					Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-b-credentials"}}}}
+					Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-b-credentials"}}},
+				Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady}}
 			if err := r.Create(ctx, providerB); err != nil {
 				t.Fatal(err)
 			}
@@ -1575,6 +1593,9 @@ func TestCrossModelSelectionConflictsDoNotBlockUnrelatedModel(t *testing.T) {
 			if err := r.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-b-credentials", Namespace: healthy.Namespace},
 				Data: map[string][]byte{"api-key": []byte("fixture-only-secret")}}); err != nil {
 				t.Fatal(err)
+			}
+			if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(providerB)}); err != nil {
+				t.Fatalf("ReconcileProvider provider-b: %v", err)
 			}
 			newAlias := func(name string, refs []v1alpha1.ExternalProviderRef) *v1alpha1.ExternalModel {
 				for i := range refs {
