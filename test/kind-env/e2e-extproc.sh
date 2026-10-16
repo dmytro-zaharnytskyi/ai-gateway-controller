@@ -382,8 +382,15 @@ accepted=$(jq -r '[.status.parents[]?.conditions[]?|select(.type=="Accepted")|.s
 resolved=$(jq -r '[.status.parents[]?.conditions[]?|select(.type=="ResolvedRefs")|.status]|any(.=="True")'<<<"$route")
 [[ "$accepted" == true && "$resolved" == true ]] && record 3 route_status PASS "accepted=true resolved_refs=true" || record 3 route_status FAIL "accepted=$accepted resolved_refs=$resolved"
 fqdn=$EXT_SERVICE.$NS.svc.cluster.local
-ef=$(kctl -n "$API_NS" get envoyfilter payload-processing -o yaml 2>/dev/null || true); dr=$(kctl -n "$API_NS" get destinationrule "$EXT_SERVICE" -o yaml 2>/dev/null || true)
-grep -Fq "$fqdn"<<<"$ef"&&grep -Fq "$fqdn"<<<"$dr"&&record 4 namespace_split PASS "fqdn=$fqdn"||record 4 namespace_split FAIL "fqdn=$fqdn"
+ef=$(kctl -n "$API_NS" get envoyfilter payload-processing-external-model-filters -o json 2>/dev/null || echo '{}')
+dr=$(kctl -n "$API_NS" get destinationrule "$EXT_SERVICE" -o json 2>/dev/null || echo '{}')
+ef_host=$(jq -r '[.spec.configPatches[]? | select(.applyTo=="CLUSTER") | .patch.value // empty | select(.name=="payload-processing-external-model-extproc") | .load_assignment.endpoints[]?.lb_endpoints[]?.endpoint.address.socket_address.address // empty] | first // empty' <<<"$ef")
+dr_host=$(jq -r '.spec.host // empty' <<<"$dr")
+if [[ "$ef_host" == "$fqdn" && "$dr_host" == "$fqdn" ]]; then
+  record 4 namespace_split PASS "envoy_cluster_host=$ef_host destination_rule_host=$dr_host"
+else
+  record 4 namespace_split FAIL "expected=$fqdn envoy_cluster_host=${ef_host:-absent} destination_rule_host=${dr_host:-absent}"
+fi
 cfg=$(kctl -n "$NS" get configmap "$EXT_CONFIG" -o jsonpath='{.data.extproc\.yaml}' 2>/dev/null || true)
 grep -q intelligent_route<<<"$cfg"&&grep -q credential_inject<<<"$cfg"&&record 5 post_auth_chain PASS "filters_present=true"||record 5 post_auth_chain FAIL "filters_present=false"
 if wait_overlay a; then record 6 overlay_a PASS "two_stable_samples=true"; else record 6 overlay_a FAIL "two_stable_samples=false"; fi
