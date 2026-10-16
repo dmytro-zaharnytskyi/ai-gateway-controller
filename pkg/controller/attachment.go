@@ -160,8 +160,10 @@ func (r *Reconciler) attachmentRouteModels(_ context.Context, route *unstructure
 	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: route.GetNamespace(), Name: model}}}
 }
 
-// sameNameModels enqueues attached models in other namespaces with the same
-// client-facing name, so a model-name conflict is re-decided for them.
+// sameNameModels enqueues attached models with the same client-facing name,
+// in any namespace, so a model-name conflict is re-decided for them. Updates
+// map both the old and the new object, so a rename also re-decides the name
+// it releases.
 func (r *Reconciler) sameNameModels(ctx context.Context, obj client.Object) []reconcile.Request {
 	changed, ok := obj.(*v1alpha1.ExternalModel)
 	if !ok {
@@ -175,7 +177,7 @@ func (r *Reconciler) sameNameModels(ctx context.Context, obj client.Object) []re
 	var requests []reconcile.Request
 	for i := range models.Items {
 		m := &models.Items[i]
-		if m.Namespace != changed.Namespace && len(m.Spec.GatewayRefs) > 0 && r.namespaceAllowed(m.Namespace) && clientModelName(m) == clientModelName(changed) {
+		if len(m.Spec.GatewayRefs) > 0 && r.namespaceAllowed(m.Namespace) && clientModelName(m) == clientModelName(changed) {
 			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(m)})
 		}
 	}
@@ -530,11 +532,15 @@ func (r *Reconciler) attachmentCandidates(ctx context.Context, t attachmentTenan
 	if err != nil {
 		return nil, err
 	}
-	winners := map[string]string{}
+	// A model name is held by one namespace. Conflicts apply across
+	// namespaces only: models in the holder's namespace share the name, as
+	// they do today.
+	type holder struct{ namespace, model string }
+	winners := map[string]holder{}
 	for _, m := range own {
 		if m.DeletionTimestamp.IsZero() {
 			// The tenant's own models always keep their model name.
-			winners[clientModelName(m)] = m.Namespace + "/" + m.Name
+			winners[clientModelName(m)] = holder{m.Namespace, m.Namespace + "/" + m.Name}
 		}
 	}
 	var models v1alpha1.ExternalModelList
@@ -558,11 +564,13 @@ func (r *Reconciler) attachmentCandidates(ctx context.Context, t attachmentTenan
 	for _, m := range attached {
 		candidate := attachedModel{model: m, routeName: attachmentRouteName(m, t.gateway)}
 		name := clientModelName(m)
-		if winner, taken := winners[name]; taken {
+		if winner, taken := winners[name]; taken && winner.namespace != m.Namespace {
 			candidate.reason = reasonModelNameConflict
-			candidate.message = fmt.Sprintf("model name %q is served on this Gateway by ExternalModel %s", name, winner)
+			candidate.message = fmt.Sprintf("model name %q is served on this Gateway by ExternalModel %s", name, winner.model)
 		} else {
-			winners[name] = m.Namespace + "/" + m.Name
+			if !taken {
+				winners[name] = holder{m.Namespace, m.Namespace + "/" + m.Name}
+			}
 			if err := r.resolveAttachedModel(ctx, &candidate); err != nil {
 				return nil, err
 			}

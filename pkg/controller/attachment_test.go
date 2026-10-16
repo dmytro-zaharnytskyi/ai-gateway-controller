@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"maps"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -15,7 +16,10 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
@@ -307,6 +311,97 @@ func TestModelNameConflictKeepsTenantModelThenOldest(t *testing.T) {
 	if _, err := getUnstructured(r, httpRouteGVK, "team-one", attachmentRouteName(older, gatewayB)); err != nil {
 		t.Fatalf("the oldest attached model lost its route: %v", err)
 	}
+}
+
+// renameModel changes the model's client-facing name and returns the requests
+// the model-name watch enqueues for that update.
+func renameModel(t *testing.T, r *Reconciler, model *v1alpha1.ExternalModel, modelName string) []reconcile.Request {
+	t.Helper()
+	old := getModel(t, r, model)
+	renamed := old.DeepCopy()
+	renamed.Spec.ModelName = modelName
+	if err := r.Update(context.Background(), renamed); err != nil {
+		t.Fatal(err)
+	}
+	q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+	defer q.ShutDown()
+	handler.EnqueueRequestsFromMapFunc(r.sameNameModels).Update(context.Background(), event.UpdateEvent{ObjectOld: old, ObjectNew: renamed}, q)
+	var requests []reconcile.Request
+	for q.Len() > 0 {
+		request, _ := q.Get()
+		requests = append(requests, request)
+		q.Done(request)
+	}
+	return requests
+}
+
+func attachmentRouteExists(t *testing.T, r *Reconciler, model *v1alpha1.ExternalModel) bool {
+	t.Helper()
+	_, err := getUnstructured(r, httpRouteGVK, model.Namespace, attachmentRouteName(model, gatewayB))
+	if err != nil && !apierrors.IsNotFound(err) {
+		t.Fatal(err)
+	}
+	return err == nil
+}
+
+func TestRenamedWinnerReleasesItsNameToTheWaitingModel(t *testing.T) {
+	providerOne, secretOne := attachmentProvider("team-one")
+	providerTwo, secretTwo := attachmentProvider("team-two")
+	winner := attachmentModel("a", "team-one", "foo", time.Unix(100, 0), gatewayB)
+	waiting := attachmentModel("b", "team-two", "foo", time.Unix(200, 0), gatewayB)
+	objects := []client.Object{providerOne, secretOne, providerTwo, secretTwo, winner, waiting}
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, winner)
+	reconcileModel(t, r, waiting)
+	if reason := readyReason(getModel(t, r, waiting)); reason != reasonModelNameConflict || attachmentRouteExists(t, r, waiting) {
+		t.Fatalf("waiting model reason = %q, route = %t; want %q without a route", reason, attachmentRouteExists(t, r, waiting), reasonModelNameConflict)
+	}
+
+	requests := renameModel(t, r, winner, "bar")
+	if !slices.Contains(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(waiting)}) {
+		t.Fatalf("renaming %s enqueued %v, want the model waiting on its previous name", winner.Name, requests)
+	}
+	reconcileModel(t, r, waiting)
+	if reason := readyReason(getModel(t, r, waiting)); reason != reasonAttachmentPending || !attachmentRouteExists(t, r, waiting) {
+		t.Fatalf("after the rename: reason = %q, route = %t; want %q with a route", reason, attachmentRouteExists(t, r, waiting), reasonAttachmentPending)
+	}
+}
+
+func TestSameNamespaceModelsShareAnAttachedName(t *testing.T) {
+	providerOne, secretOne := attachmentProvider("team-one")
+	providerTwo, secretTwo := attachmentProvider("team-two")
+	first := attachmentModel("first", "team-one", "foo", time.Unix(100, 0), gatewayB)
+	other := attachmentModel("other", "team-two", "foo", time.Unix(200, 0), gatewayB)
+	sibling := attachmentModel("sibling", "team-one", "foo", time.Unix(300, 0), gatewayB)
+	objects := []client.Object{providerOne, secretOne, providerTwo, secretTwo, first, other, sibling}
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	for _, model := range []*v1alpha1.ExternalModel{first, other, sibling} {
+		reconcileModel(t, r, model)
+	}
+	want := func(model *v1alpha1.ExternalModel, reason string, route bool) {
+		t.Helper()
+		if got := readyReason(getModel(t, r, model)); got != reason || attachmentRouteExists(t, r, model) != route {
+			t.Fatalf("%s/%s: reason = %q, route = %t; want %q, route = %t", model.Namespace, model.Name, got, attachmentRouteExists(t, r, model), reason, route)
+		}
+	}
+	// Conflicts apply across namespaces only: same-namespace models share the name.
+	want(first, reasonAttachmentPending, true)
+	want(sibling, reasonAttachmentPending, true)
+	want(other, reasonModelNameConflict, false)
+
+	// Once the oldest model releases the name, the other namespace holds it,
+	// so the same-namespace sibling must be re-decided too.
+	requests := renameModel(t, r, first, "bar")
+	for _, model := range []*v1alpha1.ExternalModel{other, sibling} {
+		if !slices.Contains(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}) {
+			t.Fatalf("renaming %s enqueued %v, want %s/%s", first.Name, requests, model.Namespace, model.Name)
+		}
+		reconcileModel(t, r, model)
+	}
+	want(other, reasonAttachmentPending, true)
+	want(sibling, reasonModelNameConflict, false)
 }
 
 func TestDeletingProviderExcludesAttachedModel(t *testing.T) {
