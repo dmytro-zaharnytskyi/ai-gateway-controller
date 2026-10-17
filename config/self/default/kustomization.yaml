@@ -6,6 +6,7 @@ namespace: opendatahub
 resources:
   - ../rbac
   - ../manager
+  - ../monitoring
 
 labels:
   - pairs:
