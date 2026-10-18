@@ -18,8 +18,8 @@ func TestScopedStableIDFormsAreDisjointFromExistingForm(t *testing.T) {
 	if !strings.HasPrefix(hashed, "sha256:") || len(hashed) != len("sha256:")+64 || len(hashed) > maxStableIDBytes {
 		t.Fatalf("over-limit stable_id = %q", hashed)
 	}
-	if strings.Count(existing, "/") != 1 || strings.Count(scoped, "/") != 3 || strings.Contains(hashed, "/") {
-		t.Fatalf("forms overlap: existing=%q scoped=%q hashed=%q", existing, scoped, hashed)
+	if IsScopedStableID(existing) || !IsScopedStableID(scoped) || !IsScopedStableID(hashed) {
+		t.Fatalf("form detection: existing=%t scoped=%t hashed=%t", IsScopedStableID(existing), IsScopedStableID(scoped), IsScopedStableID(hashed))
 	}
 	// Length prefixes keep field boundaries in the hash input.
 	if ScopedStableID("a", long+"b", "c", long) == ScopedStableID("a", long, "bc", long) {
@@ -41,6 +41,43 @@ func TestRenderUsesRouteStableIDOverride(t *testing.T) {
 	candidates := env.Overlay.Candidates
 	if len(candidates) != 2 || candidates[0].StableID != scoped.StableID || candidates[1].StableID != CandidateStableID("other", "openai") {
 		t.Fatalf("candidates = %#v, want the scoped override and the existing form", candidates)
+	}
+}
+
+func TestRenderUsesCredentialCopiesAndPreservedCandidates(t *testing.T) {
+	r := route("model", "openai", 1)
+	r.StableID = ScopedStableID("team", "model", "team", "openai")
+	r.SecretName, r.SecretNamespace = "agc-cred-0123456789ab", "tenant-b"
+	preserved := Candidate{Cluster: "provider-own", StableID: "own/provider-own", Kind: "inference_model", Name: "own", Site: "site-a", Fresh: true}
+	env, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "team/model", Routes: []resolver.Route{r}}), scope(), Revision{},
+		Options{PreservedCandidates: []Candidate{preserved}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates := env.Overlay.Candidates
+	if len(candidates) != 2 || candidates[0] != preserved {
+		t.Fatalf("candidates = %#v, want the preserved candidate first", candidates)
+	}
+	if candidates[1].Credential.SecretRef != (SecretRef{Name: r.SecretName, Namespace: "tenant-b", Key: "api-key"}) {
+		t.Fatalf("rendered credential = %#v, want the tenant-namespace copy", candidates[1].Credential)
+	}
+}
+
+func TestPreservedSelectionGroupsKeepTheirPolicy(t *testing.T) {
+	group := uint32(0)
+	preserved := []Candidate{
+		{Cluster: "provider-a", StableID: "own/provider-a", Kind: "inference_model", Name: "own", Site: "site-a", Fresh: true, SelectionGroup: &group},
+		{Cluster: "provider-b", StableID: "own/provider-b", Kind: "inference_model", Name: "own", Site: "site-a", Fresh: true, SelectionGroup: &group},
+	}
+	attached := route("model", "openai", 1)
+	attached.StableID = ScopedStableID("team", "model", "team", "openai")
+	env, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "team/model", Routes: []resolver.Route{attached}}), scope(), Revision{},
+		Options{PreservedCandidates: preserved})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(env.Overlay.SelectionPolicy) != `{"mode":"random"}` {
+		t.Fatalf("selection policy = %s, want the preserved groups' random policy", env.Overlay.SelectionPolicy)
 	}
 }
 

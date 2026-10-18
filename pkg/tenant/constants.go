@@ -189,6 +189,10 @@ const (
 	// (MaasTenantConfig) namespace.
 	LabelAttachmentTenant = "inference.opendatahub.io/attachment-tenant"
 
+	// LabelCredentialCopy marks controller-owned copies of credential Secrets
+	// from outside the tenant namespace. Copies live in the tenant namespace.
+	LabelCredentialCopy = "inference.opendatahub.io/credential-copy"
+
 	// maxKubernetesNameLength is the Kubernetes object name limit (RFC 1123
 	// label / DNS subdomain component). Rename returns an error rather than
 	// applying a name that would exceed it.
@@ -210,4 +214,5 @@ var (
 	gvkDestinationRule    = schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"}
 	gvkClusterRoleBinding = schema.GroupVersionKind{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding"}
 	gvkGateway            = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"}
+	gvkHTTPRoute          = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"}
 )

@@ -2,13 +2,83 @@ package tenant
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
 )
+
+func TestAttachedOverlayCandidatesSkipRemovedCredentialCopies(t *testing.T) {
+	credential := func(name string) *envelope.Credential {
+		return &envelope.Credential{Strategy: "bearer_token", SecretRef: envelope.SecretRef{Name: name, Namespace: "tenant-b", Key: "api-key"}}
+	}
+	candidates := []envelope.Candidate{
+		{Cluster: "provider-own", StableID: "own/provider-own", Name: "own", Credential: credential("own-key")},
+		{Cluster: "provider-openai", StableID: "team/chat/team/openai", Name: "chat", Credential: credential("agc-cred-present")},
+		{Cluster: "provider-openai", StableID: "gone/chat/gone/openai", Name: "gone", Credential: credential("agc-cred-removed")},
+	}
+	data, err := json.Marshal(envelope.Envelope{Overlay: envelope.Overlay{Candidates: candidates}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlay := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: praxisOverlayName, Namespace: "tenant-b", Labels: map[string]string{managedByLabel: ManagedByAIGatewayController}},
+		Data:       map[string]string{praxisOverlayDataKey: string(data)},
+	}
+	present := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "agc-cred-present", Namespace: "tenant-b"}}
+	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(overlay, present).Build()}
+	got, err := r.attachedOverlayCandidates(context.Background(), "tenant-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].StableID != "team/chat/team/openai" {
+		t.Fatalf("attached candidates = %#v, want only the attachment whose copy exists", got)
+	}
+}
+
+func TestCleanupRemovesTenantAttachmentState(t *testing.T) {
+	owned := map[string]string{LabelManagedBy: ManagedByAIGatewayController}
+	copied := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "agc-cred-0123456789ab", Namespace: "tenant-b",
+		Labels: map[string]string{LabelManagedBy: ManagedByAIGatewayController, LabelCredentialCopy: "true"}}}
+	unrelated := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-key", Namespace: "tenant-b", Labels: owned}}
+	rule := func(name, tenantNamespace string) *unstructured.Unstructured {
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(gvkDestinationRule)
+		u.SetName(name)
+		u.SetNamespace("gateway-b")
+		u.SetLabels(map[string]string{LabelManagedBy: ManagedByAIGatewayController, LabelAttachmentTenant: tenantNamespace})
+		return u
+	}
+	attachedRule, neighborRule := rule("provider-openai-0123456789ab", "tenant-b"), rule("provider-openai-ba9876543210", "tenant-c")
+	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(copied, unrelated, attachedRule, neighborRule).Build()
+	r := &Reconciler{Client: fakeClient}
+	if err := r.cleanup(context.Background(), "tenant-b", "gateway-b", "tenant-b"); err != nil {
+		t.Fatal(err)
+	}
+	var secret corev1.Secret
+	if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(copied), &secret); !apierrors.IsNotFound(err) {
+		t.Fatalf("credential copy survived tenant cleanup: %v", err)
+	}
+	if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(unrelated), &secret); err != nil {
+		t.Fatalf("cleanup removed a Secret that is not a credential copy: %v", err)
+	}
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(gvkDestinationRule)
+	if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(attachedRule), got); !apierrors.IsNotFound(err) {
+		t.Fatalf("attachment DestinationRule survived tenant cleanup: %v", err)
+	}
+	if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(neighborRule), got); err != nil {
+		t.Fatalf("cleanup removed another tenant's attachment DestinationRule: %v", err)
+	}
+}
 
 func TestTenantProvidersExcludeModelsBoundToOtherGateways(t *testing.T) {
 	ref := func(name string) []v1alpha1.ExternalProviderRef {
@@ -33,5 +103,28 @@ func TestTenantProvidersExcludeModelsBoundToOtherGateways(t *testing.T) {
 	}
 	if !required["local"] || !required["own"] || required["elsewhere"] || len(required) != 2 {
 		t.Fatalf("required providers = %v, want only models the tenant Gateway serves", required)
+	}
+}
+
+func TestExternalModelCleanupKeepsRouteFilterForAttachments(t *testing.T) {
+	filter := &unstructured.Unstructured{}
+	filter.SetGroupVersionKind(gvkEnvoyFilter)
+	filter.SetName(PayloadProcessingExternalModelEnvoyFilterName("tenant-b"))
+	filter.SetNamespace("gateway-b")
+	filter.SetLabels(map[string]string{LabelManagedBy: ManagedByAIGatewayController})
+	route := &unstructured.Unstructured{}
+	route.SetGroupVersionKind(gvkHTTPRoute)
+	route.SetName("external-model-chat-0123456789ab")
+	route.SetNamespace("team")
+	route.SetLabels(map[string]string{LabelManagedBy: ManagedByAIGatewayController, LabelAttachmentTenant: "tenant-b"})
+	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(filter, route).Build()
+	r := &Reconciler{Client: fakeClient}
+	if err := r.cleanupExternalModelResources(context.Background(), "tenant-b", "gateway-b", "tenant-b"); err != nil {
+		t.Fatal(err)
+	}
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(gvkEnvoyFilter)
+	if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(filter), got); err != nil {
+		t.Fatalf("route filter removed while an attachment route targets the tenant: %v", err)
 	}
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -379,8 +380,13 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	attached, err := r.attachedOverlayCandidates(ctx, tenantNamespace)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	serving := hasModels || len(attached) > 0
 	var runtimeCandidates []envelope.Candidate
-	if hasModels {
+	if serving {
 		_, requiredProviders, providerErr := r.providersForTenant(ctx, tenantNamespace, gatewayName, gatewayNamespace)
 		if providerErr != nil {
 			return ctrl.Result{}, providerErr
@@ -393,10 +399,13 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 			log.Info("routing overlay is not ready for ExternalModel ExtProc", "reason", reason, "namespace", tenantNamespace)
 			return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
 		}
-		runtimeCandidates, err = r.runtimeCandidates(ctx, tenantNamespace, gatewayName, gatewayNamespace)
-		if err != nil {
-			return ctrl.Result{}, err
+		if hasModels {
+			runtimeCandidates, err = r.runtimeCandidates(ctx, tenantNamespace, gatewayName, gatewayNamespace)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
 		}
+		runtimeCandidates = append(runtimeCandidates, attached...)
 	} else if err := r.cleanupExternalModelResources(ctx, tenantID, gatewayNamespace, tenantNamespace); err != nil {
 		return ctrl.Result{}, fmt.Errorf("clean up ExternalModel ExtProc resources: %w", err)
 	}
@@ -405,7 +414,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("split ExternalModel ExtProc resources: %w", err)
 	}
-	if hasModels {
+	if serving {
 		if err := configureExternalModelExtProc(resources, tenantNamespace, runtimeCandidates); err != nil {
 			return ctrl.Result{}, fmt.Errorf("configure ExternalModel ExtProc: %w", err)
 		}
@@ -546,7 +555,19 @@ func (r *Reconciler) cleanupExternalModelResources(ctx context.Context, tenantID
 		{gvkEnvoyFilter, PayloadProcessingExternalModelFilterNameForTenant(tenantID), gatewayNamespace},
 		{gvkEnvoyFilter, PayloadProcessingExternalModelEnvoyFilterName(tenantID), gatewayNamespace},
 	}
+	// The route filter also carries patches for attachments from other
+	// namespaces, which can be written before this tenant observes them in
+	// the published overlay. The ExternalModel reconciler owns that filter
+	// while any attachment route targets this tenant.
+	attachments := &unstructured.UnstructuredList{}
+	attachments.SetGroupVersionKind(gvkHTTPRoute.GroupVersion().WithKind("HTTPRouteList"))
+	if err := r.Client.List(ctx, attachments, client.MatchingLabels{LabelManagedBy: ManagedByAIGatewayController, LabelAttachmentTenant: tenantNamespace}); err != nil {
+		return fmt.Errorf("list attachment HTTPRoutes for %s: %w", tenantNamespace, err)
+	}
 	for _, target := range targets {
+		if len(attachments.Items) > 0 && target.gvk == gvkEnvoyFilter && target.name == PayloadProcessingExternalModelEnvoyFilterName(tenantID) {
+			continue
+		}
 		if err := r.deleteResourceIfOwned(ctx, target.gvk, target.name, target.namespace); err != nil {
 			return err
 		}
@@ -632,6 +653,49 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 		candidates = append(candidates, candidate)
 	}
 	return candidates, nil
+}
+
+// attachedOverlayCandidates returns the published overlay candidates that
+// ExternalModels from other namespaces contribute to this tenant. They carry
+// scoped stable IDs and reference credential copies in the tenant namespace.
+// A candidate whose copy no longer exists is skipped: its attachment was
+// removed and the entry is inert until the next overlay publish drops it,
+// so mounting the missing Secret would only block the ExtProc rollout.
+func (r *Reconciler) attachedOverlayCandidates(ctx context.Context, namespace string) ([]envelope.Candidate, error) {
+	var configMap corev1.ConfigMap
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: praxisOverlayName}, &configMap); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get routing overlay %s/%s: %w", namespace, praxisOverlayName, err)
+	}
+	if configMap.GetLabels()[managedByLabel] != render.FieldOwner {
+		return nil, nil
+	}
+	var env envelope.Envelope
+	if json.Unmarshal([]byte(configMap.Data[praxisOverlayDataKey]), &env) != nil {
+		// routingOverlayReady reports the invalid overlay as not ready.
+		return nil, nil //nolint:nilerr // readiness, not an error
+	}
+	var attached []envelope.Candidate
+	for _, candidate := range env.Overlay.Candidates {
+		if !envelope.IsScopedStableID(candidate.StableID) {
+			continue
+		}
+		if candidate.Credential != nil {
+			copySecret := &metav1.PartialObjectMetadata{}
+			copySecret.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
+			key := client.ObjectKey{Namespace: candidate.Credential.SecretRef.Namespace, Name: candidate.Credential.SecretRef.Name}
+			if err := r.Client.Get(ctx, key, copySecret); err != nil {
+				if apierrors.IsNotFound(err) {
+					continue
+				}
+				return nil, fmt.Errorf("get credential copy %s: %w", key, err)
+			}
+		}
+		attached = append(attached, candidate)
+	}
+	return attached, nil
 }
 
 func (r *Reconciler) routingOverlayReady(ctx context.Context, namespace string, requiredProviders map[string]bool) (bool, string, error) {
@@ -870,6 +934,36 @@ func (r *Reconciler) cleanup(ctx context.Context, tenantID, gatewayNamespace, te
 	for _, t := range targets {
 		if err := r.deleteResourceIfOwned(ctx, t.gvk, t.name, t.namespace); err != nil {
 			return err
+		}
+	}
+	return r.cleanupAttachmentState(ctx, tenantNamespace)
+}
+
+// cleanupAttachmentState removes what ExternalModels from other namespaces
+// contributed to this tenant: credential copies in the tenant namespace and
+// their Gateway-namespace DestinationRules. Their HTTPRoutes live in the model
+// namespaces and stay owned by the ExternalModel reconciler.
+func (r *Reconciler) cleanupAttachmentState(ctx context.Context, tenantNamespace string) error {
+	copies := &metav1.PartialObjectMetadataList{}
+	copies.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("SecretList"))
+	if err := r.Client.List(ctx, copies, client.InNamespace(tenantNamespace),
+		client.MatchingLabels{LabelManagedBy: ManagedByAIGatewayController, LabelCredentialCopy: "true"}); err != nil {
+		return fmt.Errorf("list credential copies in %s: %w", tenantNamespace, err)
+	}
+	for i := range copies.Items {
+		if err := client.IgnoreNotFound(r.Client.Delete(ctx, &copies.Items[i])); err != nil {
+			return fmt.Errorf("delete credential copy %s/%s: %w", tenantNamespace, copies.Items[i].GetName(), err)
+		}
+	}
+	rules := &unstructured.UnstructuredList{}
+	rules.SetGroupVersionKind(gvkDestinationRule.GroupVersion().WithKind("DestinationRuleList"))
+	if err := r.Client.List(ctx, rules,
+		client.MatchingLabels{LabelManagedBy: ManagedByAIGatewayController, LabelAttachmentTenant: tenantNamespace}); err != nil {
+		return fmt.Errorf("list attachment DestinationRules for %s: %w", tenantNamespace, err)
+	}
+	for i := range rules.Items {
+		if err := client.IgnoreNotFound(r.Client.Delete(ctx, &rules.Items[i])); err != nil {
+			return fmt.Errorf("delete attachment DestinationRule %s/%s: %w", rules.Items[i].GetNamespace(), rules.Items[i].GetName(), err)
 		}
 	}
 	return nil

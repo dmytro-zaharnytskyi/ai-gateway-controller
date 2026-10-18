@@ -1329,7 +1329,6 @@ func TestExternalModelDeletionRepublishesRemainingRoutes(t *testing.T) {
 		if err := r.Create(context.Background(), provider); err != nil {
 			t.Fatal(err)
 		}
-		markProviderReady(t, r, provider)
 		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name + "-credentials", Namespace: model.Namespace}, Data: map[string][]byte{"api-key": []byte("fixture-only-secret")}}
 		if err := r.Create(context.Background(), secret); err != nil {
 			t.Fatal(err)
@@ -1439,6 +1438,7 @@ func TestReconcileAppliesCandidateTransportBeforePublishingRandomSelection(t *te
 		ObjectMeta: metav1.ObjectMeta{Name: "provider-b", Namespace: model.Namespace, UID: "provider-b-uid"},
 		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "b.example.com",
 			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-b-credentials"}}},
+		Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
 	}
 	if err := r.Create(context.Background(), providerB); err != nil {
 		t.Fatal(err)
@@ -1538,13 +1538,6 @@ func TestReconcileAppliesCandidateTransportBeforePublishingRandomSelection(t *te
 		publishCalled = true
 		return pub.Publish(ctx, set, scope, options)
 	}
-	// The provider reconciler applies provider transport and only then marks
-	// the provider Ready, which model reconciliation requires.
-	for _, name := range []string{"provider", "provider-b"} {
-		if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKey{Namespace: model.Namespace, Name: name}}); err != nil {
-			t.Fatalf("ReconcileProvider %s: %v", name, err)
-		}
-	}
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -1567,11 +1560,11 @@ func TestReconcileRejectsUnequalWeightsBeforeTransportOrPublication(t *testing.T
 		ObjectMeta: metav1.ObjectMeta{Name: "provider-b", Namespace: model.Namespace, UID: "provider-b-uid"},
 		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "b.example.com",
 			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-b-credentials"}}},
+		Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
 	}
 	if err := r.Create(context.Background(), providerB); err != nil {
 		t.Fatal(err)
 	}
-	markProviderReady(t, r, providerB)
 	if err := r.Create(context.Background(), &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "provider-b-credentials", Namespace: model.Namespace},
 		Data:       map[string][]byte{"api-key": []byte("fixture-only-secret")},
@@ -1618,7 +1611,6 @@ func TestUnequalWeightModelDoesNotFailOrBlockHealthySiblingDeletion(t *testing.T
 	if err := r.Create(ctx, providerB); err != nil {
 		t.Fatal(err)
 	}
-	markProviderReady(t, r, providerB)
 	if err := r.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-b-credentials", Namespace: healthy.Namespace},
 		Data: map[string][]byte{"api-key": []byte("fixture-only-secret")}}); err != nil {
 		t.Fatal(err)
@@ -1702,7 +1694,6 @@ func TestCrossModelSelectionConflictsDoNotBlockUnrelatedModel(t *testing.T) {
 			if err := r.Create(ctx, providerB); err != nil {
 				t.Fatal(err)
 			}
-			markProviderReady(t, r, providerB)
 			if err := r.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-b-credentials", Namespace: healthy.Namespace},
 				Data: map[string][]byte{"api-key": []byte("fixture-only-secret")}}); err != nil {
 				t.Fatal(err)
@@ -2056,17 +2047,6 @@ func reconcilerFixture(t *testing.T) (*Reconciler, *v1alpha1.ExternalModel) {
 	r.Namespace, r.GatewayName, r.GatewayNamespace, r.Network = "tenant-a", "gateway", "tenant-a", "external-model"
 	r.KnownClusters = []string{"provider-provider"}
 	return r, model
-}
-
-// markProviderReady records the standalone provider reconciler's Ready status,
-// which model reconciliation requires. The fake client drops status on Create.
-func markProviderReady(t *testing.T, r *Reconciler, provider *v1alpha1.ExternalProvider) {
-	t.Helper()
-	provider.Status.Phase = resolver.PhaseReady
-	provider.Status.ObservedGeneration = provider.Generation
-	if err := r.Status().Update(context.Background(), provider); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func TestProviderReadinessIsReconciledIndependentlyFromModels(t *testing.T) {

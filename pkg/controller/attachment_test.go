@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"strings"
@@ -148,6 +150,21 @@ func overlayEnvelope(t *testing.T, r *Reconciler, namespace string) envelope.Env
 	return env
 }
 
+func routeFilterNames(t *testing.T, r *Reconciler, tenantID, gatewayNamespace string) []string {
+	t.Helper()
+	filter, err := getUnstructured(r, schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"},
+		gatewayNamespace, tenant.PayloadProcessingExternalModelEnvoyFilterName(tenantID))
+	if err != nil {
+		t.Fatalf("route EnvoyFilter: %v", err)
+	}
+	var names []string
+	patches := nestedSlice(t, filter.Object, "spec", "configPatches")
+	for i := range patches {
+		names = append(names, nestedString(t, nestedMapAt(t, patches, i), "match", "routeConfiguration", "vhost", "route", "name"))
+	}
+	return names
+}
+
 func TestUserNamespaceModelServedOnlyAfterRouteAcceptance(t *testing.T) {
 	provider, secret := attachmentProvider("team")
 	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
@@ -173,16 +190,16 @@ func TestUserNamespaceModelServedOnlyAfterRouteAcceptance(t *testing.T) {
 	if _, err := getUnstructured(r, schema.GroupVersionKind{Version: "v1", Kind: "Service"}, "team", "provider-openai"); err != nil {
 		t.Fatalf("model-namespace provider Service: %v", err)
 	}
+	ruleName := attachmentDestinationRuleName(gatewayB, "team", "openai")
+	copyName := credentialCopyName("tenant-b", "team", "openai-key", "api-key")
 	assertAttachmentUnpublished := func() {
 		t.Helper()
-		rules := &unstructured.UnstructuredList{}
-		rules.SetGroupVersionKind(destinationRuleGVK.GroupVersion().WithKind("DestinationRuleList"))
-		if err := r.List(context.Background(), rules, client.InNamespace("gateway-b")); err != nil || len(rules.Items) != 0 {
-			t.Fatalf("DestinationRule published into the tenant: %v %v", err, rules.Items)
+		if _, err := getUnstructured(r, destinationRuleGVK, "gateway-b", ruleName); !apierrors.IsNotFound(err) {
+			t.Fatalf("DestinationRule published before acceptance: %v", err)
 		}
-		var secrets corev1.SecretList
-		if err := r.List(context.Background(), &secrets, client.InNamespace("tenant-b")); err != nil || len(secrets.Items) != 0 {
-			t.Fatalf("credential copy published into the tenant: %v %v", err, secrets.Items)
+		var copied corev1.Secret
+		if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: copyName}, &copied); !apierrors.IsNotFound(err) {
+			t.Fatalf("credential copy published before acceptance: %v", err)
 		}
 		var overlay corev1.ConfigMap
 		if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
@@ -203,10 +220,57 @@ func TestUserNamespaceModelServedOnlyAfterRouteAcceptance(t *testing.T) {
 
 	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
 	reconcileModel(t, r, model)
-	// Publishing into the tenant follows; an accepted route alone serves nothing.
-	assertAttachmentUnpublished()
-	if got := getModel(t, r, model); got.Status.Phase == resolver.PhaseReady || readyReason(got) != reasonAttachmentPending {
-		t.Fatalf("accepted status = %q/%q, want %q", got.Status.Phase, readyReason(got), reasonAttachmentPending)
+	rule, err := getUnstructured(r, destinationRuleGVK, "gateway-b", ruleName)
+	if err != nil {
+		t.Fatalf("attachment DestinationRule: %v", err)
+	}
+	if len(ruleName) > 63 || rule.GetLabels()[tenant.LabelAttachmentTenant] != "tenant-b" || rule.GetLabels()[externalGatewayNameLabel] != "gw-b" {
+		t.Fatalf("attachment DestinationRule %q labels = %#v", ruleName, rule.GetLabels())
+	}
+	// The provider's own reconciler selects DestinationRules by the
+	// provider-namespace tenant label; the attachment rule must not carry it.
+	if _, ok := rule.GetLabels()[externalTenantLabel]; ok {
+		t.Fatalf("attachment DestinationRule carries %s: %#v", externalTenantLabel, rule.GetLabels())
+	}
+	var copied corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: copyName}, &copied); err != nil {
+		t.Fatalf("credential copy: %v", err)
+	}
+	if string(copied.Data["api-key"]) != "sk-team" || len(copied.Data) != 1 || copied.Labels[tenant.LabelCredentialCopy] != "true" {
+		t.Fatalf("credential copy = %#v", copied)
+	}
+	env := overlayEnvelope(t, r, "tenant-b")
+	if len(env.Overlay.Candidates) != 1 {
+		t.Fatalf("overlay candidates = %#v", env.Overlay.Candidates)
+	}
+	candidate := env.Overlay.Candidates[0]
+	if candidate.StableID != "team/chat/team/openai" || candidate.Name != "chat-model" || candidate.Cluster != "provider-openai" {
+		t.Fatalf("attached candidate = %#v", candidate)
+	}
+	if candidate.Credential == nil || candidate.Credential.SecretRef != (envelope.SecretRef{Name: copyName, Namespace: "tenant-b", Key: "api-key"}) {
+		t.Fatalf("attached candidate credential = %#v, want the tenant-namespace copy", candidate.Credential)
+	}
+	if env.Scope.Namespace != "tenant-b" || env.Scope.Gateway != "gw-b" {
+		t.Fatalf("overlay scope = %#v", env.Scope)
+	}
+	route, err = getUnstructured(r, httpRouteGVK, "team", routeName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headers := nestedSlice(t, nestedMapAt(t, nestedSlice(t, nestedMapAt(t, nestedSlice(t, route.Object, "spec", "rules"), 0), "matches"), 0), "headers")
+	if nestedMapAt(t, headers, 0)["value"] != candidate.StableID {
+		t.Fatalf("route candidate header = %#v, want %q", headers, candidate.StableID)
+	}
+	names := routeFilterNames(t, r, "tenant-b", "gateway-b")
+	if len(names) != 4 || names[0] != "team."+routeName+".0" {
+		t.Fatalf("route filter patches = %v", names)
+	}
+	got := getModel(t, r, model)
+	if got.Status.Phase != resolver.PhaseReady || got.Status.HTTPRouteName != routeName {
+		t.Fatalf("served status = %#v", got.Status)
+	}
+	if len(got.Status.Gateways) != 0 {
+		t.Fatalf("status.gateways belongs to RHOAIENG-90802, got %#v", got.Status.Gateways)
 	}
 }
 
@@ -227,9 +291,10 @@ func TestSharedModelAttachesToTenantsInIsolation(t *testing.T) {
 		t.Fatalf("attachments share HTTPRoute name %q", routeB)
 	}
 	for _, tc := range []struct {
-		gateway v1alpha1.NamespacedObjectReference
-		route   string
-	}{{gatewayB, routeB}, {gatewayC, routeC}} {
+		tenantNamespace string
+		gateway         v1alpha1.NamespacedObjectReference
+		route           string
+	}{{"tenant-b", gatewayB, routeB}, {"tenant-c", gatewayC, routeC}} {
 		route, err := getUnstructured(r, httpRouteGVK, "team", tc.route)
 		if err != nil {
 			t.Fatal(err)
@@ -237,6 +302,19 @@ func TestSharedModelAttachesToTenantsInIsolation(t *testing.T) {
 		if parent := nestedMapAt(t, nestedSlice(t, route.Object, "spec", "parentRefs"), 0); parent["name"] != tc.gateway.Name || parent["namespace"] != tc.gateway.Namespace {
 			t.Fatalf("route %s parentRef = %#v", tc.route, parent)
 		}
+		env := overlayEnvelope(t, r, tc.tenantNamespace)
+		if len(env.Overlay.Candidates) != 1 || env.Overlay.Candidates[0].Credential.SecretRef.Namespace != tc.tenantNamespace {
+			t.Fatalf("%s overlay = %#v", tc.tenantNamespace, env.Overlay.Candidates)
+		}
+		for _, name := range routeFilterNames(t, r, tc.tenantNamespace, tc.gateway.Namespace) {
+			if !strings.HasPrefix(name, "team."+tc.route+".") {
+				t.Fatalf("%s route filter leaks route %q", tc.tenantNamespace, name)
+			}
+		}
+	}
+	got := getModel(t, r, model)
+	if got.Status.Phase != resolver.PhaseReady || got.Status.HTTPRouteName != "" {
+		t.Fatalf("multi-attachment status = %q httpRouteName=%q, want Ready and empty", got.Status.Phase, got.Status.HTTPRouteName)
 	}
 }
 
@@ -252,8 +330,8 @@ func TestUnsupportedAttachmentDoesNotBlockOtherAttachments(t *testing.T) {
 	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
 	reconcileModel(t, r, model)
 
-	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB)); err != nil {
-		t.Fatalf("the Praxis tenant attachment must get its route: %v", err)
+	if len(overlayEnvelope(t, r, "tenant-b").Overlay.Candidates) != 1 {
+		t.Fatal("the Praxis tenant attachment must be served")
 	}
 	for _, gateway := range []v1alpha1.NamespacedObjectReference{gatewayC, unmanaged} {
 		if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gateway)); !apierrors.IsNotFound(err) {
@@ -308,8 +386,13 @@ func TestModelNameConflictKeepsTenantModelThenOldest(t *testing.T) {
 	if msg := apiMeta.FindStatusCondition(getModel(t, r, conflicting).Status.Conditions, conditionReady).Message; !strings.Contains(msg, "tenant-b/own") {
 		t.Fatalf("conflict message %q does not name the winner", msg)
 	}
-	if _, err := getUnstructured(r, httpRouteGVK, "team-one", attachmentRouteName(older, gatewayB)); err != nil {
-		t.Fatalf("the oldest attached model lost its route: %v", err)
+	env := overlayEnvelope(t, r, "tenant-b")
+	var ids []string
+	for _, candidate := range env.Overlay.Candidates {
+		ids = append(ids, candidate.StableID)
+	}
+	if strings.Join(ids, ",") != "own/provider-openai,team-one/older/team-one/openai" {
+		t.Fatalf("overlay candidates = %v, want the tenant's own model first and only the oldest attached winner", ids)
 	}
 }
 
@@ -368,13 +451,26 @@ func TestRenamedWinnerReleasesItsNameToTheWaitingModel(t *testing.T) {
 	}
 }
 
+// namedProvider returns another provider and its credential in namespace.
+func namedProvider(namespace, name string) (*v1alpha1.ExternalProvider, *corev1.Secret) {
+	provider, secret := attachmentProvider(namespace)
+	provider.Name, provider.UID = name, types.UID("provider-"+namespace+"-"+name)
+	secret.Name = name + "-key"
+	provider.Spec.Auth.SecretRef.Name = secret.Name
+	return provider, secret
+}
+
 func TestSameNamespaceModelsShareAnAttachedName(t *testing.T) {
 	providerOne, secretOne := attachmentProvider("team-one")
+	providerAlt, secretAlt := namedProvider("team-one", "alt")
 	providerTwo, secretTwo := attachmentProvider("team-two")
 	first := attachmentModel("first", "team-one", "foo", time.Unix(100, 0), gatewayB)
 	other := attachmentModel("other", "team-two", "foo", time.Unix(200, 0), gatewayB)
+	// Same-namespace models sharing a name are one selection group, so the
+	// sibling uses another provider, as on the tenant-local path.
 	sibling := attachmentModel("sibling", "team-one", "foo", time.Unix(300, 0), gatewayB)
-	objects := []client.Object{providerOne, secretOne, providerTwo, secretTwo, first, other, sibling}
+	sibling.Spec.ExternalProviderRefs[0].Ref.Name = providerAlt.Name
+	objects := []client.Object{providerOne, secretOne, providerAlt, secretAlt, providerTwo, secretTwo, first, other, sibling}
 	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
 	r := attachmentReconciler(t, objects...)
 	for _, model := range []*v1alpha1.ExternalModel{first, other, sibling} {
@@ -402,6 +498,29 @@ func TestSameNamespaceModelsShareAnAttachedName(t *testing.T) {
 	}
 	want(other, reasonAttachmentPending, true)
 	want(sibling, reasonModelNameConflict, false)
+}
+
+func TestSameNamespaceAliasesRepeatingAProviderExcludeOnlyThemselves(t *testing.T) {
+	tenantProvider, tenantSecret := attachmentProvider("tenant-b")
+	ownModel := attachmentModel("own", "tenant-b", "own-model", time.Unix(300, 0))
+	provider, secret := attachmentProvider("team")
+	first := attachmentModel("first", "team", "foo", time.Unix(100, 0), gatewayB)
+	second := attachmentModel("second", "team", "foo", time.Unix(200, 0), gatewayB)
+	objects := []client.Object{tenantProvider, tenantSecret, ownModel, provider, secret, first, second}
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	for _, model := range []*v1alpha1.ExternalModel{first, second, ownModel} {
+		reconcileModel(t, r, model)
+	}
+	for _, model := range []*v1alpha1.ExternalModel{first, second} {
+		if got := getModel(t, r, model); readyReason(got) != reasonReconcileFailed || attachmentRouteExists(t, r, model) {
+			t.Fatalf("%s: reason = %q, route = %t; want %q without a route", model.Name, readyReason(got), attachmentRouteExists(t, r, model), reasonReconcileFailed)
+		}
+	}
+	// The rejected group never reaches the overlay or blocks the tenant's own model.
+	if env := overlayEnvelope(t, r, "tenant-b"); len(env.Overlay.Candidates) != 1 || env.Overlay.Candidates[0].Name != "own-model" {
+		t.Fatalf("overlay candidates = %#v, want only the tenant's own model", env.Overlay.Candidates)
+	}
 }
 
 func TestDeletingProviderExcludesAttachedModel(t *testing.T) {
@@ -542,6 +661,9 @@ func TestUnservedHomeAttachmentBlocksAggregateReady(t *testing.T) {
 	reconcileModel(t, r, model)
 	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
 	reconcileModel(t, r, model)
+	if len(overlayEnvelope(t, r, "tenant-b").Overlay.Candidates) != 1 {
+		t.Fatal("the Praxis attachment must still be served")
+	}
 	if got := getModel(t, r, model); got.Status.Phase == resolver.PhaseReady || readyReason(got) != reasonTenantNotPraxis {
 		t.Fatalf("status = %q/%q, want the unserved home attachment reported", got.Status.Phase, readyReason(got))
 	}
@@ -731,4 +853,353 @@ func TestRemovedGatewayRefRemovesOnlyItsAttachmentRoute(t *testing.T) {
 		t.Fatalf("after removing every gatewayRef: routes b=%v other=%v, want the model's last attachment gone",
 			routeExists(routeB), routeExists(otherC))
 	}
+}
+
+func TestAttachmentPreservesTenantOwnOverlayCandidates(t *testing.T) {
+	tenantProvider, tenantSecret := attachmentProvider("tenant-b")
+	ownModel := attachmentModel("own", "tenant-b", "own-model", time.Unix(300, 0))
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	objects := append([]client.Object{tenantProvider, tenantSecret, ownModel, provider, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, ownModel)
+	before := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates
+
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	after := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates
+	if len(after) != 2 || mustJSON(t, after[0]) != mustJSON(t, before[0]) {
+		t.Fatalf("own candidate changed: before %#v after %#v", before, after)
+	}
+	names := routeFilterNames(t, r, "tenant-b", "gateway-b")
+	if len(names) != 8 || names[0] != "tenant-b.external-model-own.0" || names[4] != "team."+attachmentRouteName(model, gatewayB)+".0" {
+		t.Fatalf("route filter patches = %v, want own patches then the attachment", names)
+	}
+
+	// The tenant's own reconcile keeps the admitted attachment.
+	reconcileModel(t, r, ownModel)
+	if again := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates; len(again) != 2 || again[1].StableID != "team/chat/team/openai" {
+		t.Fatalf("own reconcile dropped the attachment: %#v", again)
+	}
+}
+
+func TestSameNamedProvidersFromNamespacesStayDistinct(t *testing.T) {
+	providerOne, secretOne := attachmentProvider("team-one")
+	providerTwo, secretTwo := attachmentProvider("team-two")
+	modelOne := attachmentModel("chat", "team-one", "chat-one", time.Unix(100, 0), gatewayB)
+	modelTwo := attachmentModel("chat", "team-two", "chat-two", time.Unix(200, 0), gatewayB)
+	objects := append([]client.Object{providerOne, secretOne, providerTwo, secretTwo, modelOne, modelTwo}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	for _, model := range []*v1alpha1.ExternalModel{modelOne, modelTwo} {
+		reconcileModel(t, r, model)
+		setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	}
+	for _, model := range []*v1alpha1.ExternalModel{modelOne, modelTwo} {
+		reconcileModel(t, r, model)
+	}
+	ruleOne, ruleTwo := attachmentDestinationRuleName(gatewayB, "team-one", "openai"), attachmentDestinationRuleName(gatewayB, "team-two", "openai")
+	if ruleOne == ruleTwo {
+		t.Fatalf("DestinationRules collide: %s", ruleOne)
+	}
+	for _, name := range []string{ruleOne, ruleTwo} {
+		if _, err := getUnstructured(r, destinationRuleGVK, "gateway-b", name); err != nil {
+			t.Fatalf("DestinationRule %s: %v", name, err)
+		}
+	}
+	env := overlayEnvelope(t, r, "tenant-b")
+	if len(env.Overlay.Candidates) != 2 || env.Overlay.Candidates[0].StableID != "team-one/chat/team-one/openai" ||
+		env.Overlay.Candidates[1].StableID != "team-two/chat/team-two/openai" {
+		t.Fatalf("overlay candidates = %#v", env.Overlay.Candidates)
+	}
+	if env.Overlay.Candidates[0].Credential.SecretRef.Name == env.Overlay.Candidates[1].Credential.SecretRef.Name {
+		t.Fatal("credential copies of different sources collide")
+	}
+}
+
+func servedAttachmentFixture(t *testing.T) (*Reconciler, *v1alpha1.ExternalModel) {
+	t.Helper()
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	objects := append([]client.Object{provider, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	if len(overlayEnvelope(t, r, "tenant-b").Overlay.Candidates) != 1 {
+		t.Fatal("fixture attachment is not served")
+	}
+	return r, model
+}
+
+func assertAttachmentWithdrawn(t *testing.T, r *Reconciler) {
+	t.Helper()
+	if _, err := getUnstructured(r, destinationRuleGVK, "gateway-b", attachmentDestinationRuleName(gatewayB, "team", "openai")); !apierrors.IsNotFound(err) {
+		t.Fatalf("attachment DestinationRule remains: %v", err)
+	}
+	var copied corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key")}, &copied); !apierrors.IsNotFound(err) {
+		t.Fatalf("credential copy remains: %v", err)
+	}
+}
+
+func assertNoTenantOverlay(t *testing.T, r *Reconciler) {
+	t.Helper()
+	var overlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: "routing-overlay"}, &overlay); !apierrors.IsNotFound(err) {
+		t.Fatalf("overlay entry remains: %v", err)
+	}
+}
+
+func TestRevokedAcceptanceWithdrawsAttachment(t *testing.T) {
+	r, model := servedAttachmentFixture(t)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionFalse, "NotAllowedByListeners")
+	reconcileModel(t, r, model)
+	assertAttachmentWithdrawn(t, r)
+	assertNoTenantOverlay(t, r)
+	if got := getModel(t, r, model); readyReason(got) != "NotAllowedByListeners" {
+		t.Fatalf("reason = %q", readyReason(got))
+	}
+}
+
+func TestRemovedGatewayRefCollectsAttachmentState(t *testing.T) {
+	r, model := servedAttachmentFixture(t)
+	got := getModel(t, r, model)
+	got.Spec.GatewayRefs = nil
+	if err := r.Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+	if attachmentRouteExists(t, r, model) {
+		t.Fatal("detached model keeps its attachment route")
+	}
+	assertAttachmentWithdrawn(t, r)
+}
+
+func TestDeletedCredentialSourceWithdrawsAttachment(t *testing.T) {
+	r, model := servedAttachmentFixture(t)
+	_, secret := attachmentProvider("team")
+	if err := r.Delete(context.Background(), secret); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); readyReason(got) != reasonProviderNotReady {
+		t.Fatalf("reason = %q, want %q", readyReason(got), reasonProviderNotReady)
+	}
+	// The copy must not keep serving a credential its source no longer holds.
+	assertAttachmentWithdrawn(t, r)
+	assertNoTenantOverlay(t, r)
+	if attachmentRouteExists(t, r, model) {
+		t.Fatal("excluded model keeps its route")
+	}
+
+	_, secret = attachmentProvider("team")
+	if err := r.Create(context.Background(), secret); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	if len(overlayEnvelope(t, r, "tenant-b").Overlay.Candidates) != 1 {
+		t.Fatal("the attachment is not served again after its source Secret was restored")
+	}
+}
+
+// failingSecretReader fails Secret reads as an unavailable API server would.
+type failingSecretReader struct{ client.Reader }
+
+func (f failingSecretReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.Secret); ok {
+		return apierrors.NewServiceUnavailable("etcd is unavailable")
+	}
+	return f.Reader.Get(ctx, key, obj, opts...)
+}
+
+func TestTransientCredentialReadKeepsServedAttachment(t *testing.T) {
+	r, model := servedAttachmentFixture(t)
+	r.APIReader = failingSecretReader{Reader: r.APIReader}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err == nil {
+		t.Fatal("a failed Secret read must be retried")
+	}
+	if len(overlayEnvelope(t, r, "tenant-b").Overlay.Candidates) != 1 {
+		t.Fatal("a failed Secret read withdrew the served attachment")
+	}
+	var copied corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key")}, &copied); err != nil {
+		t.Fatalf("a failed Secret read deleted the credential copy: %v", err)
+	}
+	if got := getModel(t, r, model); readyReason(got) != reasonReconcileFailed {
+		t.Fatalf("reason = %q, want %q", readyReason(got), reasonReconcileFailed)
+	}
+}
+
+// publishOwnCandidates publishes count tenant-local candidates in the tenant
+// overlay, as the tenant-local path does.
+func publishOwnCandidates(t *testing.T, r *Reconciler, namespace string, gateway v1alpha1.NamespacedObjectReference, count int) {
+	t.Helper()
+	set := &resolver.ResolvedRouteSet{}
+	for i := range count {
+		model := fmt.Sprintf("own-%d", i)
+		set.Models = append(set.Models, resolver.ModelRoutes{ModelRef: namespace + "/" + model, Routes: []resolver.Route{{
+			Model: model, ClientName: model, Namespace: namespace, Provider: "local", Cluster: "provider-local", Weight: 1,
+		}}})
+	}
+	if _, err := r.publishTenantOverlay(context.Background(), namespace, gateway.Name, set, nil, nil, "tenant-source"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAttachmentOverOverlayCapacityReceivesNoTenantState(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	objects := append([]client.Object{provider, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	publishOwnCandidates(t, r, "tenant-b", gatewayB, maxOverlayCandidates)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+
+	if got := getModel(t, r, model); readyReason(got) != reasonOverlayCapacityExceeded {
+		t.Fatalf("reason = %q, want %q", readyReason(got), reasonOverlayCapacityExceeded)
+	}
+	assertAttachmentWithdrawn(t, r)
+	for _, candidate := range overlayEnvelope(t, r, "tenant-b").Overlay.Candidates {
+		if envelope.IsScopedStableID(candidate.StableID) {
+			t.Fatalf("over-capacity model entered the overlay: %#v", candidate)
+		}
+	}
+	// It keeps its accepted route, and so its place in admission order.
+	if !attachmentRouteExists(t, r, model) {
+		t.Fatal("over-capacity model lost its accepted route")
+	}
+}
+
+func TestAttachmentPushedOverCapacityIsWithdrawn(t *testing.T) {
+	r, model := servedAttachmentFixture(t)
+	publishOwnCandidates(t, r, "tenant-b", gatewayB, maxOverlayCandidates)
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); readyReason(got) != reasonOverlayCapacityExceeded {
+		t.Fatalf("reason = %q, want %q", readyReason(got), reasonOverlayCapacityExceeded)
+	}
+	assertAttachmentWithdrawn(t, r)
+}
+
+func TestProviderReconcileKeepsAttachmentDestinationRules(t *testing.T) {
+	gatewayA := v1alpha1.NamespacedObjectReference{Name: "gw-a", Namespace: "gateway-a"}
+	provider, secret := attachmentProvider("tenant-a")
+	model := attachmentModel("chat", "tenant-a", "chat-model", time.Unix(100, 0), gatewayA, gatewayB)
+	objects := []client.Object{provider, secret, model}
+	objects = append(objects, attachmentTenantObjects("tenant-a", "tenant-a", gatewayA, "praxis")...)
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	ruleName := attachmentDestinationRuleName(gatewayB, "tenant-a", "openai")
+	if _, err := getUnstructured(r, destinationRuleGVK, "gateway-b", ruleName); err != nil {
+		t.Fatalf("attachment DestinationRule: %v", err)
+	}
+	// The provider's own reconciler keeps only the rule for its tenant's
+	// Gateway; the attachment's rule on another tenant's Gateway is not its.
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := getUnstructured(r, destinationRuleGVK, "gateway-b", ruleName); err != nil {
+		t.Fatalf("provider reconcile removed the attachment DestinationRule: %v", err)
+	}
+}
+
+func TestTenantKeepsAttachmentsWhenItsOwnModelsServeNothing(t *testing.T) {
+	r, model := servedAttachmentFixture(t)
+	// The tenant's own model references a provider that does not exist, so
+	// the tenant itself serves nothing.
+	own := attachmentModel("own", "tenant-b", "own-model", time.Unix(300, 0))
+	if err := r.Create(context.Background(), own); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(own)}); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("own reconcile = %v, want %v", err, resolver.ErrNoRoutes)
+	}
+	assertServed := func(when string) {
+		t.Helper()
+		if env := overlayEnvelope(t, r, "tenant-b"); len(env.Overlay.Candidates) != 1 || env.Overlay.Candidates[0].StableID != "team/chat/team/openai" {
+			t.Fatalf("%s: overlay candidates = %#v, want the attachment", when, env.Overlay.Candidates)
+		}
+		if names := routeFilterNames(t, r, "tenant-b", "gateway-b"); len(names) != 4 || names[0] != "team."+attachmentRouteName(model, gatewayB)+".0" {
+			t.Fatalf("%s: route filter patches = %v", when, names)
+		}
+	}
+	assertServed("own model without routes")
+
+	if err := r.Delete(context.Background(), getModel(t, r, own)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(own)}); err != nil {
+		t.Fatalf("own deletion: %v", err)
+	}
+	assertServed("last own model deleted")
+}
+
+func TestAttachmentKeepsTenantSelectionPolicy(t *testing.T) {
+	tenantProvider, tenantSecret := attachmentProvider("tenant-b")
+	tenantAlt, tenantAltSecret := namedProvider("tenant-b", "alt")
+	// The tenant's own model spreads traffic over two equal-weight providers.
+	ownModel := attachmentModel("own", "tenant-b", "own-model", time.Unix(300, 0))
+	ownModel.Spec.ExternalProviderRefs = append(ownModel.Spec.ExternalProviderRefs, v1alpha1.ExternalProviderRef{
+		Ref: v1alpha1.ExternalProviderReference{Name: tenantAlt.Name}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+	})
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	objects := append([]client.Object{tenantProvider, tenantSecret, tenantAlt, tenantAltSecret, ownModel, provider, secret, model},
+		attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, ownModel)
+	before := overlayEnvelope(t, r, "tenant-b").Overlay
+	if mustJSON(t, before.SelectionPolicy) != `{"mode":"random"}` || len(before.Candidates) != 2 {
+		t.Fatalf("own overlay = %#v, want two grouped candidates with the random policy", before)
+	}
+
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	after := overlayEnvelope(t, r, "tenant-b").Overlay
+	if len(after.Candidates) != 3 || mustJSON(t, after.Candidates[:2]) != mustJSON(t, before.Candidates) || mustJSON(t, after.SelectionPolicy) != `{"mode":"random"}` {
+		t.Fatalf("attachment publish changed the tenant's selection: before %#v after %#v", before, after)
+	}
+}
+
+func TestSharedProviderStateStaysWhileAnAttachmentUsesIt(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	chat := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	other := attachmentModel("other", "team", "other-model", time.Unix(200, 0), gatewayB)
+	objects := append([]client.Object{provider, secret, chat, other}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	for _, model := range []*v1alpha1.ExternalModel{chat, other} {
+		reconcileModel(t, r, model)
+		setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	}
+	for _, model := range []*v1alpha1.ExternalModel{chat, other} {
+		reconcileModel(t, r, model)
+	}
+	detach := func(model *v1alpha1.ExternalModel) {
+		t.Helper()
+		got := getModel(t, r, model)
+		got.Spec.GatewayRefs = nil
+		if err := r.Update(context.Background(), got); err != nil {
+			t.Fatal(err)
+		}
+		reconcileModel(t, r, model)
+	}
+	// Both models use the same provider and credential: one DestinationRule
+	// and one copy, kept while either accepted route references them.
+	detach(chat)
+	if _, err := getUnstructured(r, destinationRuleGVK, "gateway-b", attachmentDestinationRuleName(gatewayB, "team", "openai")); err != nil {
+		t.Fatalf("shared DestinationRule removed while another attachment uses it: %v", err)
+	}
+	var copied corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key")}, &copied); err != nil {
+		t.Fatalf("shared credential copy removed while another attachment uses it: %v", err)
+	}
+	detach(other)
+	assertAttachmentWithdrawn(t, r)
 }

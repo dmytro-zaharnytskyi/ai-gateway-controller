@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"sort"
 	"strings"
 
@@ -200,7 +201,21 @@ func (r *Reconciler) secretModels(ctx context.Context, obj client.Object) []reco
 			providerNames[p.Name] = true
 		}
 	}
-	return r.modelsReferencingProviders(ctx, obj.GetNamespace(), providerNames)
+	requests := r.modelsReferencingProviders(ctx, obj.GetNamespace(), providerNames)
+	// Credential copies follow their source, including model auth overrides.
+	var models v1alpha1.ExternalModelList
+	if err := r.List(ctx, &models, client.InNamespace(obj.GetNamespace())); err != nil {
+		r.Log.Error(err, "list models for Secret event", "secret", obj.GetName())
+		return requests
+	}
+	for i := range models.Items {
+		if len(models.Items[i].Spec.GatewayRefs) > 0 && slices.ContainsFunc(models.Items[i].Spec.ExternalProviderRefs, func(ref v1alpha1.ExternalProviderRef) bool {
+			return ref.Auth != nil && ref.Auth.SecretRef.Name == obj.GetName()
+		}) {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&models.Items[i])})
+		}
+	}
+	return requests
 }
 
 func (r *Reconciler) serviceModels(ctx context.Context, obj client.Object) []reconcile.Request {
@@ -498,18 +513,26 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	} else if !valid {
 		return reconcile.Result{Requeue: true}, nil
 	}
+	home := attachmentTenant{namespace: req.Namespace, tenantID: tenant.ID(modelTenant.aitenant.GetName()),
+		gateway: v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace}}
 	if len(set.Routes()) == 0 {
-		if err := r.enableExternalModelRoutes(ctx, tenant.ID(modelTenant.aitenant.GetName()), req.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
+		// Attachments from other namespaces keep the tenant's overlay and
+		// route filter; without one the existing cleanup applies.
+		if served, err := r.keepTenantAttachments(ctx, home, string(model.UID)); err != nil {
 			return reconcile.Result{}, err
-		}
-		if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenant.ID(modelTenant.aitenant.GetName())); err != nil {
-			return reconcile.Result{}, err
-		}
-		if cleanupErr := r.cleanupModelTransport(ctx, req.Namespace, nil); cleanupErr != nil {
-			return reconcile.Result{}, cleanupErr
-		}
-		if cleanupErr := r.cleanupOverlay(ctx, req.Namespace); cleanupErr != nil {
-			return reconcile.Result{}, cleanupErr
+		} else if !served {
+			if err := r.enableExternalModelRoutes(ctx, tenant.ID(modelTenant.aitenant.GetName()), req.Namespace, gatewayName, gatewayNamespace, nil); err != nil {
+				return reconcile.Result{}, err
+			}
+			if err := r.deleteLegacyExternalModelRouteFilter(ctx, tenant.ID(modelTenant.aitenant.GetName())); err != nil {
+				return reconcile.Result{}, err
+			}
+			if cleanupErr := r.cleanupModelTransport(ctx, req.Namespace, nil); cleanupErr != nil {
+				return reconcile.Result{}, cleanupErr
+			}
+			if cleanupErr := r.cleanupOverlay(ctx, req.Namespace); cleanupErr != nil {
+				return reconcile.Result{}, cleanupErr
+			}
 		}
 		message := "no ExternalModel provider references resolved to a Ready provider"
 		if statusErr := report(false, reasonNoRoutes, message, nil); statusErr != nil {
@@ -517,7 +540,11 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		}
 		return reconcile.Result{}, resolver.ErrNoRoutes
 	}
-	if err := r.applyTransport(ctx, set.Routes(), req.Namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace, modelOwners); err != nil {
+	attached, err := r.admittedAttachments(ctx, home, len(set.Routes()))
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if err := r.applyTransport(ctx, set.Routes(), req.Namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace, modelOwners, attached); err != nil {
 		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
@@ -532,24 +559,19 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		}
 		return reconcile.Result{}, err
 	}
-	pub, err := publisher.New(r.Client, publisher.Config{Namespace: req.Namespace, Name: r.ConfigMap})
-	if err != nil {
-		return reconcile.Result{}, err
-	}
-	publish := r.PublishOverlay
-	if publish == nil {
-		publish = pub.Publish
-	}
-	result, err := publish(ctx, set, envelope.Scope{
-		Network: r.Network, Gateway: gatewayName, Namespace: req.Namespace, LocalSite: r.localSite(),
-	}, envelope.Options{
-		KnownClusters: r.KnownClusters, SourceUID: string(model.UID), ProducerVersion: r.ProducerVersion,
-	})
+	result, err := r.publishTenantOverlay(ctx, req.Namespace, gatewayName, set, attached, nil, string(model.UID))
 	if err != nil {
 		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, err
+	}
+	// Attachments the tenant's own candidates pushed over the overlay
+	// capacity lose their DestinationRules and credential copies.
+	if excluded := excludedRoutes(attached); len(excluded) > 0 {
+		if err := r.gcAttachmentState(ctx, req.Namespace, excluded); err != nil {
+			return reconcile.Result{}, err
+		}
 	}
 
 	message := fmt.Sprintf("distributed routing overlay digest %s generation %d", result.Envelope.Revision.Value, result.Envelope.Provenance.SourceGeneration)
@@ -793,12 +815,19 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if err != nil {
 		return err
 	}
+	home := attachmentTenant{namespace: deleted.Namespace, tenantID: tenantID,
+		gateway: v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace}}
 	set, err := resolver.Resolve(modelPtrs, providerPtrs)
 	if errors.Is(err, resolver.ErrNoRoutes) {
 		// A sibling still exists but is temporarily unroutable: retain the
 		// last-known-good transport and overlay and retry. Only final-model
 		// deletion is allowed to remove the shared serving state.
 		if len(modelPtrs) > 0 {
+			return err
+		}
+		// Attachments from other namespaces keep the tenant's overlay and
+		// route filter; only its own transport is removed.
+		if served, err := r.keepTenantAttachments(ctx, home, string(deleted.UID)); err != nil || served {
 			return err
 		}
 		if err := r.deleteExternalModelRouteFiltersForTenant(ctx, deleted.Namespace); err != nil {
@@ -821,6 +850,9 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if len(set.Routes()) == 0 && len(rejected) > 0 {
 		// No valid sibling can serve. Remove the deleted model's routes before
 		// releasing its finalizer; unsupported siblings remain unserved.
+		if served, err := r.keepTenantAttachments(ctx, home, string(deleted.UID)); err != nil || served {
+			return err
+		}
 		if err := r.deleteExternalModelRouteFiltersForTenant(ctx, deleted.Namespace); err != nil {
 			return err
 		}
@@ -837,7 +869,11 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if err := r.validateResolvedRouteSet(ctx, set); err != nil {
 		return fmt.Errorf("validate remaining ExternalModel routes after deletion: %w", err)
 	}
-	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, tenantID, gatewayName, gatewayNamespace, modelOwners); err != nil {
+	attached, err := r.admittedAttachments(ctx, home, len(set.Routes()))
+	if err != nil {
+		return err
+	}
+	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, tenantID, gatewayName, gatewayNamespace, modelOwners, attached); err != nil {
 		return fmt.Errorf("rebuild transport after ExternalModel deletion: %w", err)
 	}
 	if err := r.cleanupExternalModelRouteFilters(ctx, deleted.Namespace, tenantID, gatewayName, gatewayNamespace); err != nil {
@@ -849,20 +885,11 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if err := r.cleanupModelTransport(ctx, deleted.Namespace, set.Routes()); err != nil {
 		return err
 	}
-	pub, err := publisher.New(r.Client, publisher.Config{Namespace: deleted.Namespace, Name: r.ConfigMap})
-	if err != nil {
-		return err
-	}
-	publish := r.PublishOverlay
-	if publish == nil {
-		publish = pub.Publish
-	}
-	if _, err := publish(ctx, set, envelope.Scope{
-		Network: r.Network, Gateway: gatewayName, Namespace: deleted.Namespace, LocalSite: r.localSite(),
-	}, envelope.Options{
-		KnownClusters: r.KnownClusters, SourceUID: string(modelPtrs[0].UID), ProducerVersion: r.ProducerVersion,
-	}); err != nil {
+	if _, err := r.publishTenantOverlay(ctx, deleted.Namespace, gatewayName, set, attached, nil, string(modelPtrs[0].UID)); err != nil {
 		return fmt.Errorf("publish remaining overlay after ExternalModel deletion: %w", err)
+	}
+	if excluded := excludedRoutes(attached); len(excluded) > 0 {
+		return r.gcAttachmentState(ctx, deleted.Namespace, excluded)
 	}
 	return nil
 }
@@ -1324,7 +1351,7 @@ func (r *Reconciler) namespaceAllowed(namespace string) bool {
 }
 
 func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route, modelNamespace, tenantID, gatewayName,
-	gatewayNamespace string, modelOwners map[string]*v1alpha1.ExternalModel) error {
+	gatewayNamespace string, modelOwners map[string]*v1alpha1.ExternalModel, attached []attachedModel) error {
 	resources := make([]unstructured.Unstructured, 0, len(routes))
 	seen := map[string]bool{}
 	models := map[string][]resolver.Route{}
@@ -1366,7 +1393,7 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 			return err
 		}
 	}
-	if err := r.enableExternalModelRoutes(ctx, tenantID, modelNamespace, gatewayName, gatewayNamespace, routes); err != nil {
+	if err := r.writeExternalModelRoutes(ctx, tenantID, modelNamespace, gatewayName, gatewayNamespace, routes, nil, attached); err != nil {
 		return err
 	}
 	return nil
@@ -1377,8 +1404,16 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 // the base EnvoyFilter; keeping these objects separate prevents concurrent
 // tenant/model reconciles from overwriting configPatches.
 func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, modelNamespace, gatewayName, gatewayNamespace string, routes []resolver.Route) error {
+	return r.writeExternalModelRoutes(ctx, tenantID, modelNamespace, gatewayName, gatewayNamespace, routes, nil, nil)
+}
+
+// writeExternalModelRoutes enables the tenant's own routes, then its served
+// attachments' routes; preserved patches are kept verbatim ahead of both.
+func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, modelNamespace, gatewayName, gatewayNamespace string, routes []resolver.Route,
+	preserved []any, attached []attachedModel) error {
 	name := tenant.PayloadProcessingExternalModelEnvoyFilterName(tenantID)
-	if len(routes) == 0 {
+	attached = servedAttachments(attached)
+	if len(routes) == 0 && len(preserved) == 0 && len(attached) == 0 {
 		return r.deleteExternalModelRouteFilters(ctx, name, modelNamespace)
 	}
 	filter := &unstructured.Unstructured{Object: map[string]any{
@@ -1404,7 +1439,7 @@ func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, mo
 			},
 		},
 	}}
-	kept := make([]any, 0, len(routes)*2+2)
+	kept := append(make([]any, 0, len(preserved)+len(routes)*2+2), preserved...)
 
 	byModel := map[string]int{}
 	for _, route := range routes {
@@ -1415,18 +1450,29 @@ func (r *Reconciler) enableExternalModelRoutes(ctx context.Context, tenantID, mo
 		models = append(models, model)
 	}
 	sort.Strings(models)
+	// Istio names Gateway routes <route namespace>.<route name>.<rule index>.
+	type routeRules struct {
+		namespace, name string
+		count           int
+	}
+	enabled := make([]routeRules, 0, len(models)+len(attached))
 	for _, model := range models {
 		// modelHTTPRouteSet emits two provider rules per route plus the
 		// canonical and header-only fail-closed sink rules.
-		count := byModel[model]*2 + 2
-		for index := 0; index < count; index++ {
+		enabled = append(enabled, routeRules{modelNamespace, modelRouteName(model), byModel[model]*2 + 2})
+	}
+	for _, a := range attached {
+		enabled = append(enabled, routeRules{a.model.Namespace, a.routeName, len(a.routes)*2 + 2})
+	}
+	for _, route := range enabled {
+		for index := 0; index < route.count; index++ {
 			kept = append(kept, map[string]any{
 				"applyTo": "HTTP_ROUTE",
 				"match": map[string]any{
 					"context": "GATEWAY",
 					"routeConfiguration": map[string]any{"vhost": map[string]any{
 						"route": map[string]any{
-							"name": fmt.Sprintf("%s.%s.%d", modelNamespace, modelRouteName(model), index),
+							"name": fmt.Sprintf("%s.%s.%d", route.namespace, route.name, index),
 						},
 					}},
 				},

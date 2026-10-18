@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 
 	"github.com/gowebpki/jcs"
@@ -154,6 +155,10 @@ type Options struct {
 	ProducerVersion string
 	// RenderedAt is injected (RFC3339) to keep Render deterministic under test.
 	RenderedAt string
+	// PreservedCandidates are already-published candidates kept verbatim
+	// ahead of the rendered routes. A tenant's own candidates are preserved
+	// this way when only contributions from other namespaces change.
+	PreservedCandidates []Candidate
 }
 
 // Render validates the resolved route set and emits the envelope with its
@@ -180,8 +185,13 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 	if err != nil {
 		return Envelope{}, err
 	}
+	// Preserved candidates keep their selection groups, and so the policy
+	// those groups need.
+	if selection.policy == nil && slices.ContainsFunc(opts.PreservedCandidates, func(c Candidate) bool { return c.SelectionGroup != nil }) {
+		selection.policy = randomSelectionPolicy
+	}
 
-	candidates := make([]Candidate, 0)
+	candidates := append(make([]Candidate, 0, len(opts.PreservedCandidates)), opts.PreservedCandidates...)
 	for _, m := range routes.Models {
 		if err := ValidateModel(m, opts); err != nil {
 			return Envelope{}, err
@@ -214,7 +224,7 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 					Strategy: strategy,
 					SecretRef: SecretRef{
 						Name:      r.SecretName,
-						Namespace: r.Namespace,
+						Namespace: routeSecretNamespace(r),
 						Key:       r.SecretKey,
 					},
 				}
@@ -322,7 +332,7 @@ func deriveSelectionMetadata(routes *resolver.ResolvedRouteSet) (selectionMetada
 	}
 	for _, capability := range capabilities {
 		if capability.count > 1 {
-			metadata.policy = json.RawMessage(`{"mode":"random"}`)
+			metadata.policy = randomSelectionPolicy
 			break
 		}
 	}
@@ -384,6 +394,9 @@ func CandidateStableID(model, provider string) string {
 	return model + "/provider-" + provider
 }
 
+// randomSelectionPolicy is the Praxis picker policy for selection groups.
+var randomSelectionPolicy = json.RawMessage(`{"mode":"random"}`)
+
 // maxStableIDBytes is the Praxis stable_id length limit.
 const maxStableIDBytes = 256
 
@@ -414,6 +427,20 @@ func RouteStableID(route resolver.Route) string {
 		return route.StableID
 	}
 	return CandidateStableID(route.Model, route.Provider)
+}
+
+// IsScopedStableID reports whether id is a ScopedStableID (three slashes or
+// the hash form) rather than the existing tenant-local form.
+func IsScopedStableID(id string) bool {
+	return strings.Count(id, "/") != 1
+}
+
+// routeSecretNamespace returns the namespace of the route's credential Secret.
+func routeSecretNamespace(route resolver.Route) string {
+	if route.SecretNamespace != "" {
+		return route.SecretNamespace
+	}
+	return route.Namespace
 }
 
 // ValidateModel applies Render's per-model checks: provider selection (equal
