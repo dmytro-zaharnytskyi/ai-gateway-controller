@@ -55,6 +55,18 @@ rules:
 - apiGroups: [""]
   resources: ["secrets"]
   verbs: ["get", "list", "watch"]
+# Controller-owned credential copies (agc-cred-<hash12>) in tenant namespaces.
+# The tenant ExtProc can mount Secrets only from its own namespace, so a
+# credential Secret from elsewhere is copied there: server-side apply needs
+# create and patch, and unreferenced copies are deleted. Trust boundary: the
+# ClusterRoleBinding grants these verbs on every Secret in every namespace.
+# RBAC cannot scope verbs by label, and hashed names rule out resourceNames,
+# so the agc-cred- name and ownership labels are controller safeguards, not
+# RBAC restrictions: the controller itself must only patch or delete Secrets
+# carrying its ownership labels.
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create", "patch", "delete"]
 - apiGroups: ["maas.opendatahub.io"]
   resources: ["externalmodels"]
   verbs: ["get", "list", "watch"]
@@ -79,6 +91,14 @@ rules:
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["httproutes"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# A cross-namespace ExternalProvider reference must be authorized by a
+# ReferenceGrant in the provider namespace. ExternalModel Gateway attachment
+# uses HTTPRoute parent status, so no Namespace read is granted.
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["referencegrants"]
+  verbs: ["get", "list", "watch"]
+# The tenant reconciler checks that an AITenant's status.gatewayRef names an
+# existing Gateway before applying praxis-extproc.
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["gateways"]
   verbs: ["get", "list", "watch"]

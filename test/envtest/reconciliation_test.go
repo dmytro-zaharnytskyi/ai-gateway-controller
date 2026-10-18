@@ -15,6 +15,10 @@ func TestControlPlane(t *testing.T) {
 		testGuardrailTimeoutAdmission(t, c)
 	})
 
+	t.Run("shipped permissions cover credential copies and reference grants", func(t *testing.T) {
+		testShippedPermissions(t, c)
+	})
+
 	t.Run("adding and deleting an external model manages its routing", func(t *testing.T) {
 		// Given an existing Praxis tenant with a configured provider.
 		const namespace = "model-publication"
