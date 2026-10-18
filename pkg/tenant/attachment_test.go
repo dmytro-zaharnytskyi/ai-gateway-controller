@@ -57,7 +57,7 @@ func TestCleanupRemovesTenantAttachmentState(t *testing.T) {
 		u.SetLabels(map[string]string{LabelManagedBy: ManagedByAIGatewayController, LabelAttachmentTenant: tenantNamespace})
 		return u
 	}
-	attachedRule, neighborRule := rule("provider-openai-0123456789ab", "tenant-b"), rule("provider-openai-ba9876543210", "tenant-c")
+	attachedRule, neighborRule := rule("provider-openai-0123456789ab", "tenant-b"), rule("provider-openai-987654321098", "tenant-c")
 	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(copied, unrelated, attachedRule, neighborRule).Build()
 	r := &Reconciler{Client: fakeClient}
 	if err := r.cleanup(context.Background(), "tenant-b", "gateway-b", "tenant-b"); err != nil {
