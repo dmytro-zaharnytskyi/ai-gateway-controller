@@ -380,11 +380,13 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	attached, err := r.attachedOverlayCandidates(ctx, tenantNamespace)
+	attached, unreadableOverlay, err := r.attachedOverlayCandidates(ctx, tenantNamespace)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	serving := hasModels || len(attached) > 0
+	// An unreadable overlay may still carry attachments: keep the processor
+	// and let routingOverlayReady report it, as for the tenant's own models.
+	serving := hasModels || len(attached) > 0 || unreadableOverlay
 	var runtimeCandidates []envelope.Candidate
 	if serving {
 		_, requiredProviders, providerErr := r.providersForTenant(ctx, tenantNamespace, gatewayName, gatewayNamespace)
@@ -661,21 +663,22 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 // A candidate whose copy no longer exists is skipped: its attachment was
 // removed and the entry is inert until the next overlay publish drops it,
 // so mounting the missing Secret would only block the ExtProc rollout.
-func (r *Reconciler) attachedOverlayCandidates(ctx context.Context, namespace string) ([]envelope.Candidate, error) {
+// The bool reports a controller-owned overlay that cannot be parsed.
+func (r *Reconciler) attachedOverlayCandidates(ctx context.Context, namespace string) ([]envelope.Candidate, bool, error) {
 	var configMap corev1.ConfigMap
 	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: praxisOverlayName}, &configMap); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, nil
+			return nil, false, nil
 		}
-		return nil, fmt.Errorf("get routing overlay %s/%s: %w", namespace, praxisOverlayName, err)
+		return nil, false, fmt.Errorf("get routing overlay %s/%s: %w", namespace, praxisOverlayName, err)
 	}
 	if configMap.GetLabels()[managedByLabel] != render.FieldOwner {
-		return nil, nil
+		return nil, false, nil
 	}
 	var env envelope.Envelope
 	if json.Unmarshal([]byte(configMap.Data[praxisOverlayDataKey]), &env) != nil {
 		// routingOverlayReady reports the invalid overlay as not ready.
-		return nil, nil //nolint:nilerr // readiness, not an error
+		return nil, true, nil //nolint:nilerr // readiness, not an error
 	}
 	var attached []envelope.Candidate
 	for _, candidate := range env.Overlay.Candidates {
@@ -690,12 +693,12 @@ func (r *Reconciler) attachedOverlayCandidates(ctx context.Context, namespace st
 				if apierrors.IsNotFound(err) {
 					continue
 				}
-				return nil, fmt.Errorf("get credential copy %s: %w", key, err)
+				return nil, false, fmt.Errorf("get credential copy %s: %w", key, err)
 			}
 		}
 		attached = append(attached, candidate)
 	}
-	return attached, nil
+	return attached, false, nil
 }
 
 func (r *Reconciler) routingOverlayReady(ctx context.Context, namespace string, requiredProviders map[string]bool) (bool, string, error) {

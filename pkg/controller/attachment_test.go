@@ -1203,3 +1203,30 @@ func TestSharedProviderStateStaysWhileAnAttachmentUsesIt(t *testing.T) {
 	detach(other)
 	assertAttachmentWithdrawn(t, r)
 }
+
+func TestDeletedAttachedOnlyModelCollectsItsCredentialCopy(t *testing.T) {
+	r, model := servedAttachmentFixture(t)
+	got := getModel(t, r, model)
+	if len(got.Finalizers) != 0 {
+		t.Fatalf("a model with only extra attachments has finalizers %v", got.Finalizers)
+	}
+	if err := r.Delete(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	// Kubernetes garbage collects the attachment route after the model; while
+	// it remains, it still references the copy and DestinationRule.
+	reconcileModel(t, r, model)
+	if _, err := getUnstructured(r, destinationRuleGVK, "gateway-b", attachmentDestinationRuleName(gatewayB, "team", "openai")); err != nil {
+		t.Fatalf("DestinationRule collected while the route still references it: %v", err)
+	}
+	route, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), route); err != nil {
+		t.Fatal(err)
+	}
+	// The route deletion requeues the deleted model.
+	reconcileModel(t, r, model)
+	assertAttachmentWithdrawn(t, r)
+}

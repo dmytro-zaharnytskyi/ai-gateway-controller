@@ -3,7 +3,9 @@ package tenant
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -14,6 +16,7 @@ import (
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
 )
 
 func TestAttachedOverlayCandidatesSkipRemovedCredentialCopies(t *testing.T) {
@@ -35,9 +38,9 @@ func TestAttachedOverlayCandidatesSkipRemovedCredentialCopies(t *testing.T) {
 	}
 	present := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "agc-cred-present", Namespace: "tenant-b"}}
 	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(overlay, present).Build()}
-	got, err := r.attachedOverlayCandidates(context.Background(), "tenant-b")
-	if err != nil {
-		t.Fatal(err)
+	got, unreadable, err := r.attachedOverlayCandidates(context.Background(), "tenant-b")
+	if err != nil || unreadable {
+		t.Fatalf("attachedOverlayCandidates: unreadable=%t err=%v", unreadable, err)
 	}
 	if len(got) != 1 || got[0].StableID != "team/chat/team/openai" {
 		t.Fatalf("attached candidates = %#v, want only the attachment whose copy exists", got)
@@ -126,5 +129,42 @@ func TestExternalModelCleanupKeepsRouteFilterForAttachments(t *testing.T) {
 	got.SetGroupVersionKind(gvkEnvoyFilter)
 	if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(filter), got); err != nil {
 		t.Fatalf("route filter removed while an attachment route targets the tenant: %v", err)
+	}
+}
+
+func TestAttachmentOnlyTenantKeepsProcessorWhenOverlayIsUnreadable(t *testing.T) {
+	requireManifests(t)
+	mtc := withMTCFinalizer(withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusSteady))
+	aitenant := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "tenant-ns", "tenant-ns")
+	processorName := PayloadProcessingExternalModelDeploymentName(IdentifierFor(mtc))
+	processor := &unstructured.Unstructured{}
+	processor.SetGroupVersionKind(gvkDeployment)
+	processor.SetName(processorName)
+	processor.SetNamespace("tenant-ns")
+	processor.SetLabels(map[string]string{managedByLabel: render.FieldOwner})
+	// The tenant has no ExternalModels of its own: it serves only attachments,
+	// and its controller-owned overlay cannot be parsed.
+	overlay := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: praxisOverlayName, Namespace: "tenant-ns", Labels: map[string]string{managedByLabel: render.FieldOwner}},
+		Data:       map[string]string{praxisOverlayDataKey: "{not json"},
+	}
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).
+		WithObjects(mtc, aitenant, processor, overlay, newGateway("my-gateway", "tenant-ns")).WithInterceptorFuncs(rec.funcs()).Build()
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	res, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns"))
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != notReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want %v while the overlay is unreadable", res.RequeueAfter, notReadyRequeueInterval)
+	}
+	if _, _, deleted := rec.snapshot(); slices.Contains(deleted, processorName) {
+		t.Fatalf("processor %s deleted for an unreadable overlay; deleted = %v", processorName, deleted)
+	}
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(gvkDeployment)
+	if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(processor), got); err != nil {
+		t.Fatalf("processor: %v", err)
 	}
 }

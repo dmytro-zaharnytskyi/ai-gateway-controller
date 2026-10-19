@@ -361,9 +361,12 @@ compatibility one-pager; this records how it is implemented.
   collects the DestinationRules and copies no accepted route references; the
   tenant's overlay drops the entry on its next publish, and until then the entry
   is inert because no route reaches it. Deleting a model with extra attachments
-  removes its routes through owner references; its DestinationRules and copies
-  remain until the tenant's next attachment reconcile or teardown. Per-Gateway
-  status and the remaining deletion cleanup are
+  removes its routes through owner references, and their deletion collects the
+  DestinationRules and copies no accepted route references; the shared overlay
+  and route filter are not rebuilt, and the tenant ExtProc stops mounting a
+  removed copy. A tenant serving only attachments keeps its ExtProc while its
+  overlay is unreadable. Per-Gateway status and the remaining deletion cleanup
+  are
   [RHOAIENG-90802](https://redhat.atlassian.net/browse/RHOAIENG-90802). A
   single-namespace controller (`--external-model-namespace`) serves no
   attachments from other namespaces.

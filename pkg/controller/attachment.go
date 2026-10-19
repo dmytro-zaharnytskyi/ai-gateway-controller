@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"slices"
 	"sort"
@@ -1306,6 +1307,44 @@ func (r *Reconciler) gcAttachmentState(ctx context.Context, tenantNamespace stri
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, copied)); err != nil {
 			return fmt.Errorf("delete credential copy %s/%s: %w", tenantNamespace, copied.GetName(), err)
+		}
+	}
+	return nil
+}
+
+// collectDeletedAttachments deletes the credential copies and DestinationRules
+// of every tenant that no accepted attachment HTTPRoute references any more.
+// A model with only extra attachments has no finalizer; its routes are
+// garbage collected with it, so this runs once they are gone. The shared
+// tenant overlay and route filter are not rebuilt: their entries are inert
+// once no route reaches them, and the tenant's next publish drops them.
+func (r *Reconciler) collectDeletedAttachments(ctx context.Context) error {
+	if r.Namespace != "" {
+		// A single-namespace controller serves no attachments.
+		return nil
+	}
+	owned := client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller"}
+	tenants := map[string]bool{}
+	rules := &unstructured.UnstructuredList{}
+	rules.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRuleList"})
+	if err := r.List(ctx, rules, owned, client.HasLabels{tenant.LabelAttachmentTenant}); err != nil {
+		return fmt.Errorf("list attachment DestinationRules: %w", err)
+	}
+	for i := range rules.Items {
+		tenants[rules.Items[i].GetLabels()[tenant.LabelAttachmentTenant]] = true
+	}
+	copies := &metav1.PartialObjectMetadataList{}
+	copies.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("SecretList"))
+	if err := r.List(ctx, copies, owned, client.MatchingLabels{tenant.LabelCredentialCopy: "true"}); err != nil {
+		return fmt.Errorf("list credential copies: %w", err)
+	}
+	for i := range copies.Items {
+		tenants[copies.Items[i].GetNamespace()] = true
+	}
+	names := slices.Sorted(maps.Keys(tenants))
+	for _, namespace := range names {
+		if err := r.gcAttachmentState(ctx, namespace, nil); err != nil {
+			return err
 		}
 	}
 	return nil

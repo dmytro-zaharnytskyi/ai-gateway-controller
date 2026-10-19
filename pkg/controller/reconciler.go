@@ -429,7 +429,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	var model v1alpha1.ExternalModel
 	if err := r.Get(ctx, req.NamespacedName, &model); err != nil {
 		if apierrors.IsNotFound(err) {
-			return reconcile.Result{}, nil
+			// A deleted model's attachment routes are garbage collected with
+			// it, and each route deletion requeues it here.
+			return reconcile.Result{}, r.collectDeletedAttachments(ctx)
 		}
 		return reconcile.Result{}, err
 	}
