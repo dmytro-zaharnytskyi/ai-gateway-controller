@@ -28,10 +28,6 @@ import (
 	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
 )
 
-// ConditionAccepted is authoritative only when its ObservedGeneration matches
-// the AIGuardrail generation.
-const ConditionAccepted = "Accepted"
-
 var (
 	// ErrPolicyNotFound means the named policy does not exist in the target namespace.
 	ErrPolicyNotFound = errors.New("guardrail policy not found")

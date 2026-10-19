@@ -15,8 +15,14 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .status.conditions[?(@.type=="Ready")].status
-      name: Ready
+    - jsonPath: .spec.provider.nemo.ref.name
+      name: Provider
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      name: Accepted
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Accepted")].reason
+      name: Reason
       type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
@@ -147,8 +153,20 @@ spec:
             properties:
               bindingRevision:
                 description: |-
-                  BindingRevision changes when provider, Secret, configuration or
-                  permission dependencies change independently of the policy generation.
+                  BindingRevision is a content digest of the provider identity, endpoint,
+                  configuration and permission dependencies behind an accepted binding:
+                  the inputs that can change without changing this policy's
+                  metadata.generation. Equal revisions mean equal dependencies, so a
+                  consumer compares it for equality rather than ordering it. It is set
+                  only while Accepted is True and cleared whenever the policy is refused,
+                  so a consumer gating on it never matches a binding that is no longer
+                  accepted.
+
+                  It does not detect every change. The content of a ConfigMap behind a
+                  provider configuration name is not observable from these resources, so
+                  editing one can change effective safety while this digest stays
+                  constant. Version configuration resources immutably where that
+                  distinction matters.
                 type: string
               conditions:
                 description: |-
@@ -216,6 +234,21 @@ spec:
                   controller.
                 format: int64
                 type: integer
+              providerEndpoint:
+                description: |-
+                  ProviderEndpoint is the in-cluster base URL of the NeMo Guardrails
+                  server, read verbatim from NemoGuardrails.status.endpoint.
+
+                  It is published so a consumer compiles against the same endpoint this
+                  controller accepted, rather than re-deriving one from the provider's
+                  name. It is set only while Accepted is True and cleared whenever the
+                  policy is refused.
+
+                  A published endpoint means the server is addressable and
+                  authenticated, not that it is serving: TrustyAI writes this field
+                  whenever the server is auth-protected, including while its pods are
+                  still coming up.
+                type: string
             type: object
         required:
         - spec

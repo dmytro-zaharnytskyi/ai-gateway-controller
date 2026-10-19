@@ -38,16 +38,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/constants"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 )
-
-// notReadyRequeueInterval is used when a MaasTenantConfig has opted into
-// praxis but is not yet ready for it (see GatewayRef / gatewayExists), or when a
-// transition-in is blocked on the IPP migration marker. This is a "come
-// back shortly" wait, distinct from ResyncInterval's steady-state resync.
-const notReadyRequeueInterval = 10 * time.Second
 
 // Reconciler primarily watches MaasTenantConfig CRs (owned by
 // maas-controller) — mirroring maas-controller's own TenantReconciler — and,
@@ -330,17 +325,17 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	}
 	if !ready {
 		log.Info("MaasTenantConfig opted into praxis but owning AITenant is not DeployReady yet (missing/Failed/stale Ready stamp); will retry")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	gatewayName, gatewayNamespace, gwReady := GatewayRef(aitenant)
 	if !gwReady {
 		log.Info("owning AITenant status.gatewayRef is not populated; will retry")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 	if err := r.gatewayExists(ctx, gatewayNamespace, gatewayName); err != nil {
 		log.Info("owning AITenant gatewayRef Gateway object is not ready; will retry", "error", err)
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	// Handshake: claim cleanup-complete → steady. Absent means wait (existing
@@ -352,7 +347,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	}
 	if !ready {
 		log.Info("waiting for the legacy IPP cleanup to finish before applying praxis-extproc")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	rendered, err := render.Build(r.ManifestPath)
@@ -399,7 +394,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		}
 		if !ready {
 			log.Info("routing overlay is not ready for ExternalModel ExtProc", "reason", reason, "namespace", tenantNamespace)
-			return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+			return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 		}
 		if hasModels {
 			runtimeCandidates, err = r.runtimeCandidates(ctx, tenantNamespace, gatewayName, gatewayNamespace)
@@ -443,14 +438,14 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	}
 	if err := r.waitForForeignOwnership(ctx, resources); err != nil {
 		log.Info("praxis-extproc resources are still owned by another controller; waiting for handoff", "error", err)
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	// RHOAIENG-98846: do not ForceOwnership-overwrite a leftover IPP plugins
 	// ConfigMap unless the operator force-annotated the MaasTenantConfig.
 	if err := r.ensurePluginsConfigMapMigrationAllowed(ctx, mtc, gatewayNamespace, tenantID); err != nil {
 		log.Info("waiting for plugins ConfigMap migration gate before applying praxis-extproc", "error", err)
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	// Re-validate the owning AITenant live, immediately before writing cluster
@@ -465,7 +460,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, err
 	} else if !valid {
 		log.Info("owning AITenant changed (uid, ownership, readiness, generation, or gatewayRef) before praxis-extproc apply; will re-resolve")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	if err := render.Apply(ctx, r.Client, resources); err != nil {
@@ -792,12 +787,12 @@ func (r *Reconciler) reconcileNotPraxis(ctx context.Context, log logr.Logger, mt
 	}
 	if aitenant == nil {
 		log.Info("waiting for owning AITenant before praxis-extproc cleanup after switch-away")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 	_, gatewayNamespace, gwReady := GatewayRef(aitenant)
 	if !gwReady {
 		log.Info("waiting for status.gatewayRef before praxis-extproc cleanup after switch-away")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	if err := r.cleanup(ctx, tenantID, gatewayNamespace, mtc.GetNamespace()); err != nil {
@@ -840,13 +835,13 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, log logr.Logger, mtc *
 	}
 	if aitenant == nil {
 		log.Info("MaasTenantConfig deleting but owning AITenant is not resolvable yet; will retry cleanup")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	_, gatewayNamespace, gwReady := GatewayRef(aitenant)
 	if !gwReady {
 		log.Info("MaasTenantConfig deleting but status.gatewayRef is not populated; will retry cleanup")
-		return ctrl.Result{RequeueAfter: notReadyRequeueInterval}, nil
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
 	if err := r.cleanup(ctx, tenantID, gatewayNamespace, mtc.GetNamespace()); err != nil {

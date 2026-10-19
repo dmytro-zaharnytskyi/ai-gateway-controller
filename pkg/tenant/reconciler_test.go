@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/constants"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
@@ -435,8 +436,8 @@ func TestReconcileAddsFinalizerAndRequeuesWhenGatewayRefMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	patched, mtcPatches, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
@@ -504,8 +505,8 @@ func TestReconcileRequeuesShortlyWhenActiveButGatewayRefNotReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	patched, _, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
@@ -528,8 +529,8 @@ func TestReconcileRequeuesWhenGatewayObjectMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	patched, _, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
@@ -552,8 +553,8 @@ func TestReconcileRequeuesWhenAITenantStatusIsStale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	patched, _, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
@@ -576,8 +577,8 @@ func TestReconcileRequeuesWhenAITenantFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	patched, _, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
@@ -610,7 +611,6 @@ func TestAITenantStillValidForApply(t *testing.T) {
 		u.SetUID(types.UID(uid))
 		return u
 	}
-
 	cases := []struct {
 		name    string
 		objects []client.Object
@@ -632,6 +632,10 @@ func TestAITenantStillValidForApply(t *testing.T) {
 		{"gateway dropped (live gatewayRef unset)", []client.Object{mtc, withUID(newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "", "", "tenant-ns"), "uid-1")}, mtc, "uid-1", false},
 		{"ownership bind lost (live tenantNamespace differs)", []client.Object{mtc,
 			withUID(newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "tenant-ns", "other-ns"), "uid-1")}, mtc, "uid-1", false},
+		// Phase alone does not invalidate: "matching uid, terminating" above
+		// stays valid, because the phase only flips once maas observes the
+		// delete. Here every signal but deletionTimestamp still reports a
+		// healthy owner, which is the window a fresh install could slip through.
 		{"owner terminating (live deletionTimestamp set)", []client.Object{mtc, withDeletionTimestamp(ownerWithUID("uid-1"))}, mtc, "uid-1", false},
 	}
 	for _, c := range cases {
@@ -685,8 +689,8 @@ func TestReconcileRefusesWhenAITenantReplacedBeforeApply(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v (owning AITenant replaced mid-reconcile)", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v (owning AITenant replaced mid-reconcile)", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	patched, _, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
@@ -718,8 +722,8 @@ func TestReconcileUsesLiveReadNotStaleCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v (AITenant deleted; only the live read can see it)", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v (AITenant deleted; only the live read can see it)", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	patched, _, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
@@ -744,8 +748,8 @@ func TestReconcileRequeuesWhenAITenantDeleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v (owning AITenant deleted)", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want the short not-ready interval %v (owning AITenant deleted)", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	patched, _, deleted := rec.snapshot()
 	if len(patched) != 0 || len(deleted) != 0 {
@@ -773,8 +777,8 @@ func TestReconcileWaitsForBlockedMigrationMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	names, _, _ := rec.snapshot()
 	if len(names) != 0 {
@@ -1189,8 +1193,8 @@ func TestReconcileDeleteRequeuesWhenGatewayRefNeverPopulated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want %v (keep finalizer until gatewayRef is known or DeletionTimeout)", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want %v (keep finalizer until gatewayRef is known or DeletionTimeout)", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 
 	_, mtcPatches, deleted := rec.snapshot()
@@ -1222,8 +1226,8 @@ func TestReconcileSwitchAwayRequeuesWhenAITenantNotReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want %v", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	_, mtcPatches, deleted := rec.snapshot()
 	if mtcPatches != 0 || len(deleted) != 0 {

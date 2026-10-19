@@ -82,8 +82,12 @@ tidy: ##	go mod tidy
 
 .PHONY: manifests
 manifests: $(CONTROLLER_GEN) ##	generate CRDs and deepcopy implementations
-	$(CONTROLLER_GEN) object paths=./api/... \
-		crd paths=./api/... \
+	$(CONTROLLER_GEN) object paths=./api/...
+	# Routed by API group: this controller's own group ships in the self bundle
+	# it installs; the shared inference group is installed by maas-controller.
+	$(CONTROLLER_GEN) crd paths=./api/aigateway/... \
+		output:crd:artifacts:config=config/self/crd/bases
+	$(CONTROLLER_GEN) crd paths=./api/inference/... \
 		output:crd:artifacts:config=config/crd/bases
 
 .PHONY: vet

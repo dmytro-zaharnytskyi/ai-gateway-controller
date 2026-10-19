@@ -53,7 +53,13 @@ func startEnvironment(t *testing.T, setupControllers func(ctrl.Manager)) client.
 	environment := &envtest.Environment{
 		BinaryAssetsDirectory: assets,
 		UseExistingCluster:    ptr.To(false),
-		CRDDirectoryPaths:     []string{"testdata/crds", filepath.Join(repoRoot, "config/crd/bases")},
+		// Two bases dirs because generation is split by API group: the aigateway
+		// group ships in the self bundle, the inference group does not.
+		CRDDirectoryPaths: []string{
+			"testdata/crds",
+			filepath.Join(repoRoot, "config/self/crd/bases"),
+			filepath.Join(repoRoot, "config/crd/bases"),
+		},
 		ErrorIfCRDPathMissing: true,
 	}
 	apiServer := environment.ControlPlane.GetAPIServer().Configure()

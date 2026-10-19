@@ -36,6 +36,7 @@ import (
 	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
 	inferencev1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/controller"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/guardrail"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
 )
 
@@ -180,6 +181,19 @@ func main() {
 	}
 	if err := modelReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up ExternalModel and ExternalProvider reconcilers")
+		os.Exit(1)
+	}
+
+	guardrailReconciler := &guardrail.Reconciler{
+		Client:         mgr.GetClient(),
+		APIReader:      mgr.GetAPIReader(),
+		Scheme:         mgr.GetScheme(),
+		ResyncInterval: resyncInterval,
+		Log:            ctrl.Log.WithName("aiguardrail"),
+		Recorder:       mgr.GetEventRecorder("aiguardrail"),
+	}
+	if err := guardrailReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to set up AIGuardrail reconciler")
 		os.Exit(1)
 	}
 

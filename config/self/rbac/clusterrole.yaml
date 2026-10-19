@@ -85,8 +85,30 @@ rules:
 - apiGroups: ["inference.opendatahub.io"]
   resources: ["externalproviders/finalizers", "externalmodels/finalizers"]
   verbs: ["update"]
+# AIGuardrail is the guardrail reconciler's primary watch target. This
+# controller owns AIGuardrail.status (the accepted provider binding:
+# ResolvedRefs / ProviderReady / Accepted), hence the status subresource rule.
+# It never writes the spec, so no update/patch on the resource itself, and it
+# publishes status with a merge patch, so no update there either.
 - apiGroups: ["aigateway.opendatahub.io"]
   resources: ["aiguardrails"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["aigateway.opendatahub.io"]
+  resources: ["aiguardrails/status"]
+  verbs: ["get", "patch"]
+# Provider references: each AIGuardrail names a NemoGuardrails whose
+# spec.allowedConsumers decides whether this namespace may consume it.
+# TrustyAI's operator is the sole owner of NemoGuardrails and its status, so
+# get/list/watch only — this controller reads the authorization input and
+# never writes it.
+- apiGroups: ["trustyai.opendatahub.io"]
+  resources: ["nemoguardrails"]
+  verbs: ["get", "list", "watch"]
+# allowedConsumers Selector mode matches labels on the consuming namespace's
+# Namespace object (never labels on the AIGuardrail), so those labels are an
+# authorization input this controller must be able to read.
+- apiGroups: [""]
+  resources: ["namespaces"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["httproutes"]
@@ -121,6 +143,14 @@ rules:
 - apiGroups: ["coordination.k8s.io"]
   resources: ["leases"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Two groups, because the manager has two recorders. Leader election emits
+# through the deprecated core/v1 one (GetEventRecorderFor), while the
+# AIGuardrail reconciler uses GetEventRecorder, whose sink is events.k8s.io/v1.
+# Dropping either group silently 403s that half of the events.
 - apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+# create and patch only: the events broadcaster never issues an update.
+- apiGroups: ["events.k8s.io"]
   resources: ["events"]
   verbs: ["create", "patch"]
