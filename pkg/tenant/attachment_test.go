@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/constants"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
 )
@@ -156,8 +157,8 @@ func TestAttachmentOnlyTenantKeepsProcessorWhenOverlayIsUnreadable(t *testing.T)
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if res.RequeueAfter != notReadyRequeueInterval {
-		t.Fatalf("RequeueAfter = %v, want %v while the overlay is unreadable", res.RequeueAfter, notReadyRequeueInterval)
+	if res.RequeueAfter != constants.NotReadyRequeueInterval {
+		t.Fatalf("RequeueAfter = %v, want %v while the overlay is unreadable", res.RequeueAfter, constants.NotReadyRequeueInterval)
 	}
 	if _, _, deleted := rec.snapshot(); slices.Contains(deleted, processorName) {
 		t.Fatalf("processor %s deleted for an unreadable overlay; deleted = %v", processorName, deleted)
