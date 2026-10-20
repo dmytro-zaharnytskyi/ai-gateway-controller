@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"net/url"
 	"slices"
 	"sort"
@@ -18,11 +17,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
@@ -63,6 +64,10 @@ const (
 	attachmentRequeueInterval = 5 * time.Second
 
 	credentialCopyPrefix = "agc-cred-" //nolint:gosec // Secret name prefix, not a credential
+
+	// attachmentFinalizer holds a deleting model until its extra attachments'
+	// own objects are removed; the home attachment keeps externalModelFinalizer.
+	attachmentFinalizer = "inference.opendatahub.io/external-model-attachment-cleanup"
 
 	annotationAttachmentModel       = "inference.opendatahub.io/attachment-model"
 	annotationAttachmentGateway     = "inference.opendatahub.io/attachment-gateway"
@@ -324,6 +329,12 @@ func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1
 		}
 		targets = append(targets, target{ait: ait, tenantNamespace: tenantNamespace, result: result})
 	}
+	extra := home < 0 || len(targets) > 1
+	if extra {
+		if err := r.setAttachmentFinalizer(ctx, model, true); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
 
 	var result reconcile.Result
 	var errs []error
@@ -374,6 +385,10 @@ func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1
 	}
 	if err := r.removeDetachedRoutes(ctx, model); err != nil {
 		errs = append(errs, err)
+	} else if !extra {
+		if err := r.setAttachmentFinalizer(ctx, model, false); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
 	if home >= 0 && !homeReported {
@@ -414,10 +429,12 @@ func failedAttachment(result attachmentResult, err error) attachmentResult {
 	return result
 }
 
-// writeAttachedStatus aggregates the attachment results into one status:
-// Ready requires every attachment, otherwise the first failing attachment in
-// gatewayRefs order is reported.
+// writeAttachedStatus writes every attachment's result to status.gateways and
+// aggregates them in the same write: Ready requires every attachment,
+// otherwise the first failing attachment in gatewayRefs order is reported.
 func (r *Reconciler) writeAttachedStatus(ctx context.Context, model *v1alpha1.ExternalModel, results []attachmentResult) error {
+	old := model.DeepCopy()
+	model.Status.Gateways = gatewayStatuses(model, results)
 	for _, res := range results {
 		if res.ready {
 			continue
@@ -427,20 +444,48 @@ func (r *Reconciler) writeAttachedStatus(ctx context.Context, model *v1alpha1.Ex
 			phase = modelPhasePending
 		}
 		message := fmt.Sprintf("Gateway %s: %s", gatewayKey(res.gateway), res.message)
-		return r.setModelStatus(ctx, model, phase, false, res.reason, message, "")
-	}
-	for _, res := range results {
-		if res.env != nil {
-			// The home attachment keeps its existing overlay attestation.
-			return r.updateModelStatus(ctx, model, true, reasonReconciled, res.message, res.env)
-		}
+		applyModelStatus(model, phase, false, res.reason, message, "")
+		return r.patchModelStatus(ctx, old, model)
 	}
 	routeName := ""
 	if len(results) == 1 {
 		routeName = results[0].routeName
 	}
-	return r.setModelStatus(ctx, model, resolver.PhaseReady, true, reasonReconciled,
-		fmt.Sprintf("served through %d Gateway attachment(s)", len(results)), routeName)
+	message := fmt.Sprintf("served through %d Gateway attachment(s)", len(results))
+	for _, res := range results {
+		if res.env != nil {
+			// The home attachment keeps its existing overlay attestation.
+			model.Status.OverlayDigest = res.env.Revision.Value
+			model.Status.OverlayGeneration = res.env.Provenance.SourceGeneration
+			message = res.message
+		}
+	}
+	applyModelStatus(model, resolver.PhaseReady, true, reasonReconciled, message, routeName)
+	return r.patchModelStatus(ctx, old, model)
+}
+
+// gatewayStatuses returns one result per attachment in gatewayRefs order. Only
+// a Ready result names the attachment's HTTPRoute, so a failed or pending
+// attachment never implies a usable route.
+func gatewayStatuses(model *v1alpha1.ExternalModel, results []attachmentResult) []v1alpha1.ExternalModelGatewayStatus {
+	statuses := make([]v1alpha1.ExternalModelGatewayStatus, 0, len(results))
+	for _, res := range results {
+		status := v1alpha1.ExternalModelGatewayStatus{NamespacedObjectReference: res.gateway}
+		if i := slices.IndexFunc(model.Status.Gateways, func(g v1alpha1.ExternalModelGatewayStatus) bool {
+			return g.NamespacedObjectReference == res.gateway
+		}); i >= 0 {
+			// Keeps the transition time of an unchanged condition.
+			status.Conditions = slices.Clone(model.Status.Gateways[i].Conditions)
+		}
+		if res.ready {
+			status.HTTPRouteRef = &v1alpha1.NamespacedObjectReference{Name: res.routeName, Namespace: model.Namespace}
+		}
+		apiMeta.SetStatusCondition(&status.Conditions, metav1.Condition{
+			Type: conditionReady, Status: boolStatus(res.ready), Reason: res.reason, Message: res.message, ObservedGeneration: model.Generation,
+		})
+		statuses = append(statuses, status)
+	}
+	return statuses
 }
 
 // leaveHomeTenant republishes the model's own tenant without it when its
@@ -485,17 +530,28 @@ func (r *Reconciler) hasHomeRoute(ctx context.Context, model *v1alpha1.ExternalM
 	return route.GetLabels()["inference.opendatahub.io/external-model"] == model.Name, nil
 }
 
-// setModelStatus writes the model status with an explicit phase. The route
-// name is recorded only when ready, matching updateModelStatus.
+// setModelStatus writes the model status with an explicit phase.
 func (r *Reconciler) setModelStatus(ctx context.Context, m *v1alpha1.ExternalModel, phase string, ready bool, reason, message, routeName string) error {
 	old := m.DeepCopy()
+	applyModelStatus(m, phase, ready, reason, message, routeName)
+	return r.patchModelStatus(ctx, old, m)
+}
+
+// applyModelStatus sets the top-level model status. The route name is recorded
+// only when ready, matching updateModelStatus, and is always empty for several
+// attachments: it names a single attachment's route.
+func applyModelStatus(m *v1alpha1.ExternalModel, phase string, ready bool, reason, message, routeName string) {
 	m.Status.ObservedGeneration = m.Generation
 	m.Status.Phase = phase
-	if ready {
+	if ready || len(m.Spec.GatewayRefs) > 1 {
 		m.Status.HTTPRouteName = routeName
 	}
 	setCondition(&m.Status.Conditions, conditionOverlayDistributed, boolStatus(ready), reason, message)
 	setCondition(&m.Status.Conditions, conditionReady, boolStatus(ready), reason, message)
+}
+
+// patchModelStatus patches the model status changed since old.
+func (r *Reconciler) patchModelStatus(ctx context.Context, old, m *v1alpha1.ExternalModel) error {
 	if equality.Semantic.DeepEqual(old.Status, m.Status) {
 		return nil
 	}
@@ -593,7 +649,7 @@ func (r *Reconciler) reconcileAttachment(ctx context.Context, model *v1alpha1.Ex
 	case idx < 0 || !admitted[idx].ready:
 		result.pending, result.reason, result.message = true, reasonAttachmentPending, "the tenant has not admitted this attachment yet"
 	default:
-		result.ready, result.message = true, "attached and distributed to the tenant overlay"
+		result.ready, result.reason, result.message = true, reasonReconciled, "attached and distributed to the tenant overlay"
 	}
 	return result, nil
 }
@@ -1238,9 +1294,10 @@ func (r *Reconciler) listAttachmentRoutes(ctx context.Context, opts ...client.Li
 }
 
 // removeAttachmentRoute deletes the model's identity-verified HTTPRoute for
-// one Gateway, then the tenant's DestinationRules and credential copies no
-// remaining attachment references. The tenant's overlay drops the entry on
-// its next publish; until then the entry is inert because no route reaches it.
+// one Gateway, then the tenant's DestinationRules and credential copies and
+// the model namespace's transport no remaining attachment references. The
+// tenant's overlay drops the entry on its next publish; until then the entry
+// is inert because no route reaches it.
 func (r *Reconciler) removeAttachmentRoute(ctx context.Context, model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference) error {
 	route, err := r.getAttachmentRoute(ctx, model.Namespace, attachmentRouteName(model, gateway))
 	if err != nil || route == nil || !isAttachmentRoute(route, model, gateway) {
@@ -1250,7 +1307,72 @@ func (r *Reconciler) removeAttachmentRoute(ctx context.Context, model *v1alpha1.
 		return fmt.Errorf("delete attachment HTTPRoute %s/%s: %w", route.GetNamespace(), route.GetName(), err)
 	}
 	// The informer cache may still list the deleted route.
-	return r.gcAttachmentState(ctx, route.GetLabels()[tenant.LabelAttachmentTenant], map[types.NamespacedName]bool{client.ObjectKeyFromObject(route): true})
+	if err := r.gcAttachmentState(ctx, route.GetLabels()[tenant.LabelAttachmentTenant], map[types.NamespacedName]bool{client.ObjectKeyFromObject(route): true}); err != nil {
+		return err
+	}
+	return r.gcAttachmentTransport(ctx, model.Namespace)
+}
+
+// gcAttachmentTransport deletes the provider Services and ServiceEntries and
+// the selection sinks no HTTPRoute in the namespace uses any more. It collects
+// only namespaces no Praxis tenant serves, where only attachments create them;
+// in a Praxis tenant namespace the provider reconciler and the tenant-local
+// path own them. Routes are read live, so a route just deleted never counts.
+func (r *Reconciler) gcAttachmentTransport(ctx context.Context, namespace string) error {
+	mtc := tenant.NewMaasTenantConfig()
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: tenant.MaasTenantConfigInstanceName}, mtc); err == nil {
+		if tenant.UsesPraxis(mtc) {
+			return nil
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get MaasTenantConfig %s/%s: %w", namespace, tenant.MaasTenantConfigInstanceName, err)
+	}
+	routes := &unstructured.UnstructuredList{}
+	routes.SetGroupVersionKind(httpRouteGVK.GroupVersion().WithKind("HTTPRouteList"))
+	if err := r.APIReader.List(ctx, routes, client.InNamespace(namespace)); err != nil {
+		return fmt.Errorf("list HTTPRoutes in %s: %w", namespace, err)
+	}
+	used := routeBackends(routes.Items)
+	for _, gvk := range []schema.GroupVersionKind{{Version: "v1", Kind: "ServiceList"}, {Group: "networking.istio.io", Version: "v1", Kind: "ServiceEntryList"}} {
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(gvk)
+		if err := r.List(ctx, list, client.InNamespace(namespace), client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller"}); err != nil {
+			return fmt.Errorf("list attachment transport %s in %s: %w", gvk.Kind, namespace, err)
+		}
+		for i := range list.Items {
+			obj := &list.Items[i]
+			labels := obj.GetLabels()
+			if used[obj.GetName()] || (labels["inference.opendatahub.io/external-provider"] == "" && labels["inference.opendatahub.io/external-model"] == "") {
+				continue
+			}
+			if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
+				return fmt.Errorf("delete attachment transport %s %s/%s: %w", obj.GetKind(), namespace, obj.GetName(), err)
+			}
+		}
+	}
+	return nil
+}
+
+// routeBackends returns the backend names the routes not being deleted use.
+func routeBackends(routes []unstructured.Unstructured) map[string]bool {
+	used := map[string]bool{}
+	for i := range routes {
+		if !routes[i].GetDeletionTimestamp().IsZero() {
+			continue
+		}
+		rules, _, _ := unstructured.NestedSlice(routes[i].Object, "spec", "rules")
+		for _, rawRule := range rules {
+			rule, _ := rawRule.(map[string]any)
+			backends, _, _ := unstructured.NestedSlice(rule, "backendRefs")
+			for _, rawBackend := range backends {
+				if backend, ok := rawBackend.(map[string]any); ok {
+					name, _ := backend["name"].(string)
+					used[name] = true
+				}
+			}
+		}
+	}
+	return used
 }
 
 // gcAttachmentState deletes the tenant's attachment DestinationRules and
@@ -1312,46 +1434,8 @@ func (r *Reconciler) gcAttachmentState(ctx context.Context, tenantNamespace stri
 	return nil
 }
 
-// collectDeletedAttachments deletes the credential copies and DestinationRules
-// of every tenant that no accepted attachment HTTPRoute references any more.
-// A model with only extra attachments has no finalizer; its routes are
-// garbage collected with it, so this runs once they are gone. The shared
-// tenant overlay and route filter are not rebuilt: their entries are inert
-// once no route reaches them, and the tenant's next publish drops them.
-func (r *Reconciler) collectDeletedAttachments(ctx context.Context) error {
-	if r.Namespace != "" {
-		// A single-namespace controller serves no attachments.
-		return nil
-	}
-	owned := client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller"}
-	tenants := map[string]bool{}
-	rules := &unstructured.UnstructuredList{}
-	rules.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRuleList"})
-	if err := r.List(ctx, rules, owned, client.HasLabels{tenant.LabelAttachmentTenant}); err != nil {
-		return fmt.Errorf("list attachment DestinationRules: %w", err)
-	}
-	for i := range rules.Items {
-		tenants[rules.Items[i].GetLabels()[tenant.LabelAttachmentTenant]] = true
-	}
-	copies := &metav1.PartialObjectMetadataList{}
-	copies.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("SecretList"))
-	if err := r.List(ctx, copies, owned, client.MatchingLabels{tenant.LabelCredentialCopy: "true"}); err != nil {
-		return fmt.Errorf("list credential copies: %w", err)
-	}
-	for i := range copies.Items {
-		tenants[copies.Items[i].GetNamespace()] = true
-	}
-	names := slices.Sorted(maps.Keys(tenants))
-	for _, namespace := range names {
-		if err := r.gcAttachmentState(ctx, namespace, nil); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // removeDetachedRoutes deletes the model's attachment HTTPRoutes for Gateways
-// its gatewayRefs no longer name.
+// its gatewayRefs no longer name, or all of them once the model is deleting.
 func (r *Reconciler) removeDetachedRoutes(ctx context.Context, model *v1alpha1.ExternalModel) error {
 	routes, err := r.listAttachmentRoutes(ctx, client.InNamespace(model.Namespace))
 	if err != nil {
@@ -1360,7 +1444,8 @@ func (r *Reconciler) removeDetachedRoutes(ctx context.Context, model *v1alpha1.E
 	for i := range routes {
 		gatewayNamespace, gatewayName, ok := strings.Cut(routes[i].GetAnnotations()[annotationAttachmentGateway], "/")
 		gateway := v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace}
-		if !ok || routes[i].GetAnnotations()[annotationAttachmentModel] != model.Name || hasGatewayRef(model, gateway) {
+		if !ok || routes[i].GetAnnotations()[annotationAttachmentModel] != model.Name ||
+			(model.DeletionTimestamp.IsZero() && hasGatewayRef(model, gateway)) {
 			continue
 		}
 		if err := r.removeAttachmentRoute(ctx, model, gateway); err != nil {
@@ -1368,6 +1453,35 @@ func (r *Reconciler) removeDetachedRoutes(ctx context.Context, model *v1alpha1.E
 		}
 	}
 	return nil
+}
+
+// setAttachmentFinalizer adds or removes the attachment finalizer.
+func (r *Reconciler) setAttachmentFinalizer(ctx context.Context, model *v1alpha1.ExternalModel, attached bool) error {
+	base := model.DeepCopy()
+	var updated bool
+	if attached {
+		updated = controllerutil.AddFinalizer(model, attachmentFinalizer)
+	} else {
+		updated = controllerutil.RemoveFinalizer(model, attachmentFinalizer)
+	}
+	if !updated {
+		return nil
+	}
+	if err := r.Patch(ctx, model, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+		return fmt.Errorf("update ExternalModel attachment finalizer: %w", err)
+	}
+	return nil
+}
+
+// clearGatewayStatus removes the per-gateway results of a model without
+// gatewayRefs.
+func (r *Reconciler) clearGatewayStatus(ctx context.Context, model *v1alpha1.ExternalModel) error {
+	if len(model.Status.Gateways) == 0 {
+		return nil
+	}
+	old := model.DeepCopy()
+	model.Status.Gateways = nil
+	return r.patchModelStatus(ctx, old, model)
 }
 
 // attachedModelSinks returns the models whose selection sinks the

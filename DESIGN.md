@@ -305,8 +305,16 @@ compatibility one-pager; this records how it is implemented.
   `AmbiguousTenant`) and are gated per tenant by the handshake above: Praxis and
   `steady`, otherwise `TenantNotSteady` (existing state retained) or
   `TenantNotPraxis` (a cleanup request: the attachment's route is removed).
-  Status reports the first failing attachment in `gatewayRefs` order; per-Gateway
-  status is [RHOAIENG-90802](https://redhat.atlassian.net/browse/RHOAIENG-90802).
+- **Status** ([RHOAIENG-90802](https://redhat.atlassian.net/browse/RHOAIENG-90802)).
+  `status.gateways` holds one result per `gatewayRefs` entry: a `Ready`
+  condition at the model generation with the attachment's own reason (the
+  Gateway's reason for an unaccepted route, the winning model for
+  `ModelNameConflict`), and `httpRouteRef` only while it is Ready. The
+  top-level status is written in the same update: Ready requires every
+  attachment, otherwise it reports the first failing one in `gatewayRefs`
+  order. `httpRouteName` names a single attachment's route and is empty for
+  several. Removing a Gateway removes its result; removing every
+  `gatewayRefs` entry removes them all.
 - **Authorization.** The attachment's HTTPRoute is created in the model
   namespace first and the Gateway enforces its listener `allowedRoutes`.
   DestinationRules, credential copies and overlay entries are published only
@@ -327,7 +335,8 @@ compatibility one-pager; this records how it is implemented.
   Model-namespace provider Services keep `provider-<provider>`, since providers
   stay model-local until
   [RHOAIENG-90804](https://redhat.atlassian.net/browse/RHOAIENG-90804).
-  Tenant-local cleanup keeps the transport attachment routes use.
+  Tenant-local cleanup, and a provider's cleanup when its namespace selects
+  IPP, keep the transport attachment routes use.
 - **Publication.** Each tenant keeps one overlay and one route EnvoyFilter. The
   tenant-local path publishes its own candidates and routes, then the admitted
   attachments; an attachment republishes the attachments and preserves the
@@ -358,16 +367,18 @@ compatibility one-pager; this records how it is implemented.
   Secret permission from
   [RHOAIENG-90808](https://redhat.atlassian.net/browse/RHOAIENG-90808).
 - **Lifecycle.** Removing a Gateway from `gatewayRefs` removes its route and
-  collects the DestinationRules and copies no accepted route references; the
-  tenant's overlay drops the entry on its next publish, and until then the entry
-  is inert because no route reaches it. Deleting a model with extra attachments
-  removes its routes through owner references, and their deletion collects the
-  DestinationRules and copies no accepted route references; the shared overlay
-  and route filter are not rebuilt, and the tenant ExtProc stops mounting a
-  removed copy. A tenant serving only attachments keeps its ExtProc while its
-  overlay is unreadable. Per-Gateway status and the remaining deletion cleanup
-  are
-  [RHOAIENG-90802](https://redhat.atlassian.net/browse/RHOAIENG-90802). A
+  collects the DestinationRules and copies no accepted route references and, in
+  a namespace no Praxis tenant serves, the provider Services, ServiceEntries
+  and selection sinks no route uses; the tenant's overlay drops
+  the entry on its next publish, and until then the entry is inert because no
+  route reaches it. A model with extra attachments carries the
+  `inference.opendatahub.io/external-model-attachment-cleanup` finalizer:
+  deleting it removes those objects for every extra attachment without
+  waiting for any tenant, and the shared overlay and route filter are not
+  rebuilt; the tenant ExtProc stops mounting a removed copy. The home
+  attachment keeps its own finalizer and existing deletion, including its
+  conservative wait for a steady tenant while siblings remain. A tenant serving
+  only attachments keeps its ExtProc while its overlay is unreadable. A
   single-namespace controller (`--external-model-namespace`) serves no
   attachments from other namespaces.
 
@@ -456,9 +467,9 @@ Until cross-namespace authorization is implemented, the resolver skips a
 provider reference to another namespace and never substitutes a local provider.
 
 Schema installation alone does not enable serving these fields. Attachment
-reconciliation is implemented (see [Gateway attachments](#gateway-attachments));
-per-Gateway status, provider authorization and MaaS selection belong to the
-follow-up stories. Activation requires
+reconciliation and per-Gateway status are implemented (see
+[Gateway attachments](#gateway-attachments)); provider authorization and MaaS
+selection belong to the follow-up stories. Activation requires
 aligned packaged schemas and serving implementations, verified tenant
 cleanup/claim ownership (including shared models/providers), and the serving,
 status, MaaS and installed-package checks.

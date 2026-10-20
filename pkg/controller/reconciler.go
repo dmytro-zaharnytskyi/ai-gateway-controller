@@ -342,8 +342,14 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 	}
 	// An explicit IPP selection is a handoff command. Remove only resources
 	// owned by Praxis and release our finalizer; IPP remains the status owner.
+	// Attachments from this namespace still serve Praxis tenants through the
+	// provider Service and ServiceEntry; removing the attachment collects them.
 	if !live.missingConfig && !live.selected {
-		if err := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name); err != nil {
+		routes, err := r.listAttachmentRoutes(ctx, client.InNamespace(provider.Namespace))
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		if err := r.cleanupProviderTransportExcept(ctx, provider.Namespace, provider.Name, routeBackends(routes)); err != nil {
 			return reconcile.Result{}, err
 		}
 		if controllerutil.ContainsFinalizer(&provider, externalProviderFinalizer) {
@@ -428,18 +434,27 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	}
 	var model v1alpha1.ExternalModel
 	if err := r.Get(ctx, req.NamespacedName, &model); err != nil {
-		if apierrors.IsNotFound(err) {
-			// A deleted model's attachment routes are garbage collected with
-			// it, and each route deletion requeues it here.
-			return reconcile.Result{}, r.collectDeletedAttachments(ctx)
-		}
-		return reconcile.Result{}, err
+		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 	// Deletion must not depend on MaasTenantConfig or its AITenant still being
 	// present. Those objects can disappear first during a tenant teardown.
 	// The deletion path uses the ExternalModel namespace and controller-owned
 	// resource labels as its independent ownership proof.
 	if !model.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(&model, attachmentFinalizer) {
+			// Extra attachments remove only their own objects: they never
+			// wait for a tenant or rebuild its shared state.
+			if err := r.removeDetachedRoutes(ctx, &model); err != nil {
+				return reconcile.Result{}, err
+			}
+			if err := r.setAttachmentFinalizer(ctx, &model, false); err != nil {
+				return reconcile.Result{}, err
+			}
+			if !controllerutil.ContainsFinalizer(&model, externalModelFinalizer) {
+				// No home attachment to clean up.
+				return reconcile.Result{}, nil
+			}
+		}
 		if err := r.reconcileDeletingModel(ctx, &model); err != nil {
 			return reconcile.Result{}, err
 		}
@@ -448,8 +463,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if len(model.Spec.GatewayRefs) > 0 {
 		return r.reconcileAttachedModel(ctx, &model)
 	}
-	// With every gatewayRef removed, no attachment route remains.
+	// With every gatewayRef removed, no attachment route, attachment
+	// finalizer or per-gateway result remains.
 	if err := r.removeDetachedRoutes(ctx, &model); err != nil {
+		return reconcile.Result{}, err
+	}
+	if err := r.setAttachmentFinalizer(ctx, &model, false); err != nil {
+		return reconcile.Result{}, err
+	}
+	if err := r.clearGatewayStatus(ctx, &model); err != nil {
 		return reconcile.Result{}, err
 	}
 	return r.reconcileHomeModel(ctx, req, &model, func(ready bool, reason, message string, env *envelope.Envelope) error {
@@ -651,7 +673,7 @@ func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.Ext
 	// still publishes the contested ref. Pending with a current stamp is enough
 	// so ExternalModel publish does not wait on Active↔MTC Ready.
 	if !tenant.DeployReady(ait) {
-		if err := r.updateModelStatus(ctx, model, false, reasonTenantNotReady, "AITenant is not ready for ExternalModel publish (Failed or status not current for this generation)", nil); err != nil {
+		if err := report(false, reasonTenantNotReady, "AITenant is not ready for ExternalModel publish (Failed or status not current for this generation)", nil); err != nil {
 			return modelTenantContext{}, false, err
 		}
 		return modelTenantContext{}, false, nil
@@ -972,6 +994,12 @@ func (r *Reconciler) applyProviderTransport(ctx context.Context, provider *v1alp
 }
 
 func (r *Reconciler) cleanupProviderTransport(ctx context.Context, namespace, providerName string) error {
+	return r.cleanupProviderTransportExcept(ctx, namespace, providerName, nil)
+}
+
+// cleanupProviderTransportExcept keeps the provider Service and ServiceEntry
+// named in used.
+func (r *Reconciler) cleanupProviderTransportExcept(ctx context.Context, namespace, providerName string, used map[string]bool) error {
 	for _, resource := range []struct {
 		group, version, kind string
 	}{
@@ -987,6 +1015,9 @@ func (r *Reconciler) cleanupProviderTransport(ctx context.Context, namespace, pr
 			return fmt.Errorf("list provider %s %s resources for cleanup: %w", providerName, resource.kind, err)
 		}
 		for i := range list.Items {
+			if used[list.Items[i].GetName()] {
+				continue
+			}
 			if err := client.IgnoreNotFound(r.Delete(ctx, &list.Items[i])); err != nil {
 				return fmt.Errorf("delete provider %s %s %s/%s: %w", providerName, resource.kind, namespace, list.Items[i].GetName(), err)
 			}
