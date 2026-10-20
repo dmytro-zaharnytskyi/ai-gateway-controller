@@ -381,7 +381,8 @@ omitted or equal namespace stays local and needs no grant.
 
 - **Authorization.** Grants are re-evaluated on every reconcile and watched, so
   adding a grant recovers the model and removing or narrowing it withdraws the
-  reference; a revoked reference never keeps its last serving state. A missing
+  reference; a revoked reference that is being served never keeps the last
+  serving state, which is otherwise retained as before. A missing
   and an unpermitted provider report the same `RefNotPermitted` condition, so
   the reference does not disclose whether the provider exists; the model's
   permitted references keep serving. A same-named local provider never stands
@@ -396,13 +397,17 @@ omitted or equal namespace stays local and needs no grant.
   `inference.opendatahub.io/external-provider-namespace` instead of the local
   provider label, identity-annotated), which is also the overlay `cluster`;
   `stable_id` `<modelNamespace>/<model>/<providerNamespace>/<provider>`; Gateway
-  DestinationRule `provider-<provider>-<hash12>`. HTTPRoute rules are keyed by
+  DestinationRule `provider-<provider>-<hash12>`. A local provider whose name
+  produces a hashed name is refused, as is the reverse. HTTPRoute rules are keyed by
   provider namespace and name, so same-named providers from two namespaces
   both keep their rules and candidates.
 - **Credentials.** Inherited auth uses the provider's Secret in the provider
   namespace; a model override uses the Secret in the model namespace, with no
   fallback to a same-named provider-namespace Secret. Secrets outside the
   tenant namespace are delivered as credential copies, as for attachments.
+  The provider's transport lives in the model namespace, so a grant trusts it:
+  whoever can edit Services or HTTPRoutes there can redirect requests that
+  carry the provider namespace's credential.
 - **Tenant-local models.** A tenant's own model referencing another
   namespace's provider gets the attachment DestinationRule and copy, recorded
   on its HTTPRoute so collection keeps them; its overlay candidate is kept as

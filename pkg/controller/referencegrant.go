@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 )
 
@@ -137,6 +138,34 @@ func deniedReferences(set *resolver.ResolvedRouteSet) map[string]string {
 	return denied
 }
 
+// servesDeniedReference reports whether the tenant's published overlay still
+// serves a provider reference of the models that is not permitted any more.
+// Only then does a namespace that resolves no routes give up its last serving
+// state; a reference that was never served keeps the existing retention.
+func (r *Reconciler) servesDeniedReference(ctx context.Context, namespace string, models []*v1alpha1.ExternalModel, permitted []*v1alpha1.ExternalProvider) (bool, error) {
+	allowed := map[types.NamespacedName]bool{}
+	for _, p := range permitted {
+		allowed[client.ObjectKeyFromObject(p)] = true
+	}
+	denied := map[string]bool{}
+	for _, m := range models {
+		for _, ref := range m.Spec.ExternalProviderRefs {
+			key := types.NamespacedName{Namespace: ref.Ref.Namespace, Name: ref.Ref.Name}
+			if key.Namespace != "" && key.Namespace != namespace && !allowed[key] {
+				denied[envelope.ScopedStableID(namespace, m.Name, key.Namespace, key.Name)] = true
+			}
+		}
+	}
+	if len(denied) == 0 {
+		return false, nil
+	}
+	published, err := r.ownOverlayCandidates(ctx, namespace)
+	if err != nil {
+		return false, err
+	}
+	return slices.ContainsFunc(published, func(c envelope.Candidate) bool { return denied[c.StableID] }), nil
+}
+
 // referenceGrantModels enqueues the models that reference a provider in the
 // grant's namespace, so a granted reference recovers and a revoked one stops
 // serving.
@@ -162,14 +191,13 @@ func providerIdentity(route resolver.Route) string {
 	return route.ProviderNamespace + "/" + route.Provider
 }
 
-// verifyProviderTransport refuses to adopt an object at a hashed provider
-// transport name that was created for another provider.
+// verifyProviderTransport refuses to adopt an object created for another
+// identity: hashed transport (or an attachment DestinationRule) is never taken
+// over by a local provider whose name produces the same object name, nor
+// local transport by hashed transport.
 func (r *Reconciler) verifyProviderTransport(ctx context.Context, resources []unstructured.Unstructured) error {
 	for i := range resources {
 		identity := resources[i].GetAnnotations()[annotationAttachmentIdentity]
-		if identity == "" {
-			continue
-		}
 		existing := &unstructured.Unstructured{}
 		existing.SetGroupVersionKind(resources[i].GroupVersionKind())
 		if err := r.Get(ctx, client.ObjectKeyFromObject(&resources[i]), existing); err != nil {

@@ -309,3 +309,62 @@ func TestProviderGrantAndSecretEventsEnqueueReferencingModels(t *testing.T) {
 	// A same-named local provider does not affect the cross-namespace reference.
 	want("local provider", r.providerModels(ctx, localProvider), local)
 }
+
+func TestUnpermittedSiblingKeepsLastServingState(t *testing.T) {
+	provider, secret := attachmentProvider("tenant-b")
+	own := attachmentModel("own", "tenant-b", "own-model", time.Unix(100, 0))
+	// Never permitted, so never served: it must not cost the namespace its
+	// last serving state.
+	sibling := referenceProvider(attachmentModel("sibling", "tenant-b", "sibling-model", time.Unix(200, 0)), "shared")
+	objects := append([]client.Object{provider, secret, own, sibling}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, own)
+
+	// A provider spec edit leaves its readiness briefly stale.
+	got := &v1alpha1.ExternalProvider{}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), got); err != nil {
+		t.Fatal(err)
+	}
+	got.Status.ObservedGeneration = got.Generation + 1
+	if err := r.Status().Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(own)}); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("reconcile = %v, want %v", err, resolver.ErrNoRoutes)
+	}
+	if candidates := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates; len(candidates) != 1 || candidates[0].StableID != "own/provider-openai" {
+		t.Fatalf("overlay candidates = %#v, want the retained serving state", candidates)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-b", modelRouteName("own")); err != nil {
+		t.Fatalf("retained HTTPRoute: %v", err)
+	}
+}
+
+func TestLocalProviderCannotTakeOverHashedTransport(t *testing.T) {
+	sharedProvider, sharedSecret := attachmentProvider("shared")
+	_, localSecret := attachmentProvider("tenant-b")
+	model := referenceProvider(attachmentModel("chat", "tenant-b", "chat-model", time.Unix(100, 0)), "shared")
+	objects := append([]client.Object{sharedProvider, sharedSecret, localSecret, model, referenceGrant("shared", "tenant-b", "")},
+		attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	serviceName := foreignRoute("tenant-b", "shared").ServiceName()
+
+	// A local provider whose own Service name is the hashed name.
+	local, _ := namedProvider("tenant-b", strings.TrimPrefix(serviceName, "provider-"))
+	local.Spec.Endpoint = "attacker.example.com"
+	local.Spec.Auth.SecretRef.Name = "openai-key"
+	if err := r.Create(context.Background(), local); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(local)}); err == nil || !strings.Contains(err.Error(), "different identity") {
+		t.Fatalf("local provider reconcile = %v, want a refused takeover", err)
+	}
+	service, err := getUnstructured(r, serviceGVK, "tenant-b", serviceName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host, _, _ := unstructured.NestedString(service.Object, "spec", "externalName"); host != "api.openai.com" || service.GetAnnotations()[annotationAttachmentIdentity] != "shared/openai" {
+		t.Fatalf("hashed Service = %s %#v, want it unchanged", host, service.GetAnnotations())
+	}
+}

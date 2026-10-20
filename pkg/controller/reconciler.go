@@ -501,14 +501,24 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	}
 	set, err := resolver.Resolve(modelPtrs, append(providerPtrs, foreign...))
 	denied := deniedReferences(set)
-	// A reference that is no longer permitted must stop serving, so it never
-	// retains the last serving state.
-	if err != nil && (!errors.Is(err, resolver.ErrNoRoutes) || len(denied) == 0) {
-		reason := reasonReconcileFailed
+	if errors.Is(err, resolver.ErrNoRoutes) {
+		// A served reference that is no longer permitted must stop serving,
+		// so its last serving state is not retained.
+		if revoked, servesErr := r.servesDeniedReference(ctx, req.Namespace, modelPtrs, foreign); servesErr != nil {
+			return reconcile.Result{}, servesErr
+		} else if revoked {
+			err = nil
+		}
+	}
+	if err != nil {
+		reason, message := reasonReconcileFailed, err.Error()
 		if errors.Is(err, resolver.ErrNoRoutes) {
 			reason = reasonProviderNotReady
+			if denial := denied[req.String()]; denial != "" {
+				reason, message = reasonRefNotPermitted, denial
+			}
 		}
-		if statusErr := report(false, reason, err.Error(), nil); statusErr != nil {
+		if statusErr := report(false, reason, message, nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, err
@@ -844,9 +854,13 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if errors.Is(err, resolver.ErrNoRoutes) {
 		// A sibling still exists but is temporarily unroutable: retain the
 		// last-known-good transport and overlay and retry. Only final-model
-		// deletion, or a reference that is no longer permitted, removes the
-		// shared serving state.
-		if len(modelPtrs) > 0 && len(deniedReferences(set)) == 0 {
+		// deletion, or a served reference that is no longer permitted,
+		// removes the shared serving state.
+		revoked, servesErr := r.servesDeniedReference(ctx, deleted.Namespace, modelPtrs, foreign)
+		if servesErr != nil {
+			return servesErr
+		}
+		if len(modelPtrs) > 0 && !revoked {
 			return err
 		}
 		// Attachments from other namespaces keep the tenant's overlay and
@@ -976,6 +990,9 @@ func (r *Reconciler) applyProviderTransport(ctx context.Context, provider *v1alp
 		service,
 		serviceEntry,
 		providerDestinationRuleAtGateway(route, gatewayName, gatewayNamespace, tenantID),
+	}
+	if err := r.verifyProviderTransport(ctx, resources); err != nil {
+		return fmt.Errorf("apply provider %s: %w", provider.Name, err)
 	}
 	for _, resource := range resources {
 		if r.ApplyResource != nil {
