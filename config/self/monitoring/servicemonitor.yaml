@@ -21,4 +21,5 @@ spec:
           configMap:
             name: openshift-service-ca.crt
             key: service-ca.crt
+        # name.namespace.svc — filled by kustomize replacements in default/
         serverName: ai-gateway-controller-metrics.opendatahub.svc

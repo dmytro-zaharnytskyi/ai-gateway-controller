@@ -119,3 +119,35 @@ func TestApplyLogDevelopmentUnsetLeavesDefault(t *testing.T) {
 		t.Fatalf("stderr write on unset: %q", buf.String())
 	}
 }
+
+func TestBuildMetricsServerOptionsSecure(t *testing.T) {
+	opts := buildMetricsServerOptions(":8443", true)
+	if opts.BindAddress != ":8443" {
+		t.Fatalf("BindAddress = %q, want :8443", opts.BindAddress)
+	}
+	if !opts.SecureServing {
+		t.Fatal("SecureServing = false, want true")
+	}
+	if opts.CertDir != metricsCertDir {
+		t.Fatalf("CertDir = %q, want %q", opts.CertDir, metricsCertDir)
+	}
+	if opts.FilterProvider == nil {
+		t.Fatal("FilterProvider is nil, want non-nil")
+	}
+}
+
+func TestBuildMetricsServerOptionsInsecure(t *testing.T) {
+	opts := buildMetricsServerOptions(":8080", false)
+	if opts.BindAddress != ":8080" {
+		t.Fatalf("BindAddress = %q, want :8080", opts.BindAddress)
+	}
+	if opts.SecureServing {
+		t.Fatal("SecureServing = true, want false")
+	}
+	if opts.CertDir != "" {
+		t.Fatalf("CertDir = %q, want empty", opts.CertDir)
+	}
+	if opts.FilterProvider != nil {
+		t.Fatal("FilterProvider is set, want nil")
+	}
+}

@@ -46,8 +46,9 @@ func testShippedPermissions(t *testing.T, c client.Client) {
 		assertAccess(t, c, true, authv1.ResourceAttributes{
 			Namespace: gatewayNamespace, Group: gatewayAPIGroup, Resource: "gateways", Verb: verb,
 		})
-		// ExternalModel Gateway attachment is authorized through HTTPRoute parent status.
-		assertAccess(t, c, false, authv1.ResourceAttributes{
+		// AIGuardrail allowedConsumers Selector mode reads Namespace labels as an
+		// authorization input (via APIReader, not the informer cache).
+		assertAccess(t, c, true, authv1.ResourceAttributes{
 			Resource: "namespaces", Verb: verb,
 		})
 	}

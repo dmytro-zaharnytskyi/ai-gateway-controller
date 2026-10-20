@@ -39,6 +39,37 @@ if [[ -z "${AI_GATEWAY_CONTROLLER_IMAGE:-}" ]]; then
   exit 1
 fi
 
+# Konflux group-test may export the snapshot digest as AI_GATEWAY_CONTROLLER_IMAGE.
+# That digest can lag the floating odh-pr-<N> tag and roll out a stale manager while
+# e2e manifests come from the PR head (e.g. --metrics-secure). Prefer a tag from the
+# SNAPSHOT JSON or odh-pr-<PR_NUMBER> (see hack/tekton/pr-group-testing-pipeline.yaml).
+if [[ "${AI_GATEWAY_CONTROLLER_IMAGE}" == *@sha256:* ]]; then
+  aigc_repo="${AI_GATEWAY_CONTROLLER_IMAGE%%@*}"
+  resolved_tag=""
+
+  if [[ -n "${SNAPSHOT:-}" ]]; then
+    resolved_tag="$(jq -r '."odh-ai-gateway-controller-ci".image_tag // empty' <<< "${SNAPSHOT}" 2>/dev/null || true)"
+    if [[ "${resolved_tag}" == "null" || "${resolved_tag}" == *@sha256:* ]]; then
+      resolved_tag=""
+    fi
+  fi
+
+  if [[ -z "${resolved_tag}" ]]; then
+    pr_num="${PR_NUMBER:-${PR_NUMBER_RESULT:-}}"
+    if [[ -n "${pr_num}" && "${pr_num}" != "null" ]]; then
+      resolved_tag="odh-pr-${pr_num}"
+    fi
+  fi
+
+  if [[ -n "${resolved_tag}" ]]; then
+    echo "NOTE: rewriting AI_GATEWAY_CONTROLLER_IMAGE from snapshot digest to tag ${resolved_tag}" >&2
+    export AI_GATEWAY_CONTROLLER_IMAGE="${aigc_repo}:${resolved_tag}"
+  else
+    echo "ERROR: refusing snapshot digest ${AI_GATEWAY_CONTROLLER_IMAGE}; set SNAPSHOT image_tag or PR_NUMBER" >&2
+    exit 1
+  fi
+fi
+
 # Konflux group-test may export PRAXIS_EXTPROC_IMAGE from odh-praxis-extproc-ci snapshot.
 export PRAXIS_EXTPROC_IMAGE="${PRAXIS_EXTPROC_IMAGE:-quay.io/opendatahub/odh-praxis-extproc:odh-stable}"
 

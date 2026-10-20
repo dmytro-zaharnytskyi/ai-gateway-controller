@@ -127,18 +127,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	metricsOpts := metricsserver.Options{
-		BindAddress:   metricsAddr,
-		SecureServing: metricsSecure,
-	}
-	if metricsSecure {
-		metricsOpts.FilterProvider = filters.WithAuthenticationAndAuthorization
-		metricsOpts.CertDir = metricsCertDir
-	}
-
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 clientgoscheme.Scheme,
-		Metrics:                metricsOpts,
+		Metrics:                buildMetricsServerOptions(metricsAddr, metricsSecure),
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "ai-gateway-controller-leader.opendatahub.io",
@@ -202,6 +193,21 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// buildMetricsServerOptions configures the controller-runtime metrics endpoint.
+// When secureMetrics is true, metrics are served over HTTPS with authn/authz
+// filters using the serving cert mounted at metricsCertDir.
+func buildMetricsServerOptions(bindAddress string, secureMetrics bool) metricsserver.Options {
+	opts := metricsserver.Options{
+		BindAddress:   bindAddress,
+		SecureServing: secureMetrics,
+	}
+	if secureMetrics {
+		opts.CertDir = metricsCertDir
+		opts.FilterProvider = filters.WithAuthenticationAndAuthorization
+	}
+	return opts
 }
 
 // resolveExtprocImage returns the praxis-extproc container image.
