@@ -312,8 +312,9 @@ compatibility one-pager; this records how it is implemented.
   `ModelNameConflict`), and `httpRouteRef` only while it is Ready. The
   top-level status is written in the same update: Ready requires every
   attachment, otherwise it reports the first failing one in `gatewayRefs`
-  order. `httpRouteName` names a single attachment's route and is empty for
-  several. Removing a Gateway removes its result; removing every
+  order. `httpRouteName` names a single attachment's route, is empty for
+  several, and is cleared while an extra attachment is not Ready; a home route
+  keeps its existing behavior. Removing a Gateway removes its result; removing every
   `gatewayRefs` entry removes them all.
 - **Authorization.** The attachment's HTTPRoute is created in the model
   namespace first and the Gateway enforces its listener `allowedRoutes`.
@@ -374,7 +375,8 @@ compatibility one-pager; this records how it is implemented.
   route reaches it. A model with extra attachments carries the
   `inference.opendatahub.io/external-model-attachment-cleanup` finalizer:
   deleting it removes those objects for every extra attachment without
-  waiting for any tenant, and the shared overlay and route filter are not
+  waiting for any tenant, including tenant state whose route namespace or
+  foreground deletion already removed, and the shared overlay and route filter are not
   rebuilt; the tenant ExtProc stops mounting a removed copy. The home
   attachment keeps its own finalizer and existing deletion, including its
   conservative wait for a steady tenant while siblings remain. A tenant serving

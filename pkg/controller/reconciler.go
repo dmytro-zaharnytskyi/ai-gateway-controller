@@ -447,6 +447,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			if err := r.removeDetachedRoutes(ctx, &model); err != nil {
 				return reconcile.Result{}, err
 			}
+			if err := r.collectDeletedAttachments(ctx); err != nil {
+				return reconcile.Result{}, err
+			}
 			if err := r.setAttachmentFinalizer(ctx, &model, false); err != nil {
 				return reconcile.Result{}, err
 			}

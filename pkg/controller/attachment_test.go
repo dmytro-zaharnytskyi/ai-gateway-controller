@@ -20,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -703,11 +704,17 @@ func TestModelWithoutTenantOrGatewayRefsIsTenantNotResolved(t *testing.T) {
 	provider, secret := attachmentProvider("team")
 	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0))
 	r := attachmentReconciler(t, provider, secret, model)
+	// A route name another writer (legacy IPP) published is left alone.
+	written := getModel(t, r, model)
+	written.Status.HTTPRouteName = "chat"
+	if err := r.Status().Update(context.Background(), written); err != nil {
+		t.Fatal(err)
+	}
 	reconcileModel(t, r, model)
 	got := getModel(t, r, model)
 	condition := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady)
 	if got.Status.Phase != modelPhasePending || condition == nil || condition.Status != metav1.ConditionFalse ||
-		condition.Reason != reasonTenantNotResolved || !strings.Contains(condition.Message, "spec.gatewayRefs") {
+		condition.Reason != reasonTenantNotResolved || !strings.Contains(condition.Message, "spec.gatewayRefs") || got.Status.HTTPRouteName != "chat" {
 		t.Fatalf("status = %#v", got.Status)
 	}
 	if _, err := getUnstructured(r, httpRouteGVK, "team", "external-model-chat"); !apierrors.IsNotFound(err) {
@@ -1095,8 +1102,8 @@ func TestRevokedAcceptanceWithdrawsAttachment(t *testing.T) {
 	reconcileModel(t, r, model)
 	assertAttachmentWithdrawn(t, r)
 	assertNoTenantOverlay(t, r)
-	if got := getModel(t, r, model); readyReason(got) != "NotAllowedByListeners" {
-		t.Fatalf("reason = %q", readyReason(got))
+	if got := getModel(t, r, model); readyReason(got) != "NotAllowedByListeners" || got.Status.HTTPRouteName != "" {
+		t.Fatalf("reason = %q, httpRouteName = %q; want the Gateway's reason and no route", readyReason(got), got.Status.HTTPRouteName)
 	}
 }
 
@@ -1111,6 +1118,56 @@ func TestRemovedGatewayRefCollectsAttachmentState(t *testing.T) {
 	if attachmentRouteExists(t, r, model) {
 		t.Fatal("detached model keeps its attachment route")
 	}
+	assertAttachmentWithdrawn(t, r)
+	if got := getModel(t, r, model); got.Status.HTTPRouteName != "" {
+		t.Fatalf("httpRouteName = %q names the deleted attachment route", got.Status.HTTPRouteName)
+	}
+}
+
+func TestFailedDetachCleanupIsRetried(t *testing.T) {
+	r, model := servedAttachmentFixture(t)
+	failed := false
+	fakeClient, ok := r.Client.(client.WithWatch)
+	if !ok {
+		t.Fatal("the test client must support watches")
+	}
+	r.Client = interceptor.NewClient(fakeClient, interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if obj.GetObjectKind().GroupVersionKind().Kind == "DestinationRule" && !failed {
+				failed = true
+				return apierrors.NewServiceUnavailable("etcd is unavailable")
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	got := getModel(t, r, model)
+	got.Spec.GatewayRefs = nil
+	if err := r.Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err == nil {
+		t.Fatal("a failed cleanup must be retried")
+	}
+	// The route is deleted last, so the retry still finds what to collect.
+	reconcileModel(t, r, model)
+	assertAttachmentWithdrawn(t, r)
+}
+
+func TestDeletingModelCollectsStateOfItsAlreadyDeletedRoute(t *testing.T) {
+	r, model := servedAttachmentFixture(t)
+	// Namespace or foreground deletion removes the route before the model's
+	// finalizer runs.
+	route, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), route); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), getModel(t, r, model)); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
 	assertAttachmentWithdrawn(t, r)
 }
 
