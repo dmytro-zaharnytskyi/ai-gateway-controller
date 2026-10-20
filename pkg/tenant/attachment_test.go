@@ -95,18 +95,22 @@ func TestTenantProvidersExcludeModelsBoundToOtherGateways(t *testing.T) {
 	elsewhere := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "elsewhere", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalModelSpec{
 		ExternalProviderRefs: ref("elsewhere"), GatewayRefs: []v1alpha1.NamespacedObjectReference{{Name: "gw-b", Namespace: "gateway-b"}},
 	}}
+	// A provider in another namespace is never the same-named local one.
+	foreign := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "foreign", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalModelSpec{
+		ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{Ref: v1alpha1.ExternalProviderReference{Name: "shared", Namespace: "shared"}}},
+	}}
 	provider := func(name string) *v1alpha1.ExternalProvider {
 		return &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tenant-a"}}
 	}
 	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(
-		local, own, elsewhere, provider("local"), provider("own"), provider("elsewhere"),
+		local, own, elsewhere, foreign, provider("local"), provider("own"), provider("elsewhere"), provider("shared"),
 	).Build()}
 	_, required, err := r.providersForTenant(context.Background(), "tenant-a", "gw-a", "gateway-a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !required["local"] || !required["own"] || required["elsewhere"] || len(required) != 2 {
-		t.Fatalf("required providers = %v, want only models the tenant Gateway serves", required)
+		t.Fatalf("required providers = %v, want only local providers of models the tenant Gateway serves", required)
 	}
 }
 
@@ -167,5 +171,19 @@ func TestAttachmentOnlyTenantKeepsProcessorWhenOverlayIsUnreadable(t *testing.T)
 	got.SetGroupVersionKind(gvkDeployment)
 	if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(processor), got); err != nil {
 		t.Fatalf("processor: %v", err)
+	}
+}
+
+func TestRuntimeCandidatesLeaveProvidersInOtherNamespacesToTheOverlay(t *testing.T) {
+	foreign := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "foreign", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalModelSpec{
+		ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{Ref: v1alpha1.ExternalProviderReference{Name: "openai", Namespace: "shared"}, APIFormat: "openai-chat"}},
+	}}
+	// A Ready same-named local provider is not the referenced one.
+	local := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "openai", Namespace: "tenant-a"},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai"}, Status: v1alpha1.ExternalProviderStatus{Phase: "Ready"}}
+	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(foreign, local).Build()}
+	candidates, err := r.runtimeCandidates(context.Background(), "tenant-a", "gw-a", "gateway-a")
+	if err != nil || len(candidates) != 0 {
+		t.Fatalf("runtime candidates = %#v, err=%v; want none, the overlay carries the reference", candidates, err)
 	}
 }

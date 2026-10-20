@@ -224,7 +224,7 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 					Strategy: strategy,
 					SecretRef: SecretRef{
 						Name:      r.SecretName,
-						Namespace: routeSecretNamespace(r),
+						Namespace: r.SecretRefNamespace(),
 						Key:       r.SecretKey,
 					},
 				}
@@ -305,7 +305,7 @@ func deriveSelectionMetadata(routes *resolver.ResolvedRouteSet) (selectionMetada
 		}
 		for _, route := range model.Routes {
 			key := "inference_model\x00" + route.ClientName
-			binding := key + "\x00" + route.Provider
+			binding := key + "\x00" + route.ProviderNamespace + "/" + route.Provider
 			if providerBindings[binding] {
 				return selectionMetadata{}, fmt.Errorf("%w: client model %s provider %s", ErrDuplicateProvider, route.ClientName, route.Provider)
 			}
@@ -433,14 +433,6 @@ func RouteStableID(route resolver.Route) string {
 // the hash form) rather than the existing tenant-local form.
 func IsScopedStableID(id string) bool {
 	return strings.Count(id, "/") != 1
-}
-
-// routeSecretNamespace returns the namespace of the route's credential Secret.
-func routeSecretNamespace(route resolver.Route) string {
-	if route.SecretNamespace != "" {
-		return route.SecretNamespace
-	}
-	return route.Namespace
 }
 
 // ValidateModel applies Render's per-model checks: provider selection (equal

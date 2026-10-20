@@ -586,7 +586,8 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 	for i := range models {
 		for _, ref := range models[i].Spec.ExternalProviderRefs {
 			name := ref.Ref.Name
-			if name == "" {
+			// A provider in another namespace is never a same-named local one.
+			if name == "" || ref.Ref.Namespace != "" && ref.Ref.Namespace != namespace {
 				continue
 			}
 			referenced[name] = true
@@ -621,7 +622,17 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 	}
 	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models))
 	for i := range models {
-		modelPtrs = append(modelPtrs, &models[i])
+		// Providers in other namespaces are loaded from the published overlay
+		// (attachedOverlayCandidates), so a model referencing only those has
+		// no local runtime candidates.
+		if slices.ContainsFunc(models[i].Spec.ExternalProviderRefs, func(ref v1alpha1.ExternalProviderRef) bool {
+			return ref.Ref.Namespace == "" || ref.Ref.Namespace == namespace
+		}) {
+			modelPtrs = append(modelPtrs, &models[i])
+		}
+	}
+	if len(modelPtrs) == 0 {
+		return nil, nil
 	}
 	providerPtrs := make([]*v1alpha1.ExternalProvider, 0, len(providers.Items))
 	for i := range providers.Items {
@@ -653,8 +664,9 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 }
 
 // attachedOverlayCandidates returns the published overlay candidates that
-// ExternalModels from other namespaces contribute to this tenant. They carry
-// scoped stable IDs and reference credential copies in the tenant namespace.
+// ExternalModels or ExternalProviders from other namespaces contribute to this
+// tenant. They carry scoped stable IDs and reference credential Secrets in the
+// tenant namespace, mostly copies.
 // A candidate whose copy no longer exists is skipped: its attachment was
 // removed and the entry is inert until the next overlay publish drops it,
 // so mounting the missing Secret would only block the ExtProc rollout.

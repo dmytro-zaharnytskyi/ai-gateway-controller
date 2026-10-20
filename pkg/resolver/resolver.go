@@ -9,6 +9,8 @@
 package resolver
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"regexp"
@@ -27,9 +29,11 @@ const (
 	// SkipRefNotFound: the referenced ExternalProvider does not exist in
 	// the model's namespace.
 	SkipRefNotFound SkipReason = "RefNotFound"
-	// SkipRefNamespaceUnsupported: cross-namespace provider resolution and
-	// authorization are not implemented; never substitute a local provider.
-	SkipRefNamespaceUnsupported SkipReason = "RefNamespaceUnsupported"
+	// SkipRefNotPermitted: the ExternalProvider in another namespace is not
+	// among the providers a ReferenceGrant permits. One reason covers a
+	// missing and an unauthorized provider, so its existence is not
+	// disclosed; a local provider is never substituted.
+	SkipRefNotPermitted SkipReason = "RefNotPermitted"
 	// SkipProviderNotReady: the provider exists but its status.phase is
 	// not Ready. Blocking gate ported from IPP: a ref may not route to a
 	// provider whose networking (Service/SE/DR) is not confirmed.
@@ -69,11 +73,14 @@ type Route struct {
 	Namespace  string
 	// Provider is the ExternalProvider CR name.
 	Provider string
+	// ProviderNamespace is the ExternalProvider namespace. Empty means
+	// Namespace.
+	ProviderNamespace string
 	// ProviderType is ExternalProvider.spec.provider and is used for
 	// provider-specific credential semantics.
 	ProviderType string
 	// Cluster is the pre-provisioned extproc load_balancer cluster name
-	// for this provider (fixed convention: "provider-<crName>").
+	// for this provider: its ServiceName.
 	Cluster string
 	// Endpoint is the provider FQDN (for HTTPRoute Host rewrite).
 	Endpoint string
@@ -87,15 +94,47 @@ type Route struct {
 	Path              string // fully resolved, no placeholders
 	Weight            int    // normalized: unset == 1; only positive weights survive
 	AuthType          string // merged auth type: apikey|sigv4|oauth2
-	SecretName        string // credential secret (same namespace as provider)
+	SecretName        string // credential secret, see SecretRefNamespace
 	SecretKey         string // fixed "api-key" per the CRD contract
 	// StableID overrides the existing stable_id derivation for a route
 	// contributed to a tenant from another namespace. Empty keeps the
 	// existing <model>/provider-<provider> form.
 	StableID string
-	// SecretNamespace is SecretName's namespace when it is a controller-owned
-	// credential copy in the tenant namespace. Empty means Namespace.
+	// SecretNamespace is SecretName's namespace: the provider namespace for
+	// inherited auth of a provider in another namespace, or the tenant
+	// namespace for a controller-owned credential copy. Empty means Namespace.
 	SecretNamespace string
+}
+
+// CrossNamespace reports whether the route's provider is in another
+// namespace than its model.
+func (r Route) CrossNamespace() bool {
+	return r.ProviderNamespace != "" && r.ProviderNamespace != r.Namespace
+}
+
+// ServiceName names the provider's transport Service and ServiceEntry in the
+// model namespace: provider-<provider>, or provider-<provider>-<hash12> within
+// 63 characters for a provider in another namespace, so it never collides
+// with a same-named local provider.
+func (r Route) ServiceName() string {
+	name := "provider-" + r.Provider
+	if !r.CrossNamespace() {
+		return name
+	}
+	sum := sha256.Sum256([]byte(r.ProviderNamespace + "/" + r.Provider))
+	hash := hex.EncodeToString(sum[:])[:12]
+	if limit := 63 - len(hash) - 1; len(name) > limit {
+		name = strings.TrimRight(name[:limit], "-.")
+	}
+	return name + "-" + hash
+}
+
+// SecretRefNamespace returns SecretName's namespace.
+func (r Route) SecretRefNamespace() string {
+	if r.SecretNamespace != "" {
+		return r.SecretNamespace
+	}
+	return r.Namespace
 }
 
 // ModelRoutes is the per-model outcome: resolved routes in ref order (the
@@ -129,7 +168,9 @@ var ErrNoRoutes = errors.New("resolver: no provider refs resolved to routes")
 // Resolve merges model/provider pairs into a route set. Ordering guarantees:
 // models keep input order, routes keep ref order. A model whose refs all
 // skip is not an error by itself — its skips are reported and only a wholly
-// empty set returns ErrNoRoutes.
+// empty set returns ErrNoRoutes. A ref to another namespace resolves only to
+// a provider of that namespace in providers, so callers pass only the
+// providers in other namespaces that the model namespace may reference.
 func Resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider) (*ResolvedRouteSet, error) {
 	return resolve(models, providers, false)
 }
@@ -161,20 +202,23 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 		}
 		mref := m.Namespace + "/" + m.Name
 		mr := ModelRoutes{ModelRef: mref}
-		activeProviders := map[string]bool{}
+		activeProviders := map[provKey]bool{}
 		clientName := m.Name
 		if m.Spec.ModelName != "" {
 			clientName = m.Spec.ModelName
 		}
 		for _, ref := range m.Spec.ExternalProviderRefs {
 			base := Skip{ModelRef: mref, ProviderRef: ref.Ref.Name}
-			if ref.Ref.Namespace != "" && ref.Ref.Namespace != m.Namespace {
-				mr.Skips = append(mr.Skips, newSkip(base, SkipRefNamespaceUnsupported,
-					fmt.Sprintf("cross-namespace ExternalProvider reference %q is not supported", ref.Ref.Namespace+"/"+ref.Ref.Name)))
+			key := provKey{m.Namespace, ref.Ref.Name}
+			if ref.Ref.Namespace != "" {
+				key.ns = ref.Ref.Namespace
+			}
+			prov, ok := byKey[key]
+			if !ok && key.ns != m.Namespace {
+				mr.Skips = append(mr.Skips, newSkip(base, SkipRefNotPermitted,
+					fmt.Sprintf("ExternalProvider %s/%s is not found or not permitted by a ReferenceGrant in namespace %s", key.ns, key.name, key.ns)))
 				continue
 			}
-
-			prov, ok := byKey[provKey{m.Namespace, ref.Ref.Name}]
 			if !ok {
 				mr.Skips = append(mr.Skips, newSkip(base,
 					SkipRefNotFound, "external provider not found in model namespace"))
@@ -195,11 +239,11 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 					SkipWeightDisabled, fmt.Sprintf("weight %d disables this ref", weight)))
 				continue
 			}
-			if weight > 0 && activeProviders[prov.Name] {
-				return nil, fmt.Errorf("resolver: model %s has multiple active references to provider %s", mref, prov.Name)
+			if weight > 0 && activeProviders[key] {
+				return nil, fmt.Errorf("resolver: model %s has multiple active references to provider %s/%s", mref, prov.Namespace, prov.Name)
 			}
 			if weight > 0 {
-				activeProviders[prov.Name] = true
+				activeProviders[key] = true
 			}
 
 			providerCA := strings.TrimSpace(prov.Spec.Config["tls.caCertificates"])
@@ -219,17 +263,21 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 				return nil, fmt.Errorf("resolver: model %s ref %s: %w", mref, ref.Ref.Name, err)
 			}
 
-			auth := prov.Spec.Auth
+			// Inherited auth uses the provider-local Secret; a model override
+			// uses the model-local Secret, even for a provider elsewhere.
+			auth, secretNamespace := prov.Spec.Auth, ""
 			if ref.Auth != nil {
 				auth = *ref.Auth
+			} else if prov.Namespace != m.Namespace {
+				secretNamespace = prov.Namespace
 			}
-			mr.Routes = append(mr.Routes, Route{
+			route := Route{
 				Model:             m.Name,
 				ClientName:        clientName,
 				Namespace:         m.Namespace,
 				Provider:          prov.Name,
+				ProviderNamespace: prov.Namespace,
 				ProviderType:      prov.Spec.Provider,
-				Cluster:           "provider-" + prov.Name,
 				Endpoint:          prov.Spec.Endpoint,
 				TLSCACertificates: caCertificates,
 				TargetModel:       ref.TargetModel,
@@ -239,7 +287,10 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 				AuthType:          auth.Type,
 				SecretName:        auth.SecretRef.Name,
 				SecretKey:         "api-key",
-			})
+				SecretNamespace:   secretNamespace,
+			}
+			route.Cluster = route.ServiceName()
+			mr.Routes = append(mr.Routes, route)
 			resolved++
 		}
 		set.Models = append(set.Models, mr)

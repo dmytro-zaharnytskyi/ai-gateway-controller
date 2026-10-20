@@ -120,6 +120,9 @@ type attachedModel struct {
 	copies    []credentialCopy
 	reason    string
 	message   string
+	// denied reports a provider reference that is not permitted; the
+	// permitted ones are still served.
+	denied string
 	// Set on admission: whether the credential copies are in place.
 	ready bool
 }
@@ -592,6 +595,9 @@ func (r *Reconciler) reconcileAttachment(ctx context.Context, model *v1alpha1.Ex
 		result.reason, result.message = admitted[idx].reason, admitted[idx].message
 	case idx < 0 || !admitted[idx].ready:
 		result.pending, result.reason, result.message = true, reasonAttachmentPending, "the tenant has not admitted this attachment yet"
+	case self.denied != "":
+		// The model's permitted references are served; the others are reported.
+		result.reason, result.message = reasonRefNotPermitted, self.denied
 	default:
 		result.ready, result.message = true, "attached and distributed to the tenant overlay"
 	}
@@ -713,8 +719,8 @@ func (r *Reconciler) attachmentCandidates(ctx context.Context, t attachmentTenan
 }
 
 // resolveAttachedModel resolves one attached model against the providers of
-// its own namespace and rewrites its routes for the tenant: scoped stable IDs
-// and credential copies in the tenant namespace.
+// its own namespace and the permitted providers of other namespaces, and
+// rewrites its routes for the tenant (see localizeRoutes).
 func (r *Reconciler) resolveAttachedModel(ctx context.Context, t attachmentTenant, candidate *attachedModel) error {
 	m := candidate.model
 	var providers v1alpha1.ExternalProviderList
@@ -730,7 +736,11 @@ func (r *Reconciler) resolveAttachedModel(ctx context.Context, t attachmentTenan
 		ready.Status.Phase = resolver.PhaseReady
 		providerPtrs = append(providerPtrs, ready)
 	}
-	set, err := resolver.Resolve([]*v1alpha1.ExternalModel{m}, providerPtrs)
+	foreign, err := r.foreignProviders(ctx, m.Namespace, []*v1alpha1.ExternalModel{m})
+	if err != nil {
+		return err
+	}
+	set, err := resolver.Resolve([]*v1alpha1.ExternalModel{m}, append(providerPtrs, foreign...))
 	if err == nil {
 		err = r.validateResolvedCredentials(ctx, set.Routes())
 	}
@@ -739,9 +749,13 @@ func (r *Reconciler) resolveAttachedModel(ctx context.Context, t attachmentTenan
 		// instead of excluding, and so withdrawing, a served attachment.
 		return err
 	}
+	denied := deniedReferences(set)[m.Namespace+"/"+m.Name]
 	if err != nil {
 		candidate.reason, candidate.message = reasonReconcileFailed, err.Error()
-		if errors.Is(err, resolver.ErrNoRoutes) || errors.Is(err, errCredentialNotReady) {
+		switch {
+		case errors.Is(err, resolver.ErrNoRoutes) && denied != "":
+			candidate.reason, candidate.message = reasonRefNotPermitted, denied
+		case errors.Is(err, resolver.ErrNoRoutes) || errors.Is(err, errCredentialNotReady):
 			candidate.reason = reasonProviderNotReady
 		}
 		return nil
@@ -749,7 +763,7 @@ func (r *Reconciler) resolveAttachedModel(ctx context.Context, t attachmentTenan
 	routes := set.Routes()
 	distinct := map[string]bool{}
 	for _, route := range routes {
-		distinct[route.Provider] = true
+		distinct[providerIdentity(route)] = true
 	}
 	if len(distinct) > maxAttachedProviders {
 		candidate.reason = reasonTooManyProviders
@@ -760,23 +774,83 @@ func (r *Reconciler) resolveAttachedModel(ctx context.Context, t attachmentTenan
 		candidate.reason, candidate.message = reasonReconcileFailed, err.Error()
 		return nil //nolint:nilerr // excludes only this model
 	}
+	candidate.copies = localizeRoutes(t.namespace, routes)
+	candidate.routes, candidate.denied = routes, denied
+	return nil
+}
+
+// localizeRoutes rewrites routes for the tenant namespace: a route whose model
+// or provider is outside it gets a scoped stable ID, and a credential Secret
+// outside it is replaced by a controller-owned copy there. A Secret in the
+// tenant namespace is mounted directly. It returns the copies.
+func localizeRoutes(tenantNamespace string, routes []resolver.Route) []credentialCopy {
+	var copies []credentialCopy
 	for i := range routes {
 		route := &routes[i]
-		route.StableID = envelope.ScopedStableID(m.Namespace, m.Name, route.Namespace, route.Provider)
-		if route.AuthType == "" {
+		if route.Namespace == tenantNamespace && !route.CrossNamespace() {
+			continue
+		}
+		route.StableID = envelope.ScopedStableID(route.Namespace, route.Model, route.ProviderNamespace, route.Provider)
+		source := route.SecretRefNamespace()
+		if route.AuthType == "" || source == tenantNamespace {
 			continue
 		}
 		copied := credentialCopy{
-			name:            credentialCopyName(t.namespace, route.Namespace, route.SecretName, route.SecretKey),
-			sourceNamespace: route.Namespace, sourceName: route.SecretName, key: route.SecretKey,
+			name:            credentialCopyName(tenantNamespace, source, route.SecretName, route.SecretKey),
+			sourceNamespace: source, sourceName: route.SecretName, key: route.SecretKey,
 		}
-		if !slices.Contains(candidate.copies, copied) {
-			candidate.copies = append(candidate.copies, copied)
+		if !slices.Contains(copies, copied) {
+			copies = append(copies, copied)
 		}
-		route.SecretName, route.SecretNamespace = copied.name, t.namespace
+		route.SecretName, route.SecretNamespace = copied.name, tenantNamespace
 	}
-	candidate.routes = routes
-	return nil
+	return copies
+}
+
+// foreignState localizes the tenant's own routes and returns, by model, the
+// state of those to providers in other namespaces: hashed transport, Gateway
+// DestinationRules and credential copies, as for an attachment.
+func foreignState(tenantNamespace string, set *resolver.ResolvedRouteSet) map[string]attachedModel {
+	state := map[string]attachedModel{}
+	for _, model := range set.Models {
+		copies := localizeRoutes(tenantNamespace, model.Routes)
+		var routes []resolver.Route
+		for _, route := range model.Routes {
+			if route.CrossNamespace() {
+				routes = append(routes, route)
+			}
+		}
+		if len(routes) > 0 {
+			state[routes[0].Model] = attachedModel{routes: routes, copies: copies}
+		}
+	}
+	return state
+}
+
+// routeStateAnnotations records on an HTTPRoute the DestinationRules and
+// credential copies its routes need; collection keeps those.
+func routeStateAnnotations(gateway v1alpha1.NamespacedObjectReference, a attachedModel) map[string]string {
+	rules := make([]string, 0, len(a.routes))
+	for _, route := range a.routes {
+		if name := attachmentDestinationRuleName(gateway, route.ProviderNamespace, route.Provider); !slices.Contains(rules, name) {
+			rules = append(rules, name)
+		}
+	}
+	copies := make([]string, 0, len(a.copies))
+	for _, copied := range a.copies {
+		copies = append(copies, copied.name)
+	}
+	return map[string]string{annotationAttachmentRules: strings.Join(rules, ","), annotationAttachmentCredentials: strings.Join(copies, ",")}
+}
+
+// stateAnnotations returns the state annotations of the tenant's own
+// HTTPRoutes for the given foreign state.
+func stateAnnotations(gateway v1alpha1.NamespacedObjectReference, state map[string]attachedModel) []map[string]string {
+	own := make([]map[string]string, 0, len(state))
+	for _, a := range state {
+		own = append(own, routeStateAnnotations(gateway, a))
+	}
+	return own
 }
 
 // transientReadError reports an API read that failed for a reason other than
@@ -916,8 +990,11 @@ func (r *Reconciler) keepTenantAttachments(ctx context.Context, t attachmentTena
 	if err := r.cleanupModelTransport(ctx, t.namespace, nil); err != nil {
 		return true, err
 	}
-	_, err = r.publishTenantOverlay(ctx, t.namespace, t.gateway.Name, nil, attached, nil, sourceUID)
-	return true, err
+	if _, err = r.publishTenantOverlay(ctx, t.namespace, t.gateway.Name, nil, attached, nil, sourceUID); err != nil {
+		return true, err
+	}
+	// The tenant's own routes are gone, and so is their state.
+	return true, r.gcTenantState(ctx, t.namespace, excludedRoutes(attached), nil)
 }
 
 // publishAttachmentTenant republishes the tenant's attachments. The tenant's
@@ -955,8 +1032,22 @@ func (r *Reconciler) publishAttachmentTenant(ctx context.Context, t attachmentTe
 }
 
 // ownOverlayCandidates returns the tenant's own published candidates: those
-// with the existing tenant-local stable_id form.
+// with the existing tenant-local stable_id form, and the scoped stable IDs of
+// its own models' providers in other namespaces. An attachment's scoped
+// stable ID starts with, or hashes, another model namespace.
 func (r *Reconciler) ownOverlayCandidates(ctx context.Context, namespace string) ([]envelope.Candidate, error) {
+	var models v1alpha1.ExternalModelList
+	if err := r.List(ctx, &models, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("list tenant ExternalModels in %s: %w", namespace, err)
+	}
+	ownScoped := map[string]bool{}
+	for i := range models.Items {
+		for _, ref := range models.Items[i].Spec.ExternalProviderRefs {
+			if ref.Ref.Namespace != "" && ref.Ref.Namespace != namespace {
+				ownScoped[envelope.ScopedStableID(namespace, models.Items[i].Name, ref.Ref.Namespace, ref.Ref.Name)] = true
+			}
+		}
+	}
 	var cm corev1.ConfigMap
 	// Live read: the tenant-local path may have published in this same
 	// event batch, and preserving a stale copy would drop its candidates.
@@ -973,7 +1064,7 @@ func (r *Reconciler) ownOverlayCandidates(ctx context.Context, namespace string)
 	}
 	var own []envelope.Candidate
 	for _, candidate := range env.Overlay.Candidates {
-		if !envelope.IsScopedStableID(candidate.StableID) {
+		if !envelope.IsScopedStableID(candidate.StableID) || ownScoped[candidate.StableID] {
 			own = append(own, candidate)
 		}
 	}
@@ -1018,24 +1109,21 @@ func (r *Reconciler) applyAttachmentRoute(ctx context.Context, a attachedModel, 
 	m := a.model
 	route := modelHTTPRouteSet(a.routes, m.Namespace, t.gateway.Name, t.gateway.Namespace)
 	providers := make([]string, 0, len(a.routes))
-	rules := make([]string, 0, len(a.routes))
 	var resources []unstructured.Unstructured
 	for _, provider := range a.routes {
-		if slices.Contains(providers, provider.Provider) {
+		if slices.Contains(providers, provider.ServiceName()) {
 			continue
 		}
-		providers = append(providers, provider.Provider)
-		rules = append(rules, attachmentDestinationRuleName(t.gateway, provider.Namespace, provider.Provider))
+		providers = append(providers, provider.ServiceName())
 		for _, obj := range []unstructured.Unstructured{providerService(provider, m.Namespace), providerServiceEntry(provider, m.Namespace)} {
-			if owner := providerOwners[provider.Provider]; owner != nil {
+			if owner := providerOwners[provider.Provider]; owner != nil && !provider.CrossNamespace() {
 				setOwnerReference(&obj, owner)
 			}
 			resources = append(resources, obj)
 		}
 	}
-	copies := make([]string, 0, len(a.copies))
-	for _, copied := range a.copies {
-		copies = append(copies, copied.name)
+	if err := r.verifyProviderTransport(ctx, resources); err != nil {
+		return err
 	}
 	sink := providerSelectionSink(a.routes[0], m.Namespace)
 	setOwnerReference(&sink, m)
@@ -1043,12 +1131,9 @@ func (r *Reconciler) applyAttachmentRoute(ctx context.Context, a attachedModel, 
 	route.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "ai-gateway-controller", tenant.LabelAttachmentTenant: t.namespace})
 	// The DestinationRules and credential copies the route needs; collection
 	// keeps those an accepted route still names.
-	route.SetAnnotations(map[string]string{
-		annotationAttachmentModel:       m.Name,
-		annotationAttachmentGateway:     gatewayKey(t.gateway),
-		annotationAttachmentRules:       strings.Join(rules, ","),
-		annotationAttachmentCredentials: strings.Join(copies, ","),
-	})
+	annotations := routeStateAnnotations(t.gateway, a)
+	annotations[annotationAttachmentModel], annotations[annotationAttachmentGateway] = m.Name, gatewayKey(t.gateway)
+	route.SetAnnotations(annotations)
 	setOwnerReference(&route, m)
 	if existing, err := r.getAttachmentRoute(ctx, m.Namespace, a.routeName); err != nil {
 		return err
@@ -1145,12 +1230,12 @@ func (r *Reconciler) applyAttachmentDestinationRules(ctx context.Context, a atta
 	seen := map[string]bool{}
 	var rules []unstructured.Unstructured
 	for _, route := range a.routes {
-		name := attachmentDestinationRuleName(t.gateway, route.Namespace, route.Provider)
+		name := attachmentDestinationRuleName(t.gateway, route.ProviderNamespace, route.Provider)
 		if seen[name] {
 			continue
 		}
 		seen[name] = true
-		identity := gatewayKey(t.gateway) + "/" + route.Namespace + "/" + route.Provider
+		identity := gatewayKey(t.gateway) + "/" + providerIdentity(route)
 		existing := &unstructured.Unstructured{}
 		existing.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1", Kind: "DestinationRule"})
 		if err := r.Get(ctx, client.ObjectKey{Namespace: t.gateway.Namespace, Name: name}, existing); err == nil {
@@ -1254,9 +1339,27 @@ func (r *Reconciler) removeAttachmentRoute(ctx context.Context, model *v1alpha1.
 }
 
 // gcAttachmentState deletes the tenant's attachment DestinationRules and
-// credential copies that no accepted attachment HTTPRoute references, other
-// than the given routes: just deleted, or excluded by the overlay capacity.
+// credential copies that neither an accepted attachment HTTPRoute, other than
+// the given routes (just deleted, or excluded by the overlay capacity), nor
+// the tenant's own HTTPRoutes reference.
 func (r *Reconciler) gcAttachmentState(ctx context.Context, tenantNamespace string, withdrawn map[types.NamespacedName]bool) error {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(httpRouteGVK.GroupVersion().WithKind("HTTPRouteList"))
+	if err := r.List(ctx, list, client.InNamespace(tenantNamespace), client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller"},
+		client.HasLabels{"inference.opendatahub.io/external-model"}); err != nil {
+		return fmt.Errorf("list tenant HTTPRoutes in %s: %w", tenantNamespace, err)
+	}
+	own := make([]map[string]string, 0, len(list.Items))
+	for i := range list.Items {
+		own = append(own, list.Items[i].GetAnnotations())
+	}
+	return r.gcTenantState(ctx, tenantNamespace, withdrawn, own)
+}
+
+// gcTenantState is gcAttachmentState with the state annotations of the
+// tenant's own HTTPRoutes given: the tenant-local path knows the routes it
+// applies before the cache does.
+func (r *Reconciler) gcTenantState(ctx context.Context, tenantNamespace string, withdrawn map[types.NamespacedName]bool, own []map[string]string) error {
 	if tenantNamespace == "" {
 		// Never collect across namespaces.
 		return nil
@@ -1265,14 +1368,17 @@ func (r *Reconciler) gcAttachmentState(ctx context.Context, tenantNamespace stri
 	if err != nil {
 		return err
 	}
-	keepRules, keepCopies := map[string]bool{}, map[string]bool{}
+	keep := slices.Clone(own)
 	for i := range routes {
 		annotations := routes[i].GetAnnotations()
 		gatewayNamespace, gatewayName, _ := strings.Cut(annotations[annotationAttachmentGateway], "/")
 		accepted, _, _ := routeAccepted(&routes[i], v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace})
-		if withdrawn[client.ObjectKeyFromObject(&routes[i])] || !accepted {
-			continue
+		if !withdrawn[client.ObjectKeyFromObject(&routes[i])] && accepted {
+			keep = append(keep, annotations)
 		}
+	}
+	keepRules, keepCopies := map[string]bool{}, map[string]bool{}
+	for _, annotations := range keep {
 		for _, name := range strings.Split(annotations[annotationAttachmentRules], ",") {
 			keepRules[name] = true
 		}

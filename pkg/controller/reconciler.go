@@ -95,8 +95,9 @@ type Reconciler struct {
 
 // SetupWithManager registers the ExternalModel and ExternalProvider loops,
 // along with their shared tenant and Secret watches. Provider and Secret
-// changes fan out to models that reference the provider; Secret and tenant
-// changes also reconcile providers independently of any model.
+// changes fan out to models that reference the provider, in any namespace, and
+// ReferenceGrant changes to models referencing a provider in their namespace;
+// Secret and tenant changes also reconcile providers independently of any model.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	inScope := predicate.NewPredicateFuncs(func(obj client.Object) bool { return r.namespaceAllowed(obj.GetNamespace()) })
 	if err := builder.ControllerManagedBy(mgr).
@@ -116,6 +117,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// namespace's attachment.
 		WatchesRawSource(source.Kind(mgr.GetCache(), newHTTPRoute(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.attachmentRouteModels))).
 		Watches(&v1alpha1.ExternalModel{}, handler.EnqueueRequestsFromMapFunc(r.sameNameModels), builder.WithPredicates(inScope)).
+		WatchesRawSource(source.Kind(mgr.GetCache(), newReferenceGrant(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.referenceGrantModels))).
 		Complete(r); err != nil {
 		return err
 	}
@@ -266,26 +268,24 @@ func (r *Reconciler) modelsInNamespace(ctx context.Context, namespace string) []
 	return requests
 }
 
+// modelsReferencingProviders enqueues the models, in any namespace, that
+// reference the named providers of the namespace.
 func (r *Reconciler) modelsReferencingProviders(ctx context.Context, namespace string, providers map[string]bool) []reconcile.Request {
 	if len(providers) == 0 || !r.namespaceAllowed(namespace) {
 		return nil
 	}
 	var models v1alpha1.ExternalModelList
-	if err := r.List(ctx, &models, client.InNamespace(namespace)); err != nil {
+	if err := r.List(ctx, &models); err != nil {
 		r.Log.Error(err, "list models for provider event", "namespace", namespace)
 		return nil
 	}
 	requests := make([]reconcile.Request, 0, len(models.Items))
 	for i := range models.Items {
-		referencesProvider := false
-		for _, ref := range models.Items[i].Spec.ExternalProviderRefs {
-			if providers[ref.Ref.Name] {
-				referencesProvider = true
-				break
-			}
-		}
-		if referencesProvider {
-			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&models.Items[i])})
+		m := &models.Items[i]
+		if r.namespaceAllowed(m.Namespace) && slices.ContainsFunc(m.Spec.ExternalProviderRefs, func(ref v1alpha1.ExternalProviderRef) bool {
+			return (ref.Ref.Namespace == namespace || (ref.Ref.Namespace == "" && m.Namespace == namespace)) && providers[ref.Ref.Name]
+		}) {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(m)})
 		}
 	}
 	return requests
@@ -431,7 +431,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		if apierrors.IsNotFound(err) {
 			// A deleted model's attachment routes are garbage collected with
 			// it, and each route deletion requeues it here.
-			return reconcile.Result{}, r.collectDeletedAttachments(ctx)
+			return reconcile.Result{}, errors.Join(r.collectDeletedAttachments(ctx), r.collectProviderTransport(ctx, req.Namespace))
 		}
 		return reconcile.Result{}, err
 	}
@@ -444,6 +444,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			return reconcile.Result{}, err
 		}
 		return reconcile.Result{}, nil
+	}
+	if err := r.collectProviderTransport(ctx, model.Namespace); err != nil {
+		return reconcile.Result{}, err
 	}
 	if len(model.Spec.GatewayRefs) > 0 {
 		return r.reconcileAttachedModel(ctx, &model)
@@ -492,8 +495,15 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		modelPtrs = append(modelPtrs, &models.Items[i])
 		modelOwners[models.Items[i].Name] = &models.Items[i]
 	}
-	set, err := resolver.Resolve(modelPtrs, providerPtrs)
+	foreign, err := r.foreignProviders(ctx, req.Namespace, modelPtrs)
 	if err != nil {
+		return reconcile.Result{}, err
+	}
+	set, err := resolver.Resolve(modelPtrs, append(providerPtrs, foreign...))
+	denied := deniedReferences(set)
+	// A reference that is no longer permitted must stop serving, so it never
+	// retains the last serving state.
+	if err != nil && (!errors.Is(err, resolver.ErrNoRoutes) || len(denied) == 0) {
 		reason := reasonReconcileFailed
 		if errors.Is(err, resolver.ErrNoRoutes) {
 			reason = reasonProviderNotReady
@@ -536,17 +546,21 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 				return reconcile.Result{}, cleanupErr
 			}
 		}
-		message := "no ExternalModel provider references resolved to a Ready provider"
-		if statusErr := report(false, reasonNoRoutes, message, nil); statusErr != nil {
+		reason, message := reasonNoRoutes, "no ExternalModel provider references resolved to a Ready provider"
+		if denial := denied[req.String()]; denial != "" {
+			reason, message = reasonRefNotPermitted, denial
+		}
+		if statusErr := report(false, reason, message, nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		return reconcile.Result{}, resolver.ErrNoRoutes
 	}
+	state := foreignState(req.Namespace, set)
 	attached, err := r.admittedAttachments(ctx, home, len(set.Routes()))
 	if err != nil {
 		return reconcile.Result{}, err
 	}
-	if err := r.applyTransport(ctx, set.Routes(), req.Namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace, modelOwners, attached); err != nil {
+	if err := r.applyTransport(ctx, set.Routes(), req.Namespace, tenant.ID(modelTenant.aitenant.GetName()), gatewayName, gatewayNamespace, modelOwners, attached, state); err != nil {
 		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
@@ -569,11 +583,14 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		return reconcile.Result{}, err
 	}
 	// Attachments the tenant's own candidates pushed over the overlay
-	// capacity lose their DestinationRules and credential copies.
-	if excluded := excludedRoutes(attached); len(excluded) > 0 {
-		if err := r.gcAttachmentState(ctx, req.Namespace, excluded); err != nil {
-			return reconcile.Result{}, err
-		}
+	// capacity, and providers in other namespaces its own routes no longer
+	// use, lose their DestinationRules and credential copies.
+	if err := r.gcTenantState(ctx, req.Namespace, excludedRoutes(attached), stateAnnotations(home.gateway, state)); err != nil {
+		return reconcile.Result{}, err
+	}
+	if denial := denied[req.String()]; denial != "" {
+		// The model's permitted references are served; the others are reported.
+		return reconcile.Result{}, report(false, reasonRefNotPermitted, denial, nil)
 	}
 
 	message := fmt.Sprintf("distributed routing overlay digest %s generation %d", result.Envelope.Revision.Value, result.Envelope.Provenance.SourceGeneration)
@@ -817,14 +834,19 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if err != nil {
 		return err
 	}
+	foreign, err := r.foreignProviders(ctx, deleted.Namespace, modelPtrs)
+	if err != nil {
+		return err
+	}
 	home := attachmentTenant{namespace: deleted.Namespace, tenantID: tenantID,
 		gateway: v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace}}
-	set, err := resolver.Resolve(modelPtrs, providerPtrs)
+	set, err := resolver.Resolve(modelPtrs, append(providerPtrs, foreign...))
 	if errors.Is(err, resolver.ErrNoRoutes) {
 		// A sibling still exists but is temporarily unroutable: retain the
 		// last-known-good transport and overlay and retry. Only final-model
-		// deletion is allowed to remove the shared serving state.
-		if len(modelPtrs) > 0 {
+		// deletion, or a reference that is no longer permitted, removes the
+		// shared serving state.
+		if len(modelPtrs) > 0 && len(deniedReferences(set)) == 0 {
 			return err
 		}
 		// Attachments from other namespaces keep the tenant's overlay and
@@ -871,11 +893,12 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if err := r.validateResolvedRouteSet(ctx, set); err != nil {
 		return fmt.Errorf("validate remaining ExternalModel routes after deletion: %w", err)
 	}
+	state := foreignState(deleted.Namespace, set)
 	attached, err := r.admittedAttachments(ctx, home, len(set.Routes()))
 	if err != nil {
 		return err
 	}
-	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, tenantID, gatewayName, gatewayNamespace, modelOwners, attached); err != nil {
+	if err := r.applyTransport(ctx, set.Routes(), deleted.Namespace, tenantID, gatewayName, gatewayNamespace, modelOwners, attached, state); err != nil {
 		return fmt.Errorf("rebuild transport after ExternalModel deletion: %w", err)
 	}
 	if err := r.cleanupExternalModelRouteFilters(ctx, deleted.Namespace, tenantID, gatewayName, gatewayNamespace); err != nil {
@@ -890,10 +913,7 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 	if _, err := r.publishTenantOverlay(ctx, deleted.Namespace, gatewayName, set, attached, nil, string(modelPtrs[0].UID)); err != nil {
 		return fmt.Errorf("publish remaining overlay after ExternalModel deletion: %w", err)
 	}
-	if excluded := excludedRoutes(attached); len(excluded) > 0 {
-		return r.gcAttachmentState(ctx, deleted.Namespace, excluded)
-	}
-	return nil
+	return r.gcTenantState(ctx, deleted.Namespace, excludedRoutes(attached), stateAnnotations(home.gateway, state))
 }
 
 func (r *Reconciler) removeExternalModelFinalizer(ctx context.Context, model *v1alpha1.ExternalModel) error {
@@ -1047,16 +1067,19 @@ func (r *Reconciler) removeExternalProviderFinalizer(ctx context.Context, provid
 // when a namespace leaves Praxis selection. It is intentionally label-gated:
 // the ConfigMap is shared by models in one tenant namespace, but resources in
 // other namespaces and any non-controller ConfigMap are never touched.
+// Without the overlay, the tenant's own routes need none of its
+// DestinationRules and credential copies.
 func (r *Reconciler) cleanupOverlay(ctx context.Context, namespace string) error {
 	var cm corev1.ConfigMap
 	key := client.ObjectKey{Namespace: namespace, Name: r.configMapName()}
-	if err := r.Get(ctx, key, &cm); err != nil {
-		return client.IgnoreNotFound(err)
+	if err := r.Get(ctx, key, &cm); client.IgnoreNotFound(err) != nil {
+		return err
+	} else if err == nil && cm.Labels["app.kubernetes.io/managed-by"] == "ai-gateway-controller" {
+		if err := client.IgnoreNotFound(r.Delete(ctx, &cm)); err != nil {
+			return err
+		}
 	}
-	if cm.Labels["app.kubernetes.io/managed-by"] != "ai-gateway-controller" {
-		return nil
-	}
-	return client.IgnoreNotFound(r.Delete(ctx, &cm))
+	return r.gcTenantState(ctx, namespace, nil, nil)
 }
 
 type tenantResolution struct {
@@ -1250,7 +1273,7 @@ func (r *Reconciler) validateResolvedCredentials(ctx context.Context, routes []r
 		if route.SecretName == "" || route.SecretKey == "" {
 			return fmt.Errorf("model %s provider %s has an incomplete effective credential reference", route.Model, route.Provider)
 		}
-		key := client.ObjectKey{Namespace: route.Namespace, Name: route.SecretName}
+		key := client.ObjectKey{Namespace: route.SecretRefNamespace(), Name: route.SecretName}
 		if seen[key] {
 			continue
 		}
@@ -1291,7 +1314,7 @@ func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver
 			} else {
 				weights[route.ClientName] = route.Weight
 			}
-			binding := route.ClientName + "\x00" + route.Provider
+			binding := route.ClientName + "\x00" + route.ProviderNamespace + "/" + route.Provider
 			if bindings[binding] {
 				duplicateProviders[route.ClientName] = true
 			}
@@ -1352,8 +1375,13 @@ func (r *Reconciler) namespaceAllowed(namespace string) bool {
 	return namespace != "" && (r.Namespace == "" || r.Namespace == namespace)
 }
 
+// applyTransport applies the tenant's own model routes. Their providers in
+// other namespaces (foreign, by model) also get hashed transport here, and,
+// as for an attachment, Gateway DestinationRules and credential copies that
+// their HTTPRoute records.
 func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route, modelNamespace, tenantID, gatewayName,
-	gatewayNamespace string, modelOwners map[string]*v1alpha1.ExternalModel, attached []attachedModel) error {
+	gatewayNamespace string, modelOwners map[string]*v1alpha1.ExternalModel, attached []attachedModel, foreign map[string]attachedModel) error {
+	home := attachmentTenant{namespace: modelNamespace, tenantID: tenantID, gateway: v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace}}
 	resources := make([]unstructured.Unstructured, 0, len(routes))
 	seen := map[string]bool{}
 	models := map[string][]resolver.Route{}
@@ -1367,6 +1395,15 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 	sort.Strings(modelNames)
 	for _, modelName := range modelNames {
 		modelRoutes := models[modelName]
+		state, hasForeign := foreign[modelName]
+		for _, route := range state.routes {
+			for _, transport := range []unstructured.Unstructured{providerService(route, modelNamespace), providerServiceEntry(route, modelNamespace)} {
+				if key := transport.GetKind() + "/" + transport.GetName(); !seen[key] {
+					resources = append(resources, transport)
+					seen[key] = true
+				}
+			}
+		}
 		sink := providerSelectionSink(modelRoutes[0], modelNamespace)
 		if owner := modelOwners[modelRoutes[0].Model]; owner != nil {
 			setOwnerReference(&sink, owner)
@@ -1379,9 +1416,25 @@ func (r *Reconciler) applyTransport(ctx context.Context, routes []resolver.Route
 		if owner := modelOwners[modelRoutes[0].Model]; owner != nil {
 			setOwnerReference(&obj, owner)
 		}
+		if hasForeign {
+			obj.SetAnnotations(routeStateAnnotations(home.gateway, state))
+		}
 		key := obj.GetKind() + "/" + obj.GetNamespace() + "/" + obj.GetName()
 		if !seen[key] {
 			resources = append(resources, obj)
+		}
+	}
+	if err := r.verifyProviderTransport(ctx, resources); err != nil {
+		return err
+	}
+	for _, modelName := range modelNames {
+		if state, ok := foreign[modelName]; ok {
+			if err := r.applyAttachmentDestinationRules(ctx, state, home); err != nil {
+				return err
+			}
+			if err := r.applyCredentialCopies(ctx, state, home); err != nil {
+				return err
+			}
 		}
 	}
 	for _, resource := range resources {
@@ -1749,11 +1802,23 @@ func labelledMetadata(name, namespace, key, value string) map[string]any {
 	return m
 }
 
+// providerTransportMetadata names and labels a provider's model-namespace
+// transport. Transport for a provider in another namespace carries its
+// identity instead of the local provider label.
+func providerTransportMetadata(route resolver.Route, ns string) map[string]any {
+	if !route.CrossNamespace() {
+		return labelledMetadata(route.ServiceName(), ns, "inference.opendatahub.io/external-provider", route.Provider)
+	}
+	m := labelledMetadata(route.ServiceName(), ns, labelProviderNamespace, route.ProviderNamespace)
+	m["annotations"] = map[string]any{annotationAttachmentIdentity: providerIdentity(route)}
+	return m
+}
+
 func providerService(route resolver.Route, ns string) unstructured.Unstructured {
 	endpoint := providerEndpointForRoute(route)
 	return unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1", "kind": "Service",
-		"metadata": labelledMetadata(providerServicePrefix+route.Provider, ns, "inference.opendatahub.io/external-provider", route.Provider),
+		"metadata": providerTransportMetadata(route, ns),
 		"spec": map[string]any{
 			"type": "ExternalName", "externalName": endpoint.host,
 			"ports": []any{map[string]any{"name": "https", "port": endpoint.port, "targetPort": endpoint.port}},
@@ -1764,7 +1829,7 @@ func providerServiceEntry(route resolver.Route, ns string) unstructured.Unstruct
 	endpoint := providerEndpointForRoute(route)
 	return unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "networking.istio.io/v1", "kind": "ServiceEntry",
-		"metadata": labelledMetadata(providerServicePrefix+route.Provider, ns, "inference.opendatahub.io/external-provider", route.Provider),
+		"metadata": providerTransportMetadata(route, ns),
 		"spec": map[string]any{
 			"hosts": []any{endpoint.host}, "location": "MESH_EXTERNAL", "resolution": "DNS",
 			"ports": []any{map[string]any{"name": "https", "number": endpoint.port, "protocol": "HTTPS"}},
@@ -1847,19 +1912,22 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 	}
 	path := "/" + ns + "/" + route.ClientName
 	rules := make([]any, 0, len(routes)*2+2)
+	// Keyed by provider namespace and name: same-named providers from two
+	// namespaces each keep their rules.
 	seenProviders := map[string]bool{}
 	for _, candidate := range routes {
-		if seenProviders[candidate.Provider] {
+		service := candidate.ServiceName()
+		if seenProviders[service] {
 			continue
 		}
-		seenProviders[candidate.Provider] = true
+		seenProviders[service] = true
 		stableID := envelope.RouteStableID(candidate)
 		rules = append(rules, map[string]any{
 			"matches": []any{map[string]any{
 				"path":    map[string]any{"type": "PathPrefix", "value": path},
 				"headers": []any{map[string]any{"name": selectedProviderHeader, "type": "Exact", "value": stableID}},
 			}},
-			"backendRefs": []any{map[string]any{"name": providerServicePrefix + candidate.Provider, "port": providerPort(candidate)}},
+			"backendRefs": []any{map[string]any{"name": service, "port": providerPort(candidate)}},
 			"filters":     []any{providerURLRewrite(providerEndpointForRoute(candidate)), removeInternalRoutingHeaders()},
 			"timeouts":    map[string]any{"request": "300s"},
 		})
@@ -1871,7 +1939,7 @@ func modelHTTPRouteSet(routes []resolver.Route, ns, gateway, gatewayNS string) u
 				map[string]any{"name": "X-Gateway-Model-Name", "type": "Exact", "value": route.ClientName},
 				map[string]any{"name": selectedProviderHeader, "type": "Exact", "value": stableID},
 			}}},
-			"backendRefs": []any{map[string]any{"name": providerServicePrefix + candidate.Provider, "port": providerPort(candidate)}},
+			"backendRefs": []any{map[string]any{"name": service, "port": providerPort(candidate)}},
 			"filters":     []any{providerHostnameRewrite(providerEndpointForRoute(candidate)), removeInternalRoutingHeaders()},
 			"timeouts":    map[string]any{"request": "300s"},
 		})
