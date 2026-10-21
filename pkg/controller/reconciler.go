@@ -444,13 +444,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		if controllerutil.ContainsFinalizer(&model, attachmentFinalizer) {
 			// Extra attachments remove only their own objects: they never
 			// wait for a tenant or rebuild its shared state.
-			if err := r.removeDetachedRoutes(ctx, &model); err != nil {
-				return reconcile.Result{}, err
-			}
-			if err := r.collectDeletedAttachments(ctx); err != nil {
-				return reconcile.Result{}, err
-			}
-			if err := r.setAttachmentFinalizer(ctx, &model, false); err != nil {
+			if err := r.releaseAttachments(ctx, &model); err != nil {
 				return reconcile.Result{}, err
 			}
 			if !controllerutil.ContainsFinalizer(&model, externalModelFinalizer) {
@@ -468,10 +462,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	}
 	// With every gatewayRef removed, no attachment route, attachment
 	// finalizer or per-gateway result remains.
-	if err := r.removeDetachedRoutes(ctx, &model); err != nil {
-		return reconcile.Result{}, err
-	}
-	if err := r.setAttachmentFinalizer(ctx, &model, false); err != nil {
+	if err := r.releaseAttachments(ctx, &model); err != nil {
 		return reconcile.Result{}, err
 	}
 	if err := r.clearGatewayStatus(ctx, &model); err != nil {

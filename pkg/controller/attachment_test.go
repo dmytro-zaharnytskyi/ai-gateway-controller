@@ -1148,27 +1148,40 @@ func TestFailedDetachCleanupIsRetried(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err == nil {
 		t.Fatal("a failed cleanup must be retried")
 	}
-	// The route is deleted last, so the retry still finds what to collect.
+	// The route is withdrawn before its backends.
+	if attachmentRouteExists(t, r, model) {
+		t.Fatal("the attachment route outlives a failed backend cleanup")
+	}
+	// The attachment finalizer stays until the cleanup succeeds, so the retry
+	// collects what the deleted route used.
 	reconcileModel(t, r, model)
 	assertAttachmentWithdrawn(t, r)
 }
 
 func TestDeletingModelCollectsStateOfItsAlreadyDeletedRoute(t *testing.T) {
 	r, model := servedAttachmentFixture(t)
-	// Namespace or foreground deletion removes the route before the model's
-	// finalizer runs.
+	// Foreground deletion removes the model-owned route and selection sink
+	// before the model's finalizer runs; the provider transport is not
+	// model-owned.
 	route, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Delete(context.Background(), route); err != nil {
+	sink, err := getUnstructured(r, schema.GroupVersionKind{Version: "v1", Kind: "Service"}, "team", providerSelectionSinkName("chat"))
+	if err != nil {
 		t.Fatal(err)
+	}
+	for _, owned := range []client.Object{route, sink} {
+		if err := r.Delete(context.Background(), owned); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := r.Delete(context.Background(), getModel(t, r, model)); err != nil {
 		t.Fatal(err)
 	}
 	reconcileModel(t, r, model)
 	assertAttachmentWithdrawn(t, r)
+	assertTransportCollected(t, r, "team", "chat")
 }
 
 func TestDeletedCredentialSourceWithdrawsAttachment(t *testing.T) {

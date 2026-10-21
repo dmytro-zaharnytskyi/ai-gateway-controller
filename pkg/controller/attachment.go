@@ -1297,37 +1297,32 @@ func (r *Reconciler) listAttachmentRoutes(ctx context.Context, opts ...client.Li
 }
 
 // removeAttachmentRoute deletes the model's identity-verified HTTPRoute for
-// one Gateway together with the tenant's DestinationRules and credential
-// copies and the model namespace's transport no remaining attachment
-// references. They are collected first and the route is deleted last, so a
-// retry after a failure still finds the route. The tenant's overlay drops the
-// entry on its next publish; until then the entry is inert because no route
-// reaches it.
+// one Gateway, then the tenant's DestinationRules and credential copies and
+// the model namespace's transport no remaining attachment references. The
+// route goes first, so no accepted route is left without its backends. The
+// tenant's overlay drops the entry on its next publish; until then the entry
+// is inert because no route reaches it.
 func (r *Reconciler) removeAttachmentRoute(ctx context.Context, model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference) error {
 	route, err := r.getAttachmentRoute(ctx, model.Namespace, attachmentRouteName(model, gateway))
 	if err != nil || route == nil || !isAttachmentRoute(route, model, gateway) {
 		return err
 	}
-	withdrawn := map[types.NamespacedName]bool{client.ObjectKeyFromObject(route): true}
-	if err := r.gcAttachmentState(ctx, route.GetLabels()[tenant.LabelAttachmentTenant], withdrawn); err != nil {
-		return err
-	}
-	if err := r.gcAttachmentTransport(ctx, model.Namespace, withdrawn); err != nil {
-		return err
-	}
 	if err := client.IgnoreNotFound(r.Delete(ctx, route)); err != nil {
 		return fmt.Errorf("delete attachment HTTPRoute %s/%s: %w", route.GetNamespace(), route.GetName(), err)
 	}
-	return nil
+	// The informer cache may still list the deleted route.
+	if err := r.gcAttachmentState(ctx, route.GetLabels()[tenant.LabelAttachmentTenant], map[types.NamespacedName]bool{client.ObjectKeyFromObject(route): true}); err != nil {
+		return err
+	}
+	return r.gcAttachmentTransport(ctx, model.Namespace)
 }
 
 // gcAttachmentTransport deletes the provider Services and ServiceEntries and
-// the selection sinks no HTTPRoute in the namespace uses, other than the given
-// routes, being deleted. It collects only namespaces no Praxis tenant serves,
-// where only attachments create them; in a Praxis tenant namespace the
-// provider reconciler and the tenant-local path own them. Routes are read
-// live, so a route already deleted never counts.
-func (r *Reconciler) gcAttachmentTransport(ctx context.Context, namespace string, withdrawn map[types.NamespacedName]bool) error {
+// the selection sinks no HTTPRoute in the namespace uses any more. It collects
+// only namespaces no Praxis tenant serves, where only attachments create them;
+// in a Praxis tenant namespace the provider reconciler and the tenant-local
+// path own them. Routes are read live, so a route just deleted never counts.
+func (r *Reconciler) gcAttachmentTransport(ctx context.Context, namespace string) error {
 	mtc := tenant.NewMaasTenantConfig()
 	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: tenant.MaasTenantConfigInstanceName}, mtc); err == nil {
 		if tenant.UsesPraxis(mtc) {
@@ -1341,9 +1336,7 @@ func (r *Reconciler) gcAttachmentTransport(ctx context.Context, namespace string
 	if err := r.APIReader.List(ctx, routes, client.InNamespace(namespace)); err != nil {
 		return fmt.Errorf("list HTTPRoutes in %s: %w", namespace, err)
 	}
-	used := routeBackends(slices.DeleteFunc(routes.Items, func(route unstructured.Unstructured) bool {
-		return withdrawn[client.ObjectKeyFromObject(&route)]
-	}))
+	used := routeBackends(routes.Items)
 	for _, gvk := range []schema.GroupVersionKind{{Version: "v1", Kind: "ServiceList"}, {Group: "networking.istio.io", Version: "v1", Kind: "ServiceEntryList"}} {
 		list := &unstructured.UnstructuredList{}
 		list.SetGroupVersionKind(gvk)
@@ -1446,11 +1439,9 @@ func (r *Reconciler) gcAttachmentState(ctx context.Context, tenantNamespace stri
 }
 
 // collectDeletedAttachments deletes the credential copies and DestinationRules
-// of every tenant that no accepted attachment HTTPRoute references any more.
-// A deleting model runs it before releasing its attachment finalizer: a route
-// already removed by namespace or foreground deletion leaves nothing for
-// removeAttachmentRoute to find. The shared tenant overlay and route filter
-// are not rebuilt: their entries are inert once no route reaches them, and the
+// of every tenant that no accepted attachment HTTPRoute references any more;
+// see releaseAttachments. The shared tenant overlay and route filter are not
+// rebuilt: their entries are inert once no route reaches them, and the
 // tenant's next publish drops them.
 func (r *Reconciler) collectDeletedAttachments(ctx context.Context) error {
 	if r.Namespace != "" {
@@ -1503,6 +1494,28 @@ func (r *Reconciler) removeDetachedRoutes(ctx context.Context, model *v1alpha1.E
 		}
 	}
 	return nil
+}
+
+// releaseAttachments removes every attachment of a deleting model, or of one
+// whose gatewayRefs are all removed, then releases its attachment finalizer.
+// The routes go first; the sweeps then collect what they used, including what
+// routes already removed by namespace or foreground deletion left behind. The
+// finalizer stays until both succeed, so a failed cleanup is retried without
+// needing the route.
+func (r *Reconciler) releaseAttachments(ctx context.Context, model *v1alpha1.ExternalModel) error {
+	if err := r.removeDetachedRoutes(ctx, model); err != nil {
+		return err
+	}
+	if !controllerutil.ContainsFinalizer(model, attachmentFinalizer) {
+		return nil
+	}
+	if err := r.collectDeletedAttachments(ctx); err != nil {
+		return err
+	}
+	if err := r.gcAttachmentTransport(ctx, model.Namespace); err != nil {
+		return err
+	}
+	return r.setAttachmentFinalizer(ctx, model, false)
 }
 
 // setAttachmentFinalizer adds or removes the attachment finalizer.
