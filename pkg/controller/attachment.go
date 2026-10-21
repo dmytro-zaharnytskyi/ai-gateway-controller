@@ -1440,7 +1440,9 @@ func (r *Reconciler) gcAttachmentState(ctx context.Context, tenantNamespace stri
 
 // collectDeletedAttachments deletes the credential copies and DestinationRules
 // of every tenant that no accepted attachment HTTPRoute references any more;
-// see releaseAttachments. The shared tenant overlay and route filter are not
+// see releaseAttachments. It also runs once a model is gone, for a model
+// deleted without the attachment finalizer, such as one created before it
+// existed. The shared tenant overlay and route filter are not
 // rebuilt: their entries are inert once no route reaches them, and the
 // tenant's next publish drops them.
 func (r *Reconciler) collectDeletedAttachments(ctx context.Context) error {

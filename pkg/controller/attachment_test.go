@@ -1184,6 +1184,30 @@ func TestDeletingModelCollectsStateOfItsAlreadyDeletedRoute(t *testing.T) {
 	assertTransportCollected(t, r, "team", "chat")
 }
 
+func TestModelDeletedWithoutAttachmentFinalizerCollectsItsState(t *testing.T) {
+	r, model := servedAttachmentFixture(t)
+	// A model created before the attachment finalizer existed is deleted at
+	// once; Kubernetes then garbage collects its route.
+	got := getModel(t, r, model)
+	got.Finalizers = nil
+	if err := r.Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	route, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), route); err != nil {
+		t.Fatal(err)
+	}
+	// The route deletion requeues the deleted model.
+	reconcileModel(t, r, model)
+	assertAttachmentWithdrawn(t, r)
+}
+
 func TestDeletedCredentialSourceWithdrawsAttachment(t *testing.T) {
 	r, model := servedAttachmentFixture(t)
 	_, secret := attachmentProvider("team")

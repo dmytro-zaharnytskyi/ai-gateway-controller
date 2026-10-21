@@ -434,7 +434,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	}
 	var model v1alpha1.ExternalModel
 	if err := r.Get(ctx, req.NamespacedName, &model); err != nil {
-		return reconcile.Result{}, client.IgnoreNotFound(err)
+		if apierrors.IsNotFound(err) {
+			// A deleted model's attachment routes are garbage collected with
+			// it, and each route deletion requeues it here.
+			return reconcile.Result{}, r.collectDeletedAttachments(ctx)
+		}
+		return reconcile.Result{}, err
 	}
 	// Deletion must not depend on MaasTenantConfig or its AITenant still being
 	// present. Those objects can disappear first during a tenant teardown.
