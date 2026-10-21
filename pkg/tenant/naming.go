@@ -16,6 +16,8 @@ limitations under the License.
 
 package tenant
 
+import "knative.dev/pkg/kmeta"
+
 // ID returns the resource-naming tenant identifier for an AITenant name.
 // The default/legacy AITenant keeps the empty identifier so its resources
 // stay unsuffixed (mirrors maas-controller's tenantreconcile.TenantIdentifierFor
@@ -33,7 +35,7 @@ func ResourceName(base, tenantID string) string {
 	if tenantID == "" {
 		return base
 	}
-	return base + "-" + tenantID
+	return kmeta.ChildName(base+"-", tenantID)
 }
 
 func PayloadProcessingDeploymentName(tenantID string) string {

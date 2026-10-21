@@ -196,7 +196,3 @@ type ExternalModelList struct {
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []ExternalModel `json:"items"`
 }
-
-func init() {
-	SchemeBuilder.Register(&ExternalModel{}, &ExternalModelList{})
-}

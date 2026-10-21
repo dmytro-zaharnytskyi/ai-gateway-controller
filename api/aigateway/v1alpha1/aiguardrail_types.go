@@ -194,7 +194,3 @@ type AIGuardrailList struct {
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []AIGuardrail `json:"items"`
 }
-
-func init() {
-	SchemeBuilder.Register(&AIGuardrail{}, &AIGuardrailList{})
-}
