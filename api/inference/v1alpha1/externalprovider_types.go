@@ -92,7 +92,3 @@ type ExternalProviderList struct {
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []ExternalProvider `json:"items"`
 }
-
-func init() {
-	SchemeBuilder.Register(&ExternalProvider{}, &ExternalProviderList{})
-}

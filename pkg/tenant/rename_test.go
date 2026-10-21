@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-openapi/testify/v2/assert"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -501,7 +502,7 @@ func TestRenameEnvoyFilterMissingClusterPatchErrors(t *testing.T) {
 	}
 }
 
-func TestRenameErrorsWhenComputedNameExceeds63Characters(t *testing.T) {
+func TestRenameShortensTo63Characters(t *testing.T) {
 	// "payload-processing-plugins-" (28 chars) + a 40-char tenant ID = 68,
 	// past the Kubernetes 63-character object name limit.
 	longTenantID := strings.Repeat("a", 40)
@@ -511,9 +512,10 @@ func TestRenameErrorsWhenComputedNameExceeds63Characters(t *testing.T) {
 		"metadata":   map[string]any{"name": PayloadProcessingPluginsConfigMapName},
 	}}}
 
-	if _, err := Rename(in, longTenantID, "istio-system"); err == nil {
-		t.Fatal("expected an error for a computed name over 63 characters")
-	}
+	out, err := Rename(in, longTenantID, "istio-system")
+	assert.NoError(t, err, "Rename returned an unexpected error", "err", err)
+	assert.Len(t, out, 1, "Rename output isn't of the expected length")
+	assert.Len(t, out[0].GetName(), 63, "Rename didn't shorten to 63 characters")
 }
 
 func TestRenameDoesNotMutateInputSlice(t *testing.T) {
