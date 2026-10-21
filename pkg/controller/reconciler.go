@@ -445,18 +445,24 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 		return reconcile.Result{}, nil
 	}
-	if err := r.collectProviderTransport(ctx, model.Namespace); err != nil {
-		return reconcile.Result{}, err
+	result, err := r.reconcileModel(ctx, req, &model)
+	// Provider transport is collected once the routes that used it are withdrawn.
+	if collectErr := r.collectProviderTransport(ctx, model.Namespace); collectErr != nil {
+		err = errors.Join(err, collectErr)
 	}
+	return result, err
+}
+
+func (r *Reconciler) reconcileModel(ctx context.Context, req reconcile.Request, model *v1alpha1.ExternalModel) (reconcile.Result, error) {
 	if len(model.Spec.GatewayRefs) > 0 {
-		return r.reconcileAttachedModel(ctx, &model)
+		return r.reconcileAttachedModel(ctx, model)
 	}
 	// With every gatewayRef removed, no attachment route remains.
-	if err := r.removeDetachedRoutes(ctx, &model); err != nil {
+	if err := r.removeDetachedRoutes(ctx, model); err != nil {
 		return reconcile.Result{}, err
 	}
-	return r.reconcileHomeModel(ctx, req, &model, func(ready bool, reason, message string, env *envelope.Envelope) error {
-		return r.updateModelStatus(ctx, &model, ready, reason, message, env)
+	return r.reconcileHomeModel(ctx, req, model, func(ready bool, reason, message string, env *envelope.Envelope) error {
+		return r.updateModelStatus(ctx, model, ready, reason, message, env)
 	})
 }
 

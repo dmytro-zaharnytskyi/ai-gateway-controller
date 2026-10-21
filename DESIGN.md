@@ -403,7 +403,8 @@ omitted or equal namespace stays local and needs no grant.
   both keep their rules and candidates.
 - **Credentials.** Inherited auth uses the provider's Secret in the provider
   namespace; a model override uses the Secret in the model namespace, with no
-  fallback to a same-named provider-namespace Secret. Secrets outside the
+  fallback to a same-named provider-namespace Secret. The provider's own Secret
+  is required only when a reference inherits it. Secrets outside the
   tenant namespace are delivered as credential copies, as for attachments.
   The provider's transport lives in the model namespace, so a grant trusts it:
   whoever can edit Services or HTTPRoutes there can redirect requests that
@@ -411,8 +412,8 @@ omitted or equal namespace stays local and needs no grant.
 - **Tenant-local models.** A tenant's own model referencing another
   namespace's provider gets the attachment DestinationRule and copy, recorded
   on its HTTPRoute so collection keeps them; its overlay candidate is kept as
-  the tenant's own. Model-namespace transport is collected once no
-  `ExternalModel` in the namespace references the provider.
+  the tenant's own. Model-namespace transport is collected after the reconcile,
+  once no HTTPRoute in the namespace uses it.
 
 ## Scope
 

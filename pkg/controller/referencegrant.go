@@ -74,21 +74,25 @@ func (r *Reconciler) referencePermitted(ctx context.Context, modelNamespace stri
 // Like an attachment's providers they are validated here, not through their
 // own namespace's tenant. A missing or deleting provider is omitted like an
 // unpermitted one, so a reference never discloses whether a provider exists.
+// The provider's own credential is required only when a reference inherits
+// it; an override's model-namespace Secret is validated with its route.
 func (r *Reconciler) foreignProviders(ctx context.Context, modelNamespace string, models []*v1alpha1.ExternalModel) ([]*v1alpha1.ExternalProvider, error) {
 	if r.Namespace != "" {
 		// A single-namespace controller reads no other namespace.
 		return nil, nil
 	}
+	// Whether a reference to each provider inherits its auth.
 	refs := map[types.NamespacedName]bool{}
 	for _, m := range models {
 		for _, ref := range m.Spec.ExternalProviderRefs {
 			if ref.Ref.Namespace != "" && ref.Ref.Namespace != modelNamespace {
-				refs[types.NamespacedName{Namespace: ref.Ref.Namespace, Name: ref.Ref.Name}] = true
+				key := types.NamespacedName{Namespace: ref.Ref.Namespace, Name: ref.Ref.Name}
+				refs[key] = refs[key] || ref.Auth == nil
 			}
 		}
 	}
 	providers := make([]*v1alpha1.ExternalProvider, 0, len(refs))
-	for key := range refs {
+	for key, inherited := range refs {
 		if permitted, err := r.referencePermitted(ctx, modelNamespace, key); err != nil || !permitted {
 			if err != nil {
 				return nil, err
@@ -106,7 +110,7 @@ func (r *Reconciler) foreignProviders(ctx context.Context, modelNamespace string
 			continue
 		}
 		err := r.validateProvider(ctx, &provider)
-		if err == nil {
+		if err == nil && inherited {
 			err = r.validateProviderCredential(ctx, &provider)
 		}
 		if transientReadError(err) {
@@ -214,20 +218,11 @@ func (r *Reconciler) verifyProviderTransport(ctx context.Context, resources []un
 }
 
 // collectProviderTransport deletes the namespace's transport for providers in
-// other namespaces that no ExternalModel there references any more. A revoked
-// grant keeps it until then: without route rules, overlay entries,
-// DestinationRules and credentials it serves nothing.
+// other namespaces that no HTTPRoute there uses any more. It runs after the
+// reconcile withdrew the routes, which are read live, so a route stops using
+// its backend before the backend is deleted.
 func (r *Reconciler) collectProviderTransport(ctx context.Context, namespace string) error {
-	var models v1alpha1.ExternalModelList
-	if err := r.List(ctx, &models, client.InNamespace(namespace)); err != nil {
-		return fmt.Errorf("list ExternalModels in %s: %w", namespace, err)
-	}
-	referenced := map[string]bool{}
-	for i := range models.Items {
-		for _, ref := range models.Items[i].Spec.ExternalProviderRefs {
-			referenced[ref.Ref.Namespace+"/"+ref.Ref.Name] = true
-		}
-	}
+	var transport []unstructured.Unstructured
 	for _, gvk := range []schema.GroupVersionKind{
 		{Version: "v1", Kind: "ServiceList"},
 		{Group: "networking.istio.io", Version: "v1", Kind: "ServiceEntryList"},
@@ -238,14 +233,35 @@ func (r *Reconciler) collectProviderTransport(ctx context.Context, namespace str
 			client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller"}, client.HasLabels{labelProviderNamespace}); err != nil {
 			return fmt.Errorf("list provider transport in %s: %w", namespace, err)
 		}
-		for i := range list.Items {
-			identity := list.Items[i].GetAnnotations()[annotationAttachmentIdentity]
-			if identity == "" || referenced[identity] {
-				continue
+		transport = append(transport, list.Items...)
+	}
+	if len(transport) == 0 {
+		return nil
+	}
+	routes := &unstructured.UnstructuredList{}
+	routes.SetGroupVersionKind(httpRouteGVK.GroupVersion().WithKind("HTTPRouteList"))
+	if err := r.APIReader.List(ctx, routes, client.InNamespace(namespace)); err != nil {
+		return fmt.Errorf("list HTTPRoutes in %s: %w", namespace, err)
+	}
+	used := map[string]bool{}
+	for i := range routes.Items {
+		rules, _, _ := unstructured.NestedSlice(routes.Items[i].Object, "spec", "rules")
+		for _, raw := range rules {
+			rule, _ := raw.(map[string]any)
+			backends, _, _ := unstructured.NestedSlice(rule, "backendRefs")
+			for _, raw := range backends {
+				backend, _ := raw.(map[string]any)
+				name, _, _ := unstructured.NestedString(backend, "name")
+				used[name] = true
 			}
-			if err := client.IgnoreNotFound(r.Delete(ctx, &list.Items[i])); err != nil {
-				return fmt.Errorf("delete provider transport %s/%s: %w", namespace, list.Items[i].GetName(), err)
-			}
+		}
+	}
+	for i := range transport {
+		if used[transport[i].GetName()] || transport[i].GetAnnotations()[annotationAttachmentIdentity] == "" {
+			continue
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, &transport[i])); err != nil {
+			return fmt.Errorf("delete provider transport %s/%s: %w", namespace, transport[i].GetName(), err)
 		}
 	}
 	return nil

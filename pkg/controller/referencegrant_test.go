@@ -368,3 +368,52 @@ func TestLocalProviderCannotTakeOverHashedTransport(t *testing.T) {
 		t.Fatalf("hashed Service = %s %#v, want it unchanged", host, service.GetAnnotations())
 	}
 }
+
+func TestProviderTransportOutlivesTheRouteThatUsesIt(t *testing.T) {
+	localProvider, localSecret := attachmentProvider("tenant-b")
+	sharedProvider, sharedSecret := attachmentProvider("shared")
+	model := referenceProvider(attachmentModel("chat", "tenant-b", "chat-model", time.Unix(100, 0)), "shared")
+	objects := append([]client.Object{localProvider, localSecret, sharedProvider, sharedSecret, model, referenceGrant("shared", "tenant-b", "")},
+		attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	serviceName := foreignRoute("tenant-b", "shared").ServiceName()
+
+	got := getModel(t, r, model)
+	got.Spec.ExternalProviderRefs[0].Ref.Namespace = ""
+	if err := r.Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	// The model no longer references the provider, but its route still does.
+	if err := r.collectProviderTransport(context.Background(), "tenant-b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := getUnstructured(r, serviceGVK, "tenant-b", serviceName); err != nil {
+		t.Fatalf("provider Service deleted while a route uses it: %v", err)
+	}
+	reconcileModel(t, r, model)
+	if _, err := getUnstructured(r, serviceGVK, "tenant-b", serviceName); !apierrors.IsNotFound(err) {
+		t.Fatalf("provider Service remains after its route stopped using it: %v", err)
+	}
+}
+
+func TestOverrideServesWithoutTheProviderSecret(t *testing.T) {
+	// The shared provider has no credential of its own; the model brings one.
+	sharedProvider, _ := attachmentProvider("shared")
+	_, modelSecret := attachmentProvider("team")
+	model := referenceProvider(attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB), "shared")
+	model.Spec.ExternalProviderRefs[0].Auth = &v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "openai-key"}}
+	objects := []client.Object{sharedProvider, modelSecret, model, referenceGrant("shared", "team", "")}
+	r := attachmentReconciler(t, append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)...)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("status = %q/%q %q", got.Status.Phase, readyReason(got), readyMessage(got))
+	}
+	candidates := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates
+	if len(candidates) != 1 || candidates[0].Credential.SecretRef.Name != credentialCopyName("tenant-b", "team", "openai-key", "api-key") {
+		t.Fatalf("overlay candidates = %#v, want the model-namespace credential", candidates)
+	}
+}
