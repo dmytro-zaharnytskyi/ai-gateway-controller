@@ -559,7 +559,7 @@ alone:
   visibly (event, status, metric) once status is written.
 - Whether `payload-processing-reader`'s RBAC needs to grow once more Praxis
   filters land (today's rules cover exactly the `request_id` /
-  `model_to_header` filter chains in use).
+  `json_body` filter chains in use).
 - `Params.MaaSAPIRouteName`'s fidelity is unverified against a live
   maas-api `HTTPRoute` — revisit once this controller integrates with one.
 - End-to-end verification of the `ai-gateway-operator` wiring described in
