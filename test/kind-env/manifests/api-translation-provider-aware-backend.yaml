@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-translation-provider-aware-mock
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: api-translation-kind-e2e
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-translation-provider-aware-mock
+  template:
+    metadata:
+      labels:
+        app: api-translation-provider-aware-mock
+        app.kubernetes.io/managed-by: api-translation-kind-e2e
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: provider-recorder
+          image: provider-recorder:issue28-kind
+          imagePullPolicy: Never
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          env:
+            - name: PROVIDER_NAME
+              value: provider-aware
+            - name: RESPONSE_MODE
+              value: provider-aware
+            - name: EXPECTED_HOSTS
+              value: provider-translation-ext.maas-system.svc.cluster.local,provider-translation-openai-ext.maas-system.svc.cluster.local
+            - name: ENABLE_TEST_OBSERVATIONS
+              value: "true"
+            - name: OPENAI_CREDENTIAL_FILE
+              value: /etc/provider-credentials/openai/api-key
+            - name: ANTHROPIC_CREDENTIAL_FILE
+              value: /etc/provider-credentials/anthropic/api-key
+            - name: STREAM_EVENT_DELAY
+              value: 400ms
+            - name: OVERLAY_RELOAD_STREAM_EVENT_DELAY
+              # Keep the marked reload stream open through Kubernetes' projected
+              # ConfigMap refresh and ExtProc's overlay reload.
+              value: 18s
+          ports:
+            - name: https
+              containerPort: 8443
+          readinessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /healthz
+              port: https
+            periodSeconds: 2
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/provider/tls
+              readOnly: true
+            - name: observations
+              mountPath: /var/run/provider-observations
+            - name: openai-credential
+              mountPath: /etc/provider-credentials/openai
+              readOnly: true
+            - name: anthropic-credential
+              mountPath: /etc/provider-credentials/anthropic
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: provider-translation-tls
+        - name: openai-credential
+          secret:
+            secretName: api-translation-openai-backend-credential
+            items:
+              - key: api-key
+                path: api-key
+        - name: anthropic-credential
+          secret:
+            secretName: api-translation-anthropic-backend-credential
+            items:
+              - key: api-key
+                path: api-key
+        - name: observations
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-translation-ext
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: api-translation-kind-e2e
+spec:
+  selector:
+    app: api-translation-provider-aware-mock
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-translation-openai-ext
+  namespace: maas-system
+  labels:
+    app.kubernetes.io/managed-by: api-translation-kind-e2e
+spec:
+  selector:
+    app: api-translation-provider-aware-mock
+  ports:
+    - name: https
+      port: 443
+      targetPort: https

@@ -36,13 +36,18 @@ data:
     filter_chains:
       - name: main
         filters:
-          - filter: json_body_field
-            field: model
-            header: X-Model
+          - filter: json_body
+            conditions:
+            - unless:
+              headers_present: ["X-Gateway-Model-Name"]
+            request_extract:
+              - pointer: /model
+                header: X-Gateway-Model-Name
+            on_invalid: continue
 
           - filter: intelligent_route
             overlay_file: /etc/praxis/routing/routing-overlay.json
-            model_header: X-Model
+            model_header: X-Gateway-Model-Name
             reload:
               enabled: true
               debounce_ms: 500

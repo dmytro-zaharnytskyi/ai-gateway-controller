@@ -92,6 +92,9 @@ type Candidate struct {
 	// group zero is emitted instead of being omitted by encoding/json.
 	SelectionGroup *uint32     `json:"selection_group,omitempty"`
 	Credential     *Credential `json:"credential,omitempty"`
+	APIFormat      string      `json:"api_format,omitempty"`
+	Path           string      `json:"path,omitempty"`
+	TargetModel    string      `json:"target_model,omitempty"`
 }
 
 // Provenance records who rendered this envelope and from what source state.
@@ -155,6 +158,10 @@ type Options struct {
 	ProducerVersion string
 	// RenderedAt is injected (RFC3339) to keep Render deterministic under test.
 	RenderedAt string
+	// IncludeProviderProfiles enables the newer Praxis AI profile fields used
+	// for API translation. Keep this false for flag-off overlays so older
+	// intelligent_route consumers receive the same candidate shape as main.
+	IncludeProviderProfiles bool
 	// PreservedCandidates are already-published candidates kept verbatim
 	// ahead of the rendered routes. A tenant's own candidates are preserved
 	// this way when only contributions from other namespaces change.
@@ -214,6 +221,11 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 				Site:     scope.LocalSite,
 				Fresh:    true,
 			}
+			if opts.IncludeProviderProfiles {
+				cand.APIFormat = r.APIFormat
+				cand.Path = r.Path
+				cand.TargetModel = r.TargetModel
+			}
 			if group, ok := selection.groups[selectionRouteKey{modelRef: m.ModelRef, model: r.Model, provider: r.Provider, cluster: r.Cluster}]; ok {
 				group := group
 				cand.SelectionGroup = &group
@@ -230,6 +242,16 @@ func Render(routes *resolver.ResolvedRouteSet, scope Scope, prev Revision, opts 
 				}
 			}
 			candidates = append(candidates, cand)
+		}
+	}
+	if !opts.IncludeProviderProfiles {
+		// Preserved candidates may have been published while translation was
+		// enabled. Strip the versioned profile fields before hashing a flag-off
+		// overlay so disabling the feature returns to the main wire contract.
+		for i := range candidates {
+			candidates[i].APIFormat = ""
+			candidates[i].Path = ""
+			candidates[i].TargetModel = ""
 		}
 	}
 

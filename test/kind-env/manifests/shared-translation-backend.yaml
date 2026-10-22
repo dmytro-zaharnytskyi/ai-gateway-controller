@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-translation-openai-mock
+  namespace: models-as-a-service
+  labels:
+    app.kubernetes.io/managed-by: api-translation-kind-e2e
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-translation-openai-mock
+  template:
+    metadata:
+      labels:
+        app: api-translation-openai-mock
+        app.kubernetes.io/managed-by: api-translation-kind-e2e
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: openai-mock
+          image: provider-recorder:issue28-kind
+          imagePullPolicy: Never
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          env:
+            - name: PROVIDER_NAME
+              value: translation
+            - name: RESPONSE_MODE
+              value: openai
+            - name: TLS_MODE
+              value: http
+            - name: LISTEN_ADDR
+              value: :8080
+            - name: CREDENTIAL_REQUIRED
+              value: "false"
+            - name: ENABLE_TEST_OBSERVATIONS
+              value: "true"
+            - name: STREAM_EVENT_DELAY
+              value: 1.1s
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+          volumeMounts:
+            - name: observations
+              mountPath: /var/run/provider-observations
+      volumes:
+        - name: observations
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: translation-openai-mock
+  namespace: models-as-a-service
+  labels:
+    app.kubernetes.io/managed-by: api-translation-kind-e2e
+spec:
+  selector:
+    app: api-translation-openai-mock
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

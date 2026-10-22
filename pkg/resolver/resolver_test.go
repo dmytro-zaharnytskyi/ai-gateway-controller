@@ -90,6 +90,194 @@ func TestResolveRejectsDuplicateActiveProviderBindings(t *testing.T) {
 	}
 }
 
+func TestResolveGatesAnthropicMessagesOnTenantPermission(t *testing.T) {
+	modelRef := ref("prov-anthropic", "claude", "/v1/messages")
+	modelRef.APIFormat = "messages"
+	model := model("ns1", "my-model", modelRef)
+	provider := provider("ns1", "prov-anthropic", PhaseReady, "api.anthropic.com", nil)
+	provider.Spec.Provider = "anthropic"
+	set, err := Resolve(
+		[]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider},
+	)
+	if !errors.Is(err, ErrNoRoutes) || len(set.Models) != 1 || len(set.Models[0].Routes) != 0 || len(set.Models[0].Skips) != 1 || set.Models[0].Skips[0].Reason != SkipTranslationDisabled {
+		t.Fatalf("Resolve() = (%+v, %v), want no route with APITranslationDisabled skip", set, err)
+	}
+	enabled, err := ResolveWithAPITranslation([]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider}, true)
+	if err != nil || len(enabled.Routes()) != 1 || enabled.Routes()[0].APIFormat != "messages" {
+		t.Fatalf("ResolveWithAPITranslation() = (%+v, %v), want one Messages candidate", enabled, err)
+	}
+}
+
+func TestAPITranslationPermissionPreservesOpenAIAndGatesAnthropicSelection(t *testing.T) {
+	openAIRef := ref("openai", "gpt-mock", "/v1/chat/completions")
+	messageRef := ref("anthropic", "claude-mock", "/v1/messages")
+	messageRef.APIFormat = "messages"
+	model := model("ns1", "model", openAIRef, messageRef)
+	providers := []*v1alpha1.ExternalProvider{
+		provider("ns1", "openai", PhaseReady, "openai.example.com", nil),
+		provider("ns1", "anthropic", PhaseReady, "anthropic.example.com", nil),
+	}
+	providers[1].Spec.Provider = "anthropic"
+
+	defaultOff, err := ResolveWithAPITranslation([]*v1alpha1.ExternalModel{model}, providers, false)
+	if err != nil || len(defaultOff.Routes()) != 1 || defaultOff.Routes()[0].Provider != "openai" {
+		t.Fatalf("default-off routes = %+v, err=%v; want OpenAI pass-through only", defaultOff, err)
+	}
+	if len(defaultOff.Models[0].Skips) != 1 || defaultOff.Models[0].Skips[0].Reason != SkipTranslationDisabled {
+		t.Fatalf("default-off skips = %+v, want the Messages candidate gated by permission", defaultOff.Models[0].Skips)
+	}
+
+	enabled, err := ResolveWithAPITranslation([]*v1alpha1.ExternalModel{model}, providers, true)
+	if err != nil || len(enabled.Routes()) != 2 {
+		t.Fatalf("enabled routes = %+v, err=%v; want OpenAI and Anthropic candidates", enabled, err)
+	}
+	if enabled.Routes()[0].Provider != "openai" || enabled.Routes()[1].Provider != "anthropic" {
+		t.Fatalf("enabled route order = %+v; permission must not choose a translator", enabled.Routes())
+	}
+}
+
+func TestResolveRejectsUnqualifiedActiveProviderBindings(t *testing.T) {
+	cases := []struct {
+		name         string
+		providerType string
+		apiFormat    string
+	}{
+		{name: "Azure OpenAI", providerType: "azure-openai", apiFormat: "openai-chat"},
+		{name: "Vertex OpenAI", providerType: "vertex-openai", apiFormat: "openai-chat"},
+		{name: "Bedrock OpenAI", providerType: "bedrock-openai", apiFormat: "openai-chat"},
+		{name: "custom provider", providerType: "custom", apiFormat: "openai-chat"},
+		{name: "custom format", providerType: "openai", apiFormat: "vendor-chat"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			modelRef := ref("provider", "target", "/v1/chat/completions")
+			modelRef.APIFormat = tc.apiFormat
+			model := model("ns1", "model", modelRef)
+			provider := provider("ns1", "provider", PhaseReady, "provider.example.com", nil)
+			provider.Spec.Provider = tc.providerType
+
+			_, err := ResolveWithAPITranslation([]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider}, true)
+			if !errors.Is(err, ErrProviderCapabilityUnsupported) {
+				t.Fatalf("ResolveWithAPITranslation() error = %v, want ErrProviderCapabilityUnsupported", err)
+			}
+			for _, want := range []string{tc.providerType, tc.apiFormat, "provider ref provider"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not identify %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestUnsupportedMessagesBindingFailsClosedBeforeTranslationPermission(t *testing.T) {
+	cases := []struct {
+		name         string
+		providerType string
+	}{
+		{name: "Azure OpenAI", providerType: "azure-openai"},
+		{name: "Vertex OpenAI", providerType: "vertex-openai"},
+		{name: "Bedrock OpenAI", providerType: "bedrock-openai"},
+		{name: "custom provider", providerType: "custom"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			modelRef := ref("provider", "target", "/v1/messages")
+			modelRef.APIFormat = "messages"
+			model := model("ns1", "model", modelRef)
+			provider := provider("ns1", "provider", PhaseReady, "provider.example.com", nil)
+			provider.Spec.Provider = tc.providerType
+
+			set, err := ResolveWithAPITranslation([]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider}, false)
+			if !errors.Is(err, ErrProviderCapabilityUnsupported) {
+				t.Fatalf("ResolveWithAPITranslation(default-off) error = %v, want ErrProviderCapabilityUnsupported", err)
+			}
+			if len(set.Models) != 1 || len(set.Models[0].Routes) != 0 || len(set.Models[0].Skips) != 1 || set.Models[0].Skips[0].Reason != SkipAPIFormatUnsupported {
+				t.Fatalf("ResolveWithAPITranslation(default-off) result = %+v, want APIFormatUnsupported diagnostic without a publishable route", set)
+			}
+			if !strings.Contains(err.Error(), string(SkipAPIFormatUnsupported)) {
+				t.Fatalf("ResolveWithAPITranslation(default-off) error = %v, want reported %s reason", err, SkipAPIFormatUnsupported)
+			}
+		})
+	}
+}
+
+func TestResolveAllReportsUnsupportedMessagesSeparatelyFromTranslationDisabled(t *testing.T) {
+	modelRef := withWeight(ref("provider", "target", "/v1/messages"), 0)
+	modelRef.APIFormat = "messages"
+	model := model("ns1", "model", modelRef)
+	provider := provider("ns1", "provider", PhaseReady, "provider.example.com", nil)
+	provider.Spec.Provider = "custom"
+
+	set, err := ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider}, false)
+	if !errors.Is(err, ErrNoRoutes) || len(set.Models) != 1 || len(set.Models[0].Routes) != 0 || len(set.Models[0].Skips) != 1 {
+		t.Fatalf("ResolveAllWithAPITranslation(default-off) = (%+v, %v), want one skipped unsupported candidate", set, err)
+	}
+	if got := set.Models[0].Skips[0].Reason; got != SkipAPIFormatUnsupported {
+		t.Fatalf("unsupported Messages candidate skip reason = %q, want %q", got, SkipAPIFormatUnsupported)
+	}
+}
+
+func TestResolveAllSkipsUnqualifiedDisabledBinding(t *testing.T) {
+	active := ref("active", "target-a", "/v1/chat/completions")
+	disabled := withWeight(ref("azure", "target-b", "/v1/chat/completions"), 0)
+	disabled.APIFormat = "openai-chat"
+	model := model("ns1", "model", active, disabled)
+	providers := []*v1alpha1.ExternalProvider{
+		provider("ns1", "active", PhaseReady, "openai.example.com", nil),
+		provider("ns1", "azure", PhaseReady, "azure.example.com", nil),
+	}
+	providers[1].Spec.Provider = "azure-openai"
+
+	set, err := ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{model}, providers, true)
+	if err != nil {
+		t.Fatalf("ResolveAllWithAPITranslation() error = %v, want inactive unqualified binding to be omitted", err)
+	}
+	if got := len(set.Routes()); got != 1 || set.Routes()[0].Provider != "active" {
+		t.Fatalf("preloaded routes = %+v, want only active qualified provider", set.Routes())
+	}
+	if len(set.Models[0].Skips) != 1 || set.Models[0].Skips[0].Reason != SkipAPIFormatUnsupported {
+		t.Fatalf("inactive unqualified binding skips = %+v, want APIFormatUnsupported", set.Models[0].Skips)
+	}
+}
+
+func TestResolveAllSkipsNegativeWeightUnsupportedBinding(t *testing.T) {
+	active := ref("active", "target-a", "/v1/chat/completions")
+	disabled := withWeight(ref("azure", "target-b", "/v1/chat/completions"), -1)
+	model := model("ns1", "model", active, disabled)
+	providers := []*v1alpha1.ExternalProvider{
+		provider("ns1", "active", PhaseReady, "openai.example.com", nil),
+		provider("ns1", "azure", PhaseReady, "azure.example.com", nil),
+	}
+	providers[1].Spec.Provider = "azure-openai"
+
+	set, err := ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{model}, providers, true)
+	if err != nil {
+		t.Fatalf("ResolveAllWithAPITranslation() error = %v, want negative-weight unsupported binding treated as disabled", err)
+	}
+	if got := len(set.Routes()); got != 1 || set.Routes()[0].Provider != "active" {
+		t.Fatalf("preloaded routes = %+v, want only the active qualified provider", set.Routes())
+	}
+	if len(set.Models[0].Skips) != 1 || set.Models[0].Skips[0].Reason != SkipAPIFormatUnsupported {
+		t.Fatalf("negative-weight unsupported binding skips = %+v, want APIFormatUnsupported", set.Models[0].Skips)
+	}
+}
+
+func TestResolveAllDoesNotPreloadMessagesWhenTenantPermissionIsOff(t *testing.T) {
+	modelRef := withWeight(ref("prov-anthropic", "claude", "/v1/messages"), 0)
+	modelRef.APIFormat = "messages"
+	model := model("ns1", "my-model", modelRef)
+	provider := provider("ns1", "prov-anthropic", PhaseReady, "api.anthropic.com", nil)
+	provider.Spec.Provider = "anthropic"
+
+	set, err := ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider}, false)
+	if !errors.Is(err, ErrNoRoutes) || len(set.Models) != 1 || len(set.Models[0].Routes) != 0 || len(set.Models[0].Skips) != 1 {
+		t.Fatalf("ResolveAllWithAPITranslation() = (%+v, %v), want no preloaded Messages candidate", set, err)
+	}
+	if set.Models[0].Skips[0].Reason != SkipTranslationDisabled {
+		t.Fatalf("Messages candidate skip reason = %q, want %q", set.Models[0].Skips[0].Reason, SkipTranslationDisabled)
+	}
+}
+
 func TestResolveAllIncludesUnselectedProviderBindings(t *testing.T) {
 	m := model("ns1", "my-model",
 		withWeight(ref("prov-a", "a", "/v1"), 1),

@@ -7,3 +7,7 @@ kind: Kustomization
 resources:
   - ../../../praxis-extproc/overlays/odh
   - external-model-envoy-filter.yaml
+
+# The shared filter's response mode is selected by the tenant reconciler from
+# MaasTenantConfig.spec.apiTranslation.enabled. Keep the rendered default
+# BUFFERED so tenants without translation permission retain the existing mode.

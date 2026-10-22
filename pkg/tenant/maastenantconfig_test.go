@@ -92,6 +92,39 @@ func TestUsesPraxis(t *testing.T) {
 	}
 }
 
+func TestAPITranslationEnabled(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   any
+		present bool
+		want    bool
+		wantErr bool
+	}{
+		{name: "absent defaults off"},
+		{name: "empty settings defaults off", present: true, value: map[string]any{}},
+		{name: "explicit false", present: true, value: map[string]any{"enabled": false}},
+		{name: "explicit true", present: true, value: map[string]any{"enabled": true}, want: true},
+		{name: "null enabled is malformed", present: true, value: map[string]any{"enabled": nil}, wantErr: true},
+		{name: "string enabled is malformed", present: true, value: map[string]any{"enabled": "true"}, wantErr: true},
+		{name: "non-object settings are malformed", present: true, value: "true", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mtc := mtcFixture("praxis", "", "", "")
+			if tc.present {
+				mtc.Object["spec"] = map[string]any{"apiTranslation": tc.value}
+			}
+			got, err := APITranslationEnabled(mtc)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("APITranslationEnabled() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if got != tc.want {
+				t.Fatalf("APITranslationEnabled() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIdentifierFor(t *testing.T) {
 	cases := []struct {
 		name       string

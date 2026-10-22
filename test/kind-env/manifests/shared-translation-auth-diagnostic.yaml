@@ -1,0 +1,99 @@
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: api-translation-messages-auth
+  namespace: models-as-a-service
+  labels:
+    app.kubernetes.io/managed-by: api-translation-kind-e2e-diagnostic
+spec:
+  rules:
+    authentication:
+      api-key:
+        plain:
+          selector: request.headers.authorization
+    authorization:
+      valid-api-key:
+        patternMatching:
+          patterns:
+            - operator: eq
+              selector: auth.metadata.apiKeyValidation.valid
+              value: "true"
+    metadata:
+      apiKeyValidation:
+        http:
+          body:
+            expression: '{"key": request.headers.authorization.replace("Bearer ", "")}'
+          contentType: application/json
+          method: POST
+          url: https://maas-api.maas-system.svc.cluster.local:8443/internal/v1/api-keys/validate
+    response:
+      unauthenticated:
+        headers:
+          x-ipp-authdiag-authorization:
+            expression: '"authorization" in request.headers ? "present" : "absent"'
+          x-ipp-authdiag-identity:
+            expression: 'has(auth.identity) ? "present" : "absent"'
+          x-ipp-authdiag-api-key-validation:
+            expression: 'has(auth.metadata) && "apiKeyValidation" in auth.metadata ? "present" : "absent"'
+      unauthorized:
+        headers:
+          x-ipp-authdiag-authorization:
+            expression: '"authorization" in request.headers ? "present" : "absent"'
+          x-ipp-authdiag-identity:
+            expression: 'has(auth.identity) ? "present" : "absent"'
+          x-ipp-authdiag-api-key-validation:
+            expression: 'has(auth.metadata) && "apiKeyValidation" in auth.metadata ? "present" : "absent"'
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: api-translation-messages
+---
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: api-translation-openai-auth
+  namespace: models-as-a-service
+  labels:
+    app.kubernetes.io/managed-by: api-translation-kind-e2e-diagnostic
+spec:
+  rules:
+    authentication:
+      api-key:
+        plain:
+          selector: request.headers.authorization
+    authorization:
+      valid-api-key:
+        patternMatching:
+          patterns:
+            - operator: eq
+              selector: auth.metadata.apiKeyValidation.valid
+              value: "true"
+    metadata:
+      apiKeyValidation:
+        http:
+          body:
+            expression: '{"key": request.headers.authorization.replace("Bearer ", "")}'
+          contentType: application/json
+          method: POST
+          url: https://maas-api.maas-system.svc.cluster.local:8443/internal/v1/api-keys/validate
+    response:
+      unauthenticated:
+        headers:
+          x-ipp-authdiag-authorization:
+            expression: '"authorization" in request.headers ? "present" : "absent"'
+          x-ipp-authdiag-identity:
+            expression: 'has(auth.identity) ? "present" : "absent"'
+          x-ipp-authdiag-api-key-validation:
+            expression: 'has(auth.metadata) && "apiKeyValidation" in auth.metadata ? "present" : "absent"'
+      unauthorized:
+        headers:
+          x-ipp-authdiag-authorization:
+            expression: '"authorization" in request.headers ? "present" : "absent"'
+          x-ipp-authdiag-identity:
+            expression: 'has(auth.identity) ? "present" : "absent"'
+          x-ipp-authdiag-api-key-validation:
+            expression: 'has(auth.metadata) && "apiKeyValidation" in auth.metadata ? "present" : "absent"'
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: api-translation-openai

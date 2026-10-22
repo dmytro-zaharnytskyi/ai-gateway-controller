@@ -38,7 +38,7 @@ func TestRender_HappyPath(t *testing.T) {
 
 	env, err := Render(set, scope(), Revision{}, Options{
 		KnownClusters: []string{"provider-p1"}, SourceUID: "uid-1",
-		ProducerVersion: "0.1.0", RenderedAt: "2026-09-03T00:00:00Z",
+		ProducerVersion: "0.1.0", RenderedAt: "2026-09-03T00:00:00Z", IncludeProviderProfiles: true,
 	})
 	if err != nil {
 		t.Fatalf("Render: %v", err)
@@ -53,6 +53,9 @@ func TestRender_HappyPath(t *testing.T) {
 	if c.Name != "m1" || c.Cluster != "provider-p1" || c.Kind != "inference_model" || c.Site != "site-a" || !c.Fresh {
 		t.Errorf("candidate mapping: %+v", c)
 	}
+	if c.APIFormat != "openai-chat" || c.Path != "/v1/chat/completions" || c.TargetModel != "t" {
+		t.Fatalf("trusted provider profile missing from candidate: %+v", c)
+	}
 	// Wire shape per praxis validate_revision_shape (overlay.rs):
 	// revision = {kind: "content_addressed", algorithm: "sha256", value}.
 	if env.Revision.Kind != "content_addressed" || env.Revision.Algorithm != "sha256" {
@@ -63,6 +66,85 @@ func TestRender_HappyPath(t *testing.T) {
 	}
 	if env.Provenance.SourceGeneration != 1 {
 		t.Errorf("first distribution source_generation: %d, want 1", env.Provenance.SourceGeneration)
+	}
+}
+
+func TestRenderPublishesDistinctProfilesForMixedProviderSelection(t *testing.T) {
+	openai := route("client-model", "openai", 1)
+	openai.Model, openai.ClientName = "external-model", "client-model"
+	openai.TargetModel, openai.Path, openai.APIFormat = "gpt-deployed", "/v1/chat/completions", "openai-chat"
+	anthropic := route("client-model", "anthropic", 1)
+	anthropic.Model, anthropic.ClientName = "external-model", "client-model"
+	anthropic.ProviderType, anthropic.TargetModel = "anthropic", "claude-deployed"
+	anthropic.APIFormat, anthropic.Path = "messages", "/v1/messages"
+	set := routeSet(resolver.ModelRoutes{ModelRef: "ns1/external-model", Routes: []resolver.Route{openai, anthropic}})
+	env, err := Render(set, scope(), Revision{}, Options{IncludeProviderProfiles: true})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if len(env.Overlay.Candidates) != 2 {
+		t.Fatalf("candidate count = %d, want 2", len(env.Overlay.Candidates))
+	}
+	profiles := map[string]Candidate{}
+	for _, candidate := range env.Overlay.Candidates {
+		profiles[candidate.StableID] = candidate
+	}
+	if got := profiles[CandidateStableID("external-model", "openai")]; got.APIFormat != "openai-chat" || got.Path != "/v1/chat/completions" || got.TargetModel != "gpt-deployed" {
+		t.Fatalf("OpenAI candidate profile = %+v", got)
+	}
+	if got := profiles[CandidateStableID("external-model", "anthropic")]; got.APIFormat != "messages" || got.Path != "/v1/messages" || got.TargetModel != "claude-deployed" {
+		t.Fatalf("Anthropic candidate profile = %+v", got)
+	}
+}
+
+func TestRenderProviderProfilesAreOptInAndClearedWhenTranslationTurnsOff(t *testing.T) {
+	r := route("client-model", "openai", 1)
+	r.Model = "external-model"
+	r.TargetModel = "gpt-deployed"
+	r.Path = "/v1/responses"
+	set := routeSet(resolver.ModelRoutes{ModelRef: "ns1/external-model", Routes: []resolver.Route{r}})
+
+	offBefore, err := Render(set, scope(), Revision{}, Options{})
+	if err != nil {
+		t.Fatalf("Render flag-off overlay: %v", err)
+	}
+	assertProviderProfile(t, offBefore.Overlay.Candidates[0], "", "", "")
+
+	on, err := Render(set, scope(), revisionForEnvelope(offBefore), Options{IncludeProviderProfiles: true})
+	if err != nil {
+		t.Fatalf("Render flag-on overlay: %v", err)
+	}
+	assertProviderProfile(t, on.Overlay.Candidates[0], "openai-chat", "/v1/responses", "gpt-deployed")
+
+	offAfter, err := Render(&resolver.ResolvedRouteSet{}, scope(), revisionForEnvelope(on), Options{
+		PreservedCandidates:     on.Overlay.Candidates,
+		IncludeProviderProfiles: false,
+	})
+	if err != nil {
+		t.Fatalf("Render flag-off overlay after toggle: %v", err)
+	}
+	assertProviderProfile(t, offAfter.Overlay.Candidates[0], "", "", "")
+	if offAfter.ContentDigest.Value != offBefore.ContentDigest.Value {
+		t.Fatalf("flag-off digest after toggle = %s, want original flag-off digest %s", offAfter.ContentDigest.Value, offBefore.ContentDigest.Value)
+	}
+}
+
+func revisionForEnvelope(env Envelope) Revision {
+	return Revision{Generation: env.Provenance.SourceGeneration, Digest: env.ContentDigest.Value}
+}
+
+func assertProviderProfile(t *testing.T, candidate Candidate, apiFormat, path, targetModel string) {
+	t.Helper()
+	if candidate.APIFormat != apiFormat || candidate.Path != path || candidate.TargetModel != targetModel {
+		t.Fatalf("provider profile = (%q, %q, %q), want (%q, %q, %q)",
+			candidate.APIFormat, candidate.Path, candidate.TargetModel, apiFormat, path, targetModel)
+	}
+	raw, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatalf("marshal candidate: %v", err)
+	}
+	if apiFormat == "" && (strings.Contains(string(raw), `"api_format"`) || strings.Contains(string(raw), `"target_model"`) || strings.Contains(string(raw), `"path"`)) {
+		t.Fatalf("flag-off candidate serializes provider profile fields: %s", raw)
 	}
 }
 

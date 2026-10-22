@@ -105,7 +105,7 @@ func TestTenantProvidersExcludeModelsBoundToOtherGateways(t *testing.T) {
 	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(
 		local, own, elsewhere, foreign, provider("local"), provider("own"), provider("elsewhere"), provider("shared"),
 	).Build()}
-	_, required, err := r.providersForTenant(context.Background(), "tenant-a", "gw-a", "gateway-a")
+	_, required, err := r.providersForTenant(context.Background(), "tenant-a", "gw-a", "gateway-a", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,7 @@ func TestRuntimeCandidatesLeaveProvidersInOtherNamespacesToTheOverlay(t *testing
 	local := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "openai", Namespace: "tenant-a"},
 		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai"}, Status: v1alpha1.ExternalProviderStatus{Phase: "Ready"}}
 	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(foreign, local).Build()}
-	candidates, err := r.runtimeCandidates(context.Background(), "tenant-a", "gw-a", "gateway-a")
+	candidates, _, err := r.runtimeCandidates(context.Background(), "tenant-a", "gw-a", "gateway-a", false)
 	if err != nil || len(candidates) != 0 {
 		t.Fatalf("runtime candidates = %#v, err=%v; want none, the overlay carries the reference", candidates, err)
 	}

@@ -59,6 +59,10 @@ TEST_FLAGS ?= -race -coverprofile=coverage.out
 .PHONY: test
 test: test-unit test-envtest ##	run unit and control-plane tests
 
+.PHONY: test-kind-env-contracts
+test-kind-env-contracts: ## check Kind image references and controller identity filtering
+	bash test/kind-env/test_run_contracts.sh
+
 .PHONY: test-unit
 test-unit: tidy ##	run unit tests with coverage
 	go test $(TEST_FLAGS) ./...

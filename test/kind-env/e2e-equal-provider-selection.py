@@ -29,6 +29,10 @@ AI_CONTROLLER_IMAGE = os.environ.get(
     "AI_CONTROLLER_IMAGE",
     "ai-gateway-controller:external-model-two-plane",
 )
+PROVIDER_RECORDER_IMAGE = os.environ.get(
+    "PROVIDER_RECORDER_IMAGE",
+    "provider-recorder:issue28-kind",
+)
 PRAXIS_EXTPROC_REPO = os.environ.get("PRAXIS_EXTPROC_REPO", "")
 EXPECTED_EXTPROC_MAIN_SHA = os.environ.get("EXPECTED_EXTPROC_MAIN_SHA", "")
 EVIDENCE = pathlib.Path(os.environ.get("LOCAL_ENV_SELECTION_EVIDENCE") or (
@@ -489,7 +493,6 @@ def make_ref(name):
     return {
         "ref": {"name": name}, "targetModel": "demo", "apiFormat": "openai-chat",
         "path": "/v1/chat/completions",
-        "config": {"tls.caCertificates": "/etc/external-model-e2e/provider-ca/ca.crt"},
         "weight": 1,
     }
 
@@ -1511,8 +1514,9 @@ def main():
     for suffix in ("a", "b"):
         value = backend_credential(API_NAMESPACE, f"provider-proof-{suffix}-backend-credential", suffix)
         model_credential(f"provider-proof-{suffix}-credentials", value)
-    run(["kubectl", "--context", f"kind-{CLUSTER}", "apply", "-f",
-         str(ROOT / "test/kind-env/manifests/provider-selection-proof.yaml")])
+    proof_manifest = (ROOT / "test/kind-env/manifests/provider-selection-proof.yaml").read_text()
+    proof_manifest = proof_manifest.replace("provider-recorder:issue28-kind", PROVIDER_RECORDER_IMAGE)
+    run(["kubectl", "--context", f"kind-{CLUSTER}", "apply", "-f", "-"], input_text=proof_manifest)
     for suffix in ("a", "b"):
         kubectl("-n", "maas-system", "rollout", "status", f"deployment/provider-selection-proof-{suffix}",
                 "--timeout=120s")
