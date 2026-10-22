@@ -93,6 +93,14 @@ func PayloadProcessingEnvoyFilterName(tenantID string) string {
 	return ResourceName(PayloadProcessingName, tenantID)
 }
 
+func PayloadProcessingHPAName(tenantID string) string {
+	return ResourceName(PayloadProcessingName, tenantID)
+}
+
+func PayloadPreProcessingHPAName(tenantID string) string {
+	return ResourceName(PayloadPreProcessingName, tenantID)
+}
+
 // PayloadProcessingExternalModelEnvoyFilterName is owned exclusively by the
 // ExternalModel reconciler. Keeping route-specific patches separate from the
 // tenant-owned base EnvoyFilter prevents concurrent reconcilers from losing

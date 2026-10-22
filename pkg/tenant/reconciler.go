@@ -428,6 +428,10 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		resources = filtered
 		log.Info("omitting controller-managed NetworkPolicy by explicit configuration", "namespace", gatewayNamespace)
 	}
+	scaling := resolveIPPScaling(mtc, log)
+	if err := configureIPPScaling(log, &resources, tenantID, gatewayNamespace, scaling); err != nil {
+		return ctrl.Result{}, fmt.Errorf("configure IPP scaling: %w", err)
+	}
 	for i := range resources {
 		labels := resources[i].GetLabels()
 		if labels == nil {
@@ -466,6 +470,9 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	if err := render.Apply(ctx, r.Client, resources); err != nil {
 		log.Error(err, "praxis-extproc apply failed for tenant; will retry")
 		return ctrl.Result{}, fmt.Errorf("apply: %w", err)
+	}
+	if err := r.cleanupOrphanedIPPHPAs(ctx, tenantID, gatewayNamespace, scaling); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Drop any leftover tenant-scoped standalone Praxis hop from earlier
@@ -927,6 +934,8 @@ func (r *Reconciler) cleanup(ctx context.Context, tenantID, gatewayNamespace, te
 		{gvkDestinationRule, PayloadProcessingExternalModelServiceName(tenantID), tenantNamespace},
 		{gvkClusterRoleBinding, PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID), ""},
 		{gvkClusterRoleBinding, PayloadProcessingReaderClusterRoleBindingPostNameForTenant(tenantID), ""},
+		{gvkHPA, PayloadProcessingHPAName(tenantID), gatewayNamespace},
+		{gvkHPA, PayloadPreProcessingHPAName(tenantID), gatewayNamespace},
 	}
 
 	for _, t := range targets {

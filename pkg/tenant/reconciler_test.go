@@ -321,6 +321,7 @@ func withDeletionTimestamp(u *unstructured.Unstructured) *unstructured.Unstructu
 type recorder struct {
 	mu                 sync.Mutex
 	resourcePatchNames []string
+	resourcePatchKinds []string
 	mtcPatches         int
 	mtcUpdates         int
 	deletedNames       []string
@@ -343,6 +344,7 @@ func (r *recorder) funcs() interceptor.Funcs {
 			}
 			r.mu.Lock()
 			r.resourcePatchNames = append(r.resourcePatchNames, obj.GetName())
+			r.resourcePatchKinds = append(r.resourcePatchKinds, obj.GetObjectKind().GroupVersionKind().Kind)
 			r.mu.Unlock()
 			return nil
 		},
@@ -371,6 +373,12 @@ func (r *recorder) snapshot() (resourcePatchNames []string, mtcPatches int, dele
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.resourcePatchNames...), r.mtcPatches, append([]string(nil), r.deletedNames...)
+}
+
+func (r *recorder) kindSnapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.resourcePatchKinds...)
 }
 
 func requireManifests(t *testing.T) {
@@ -905,6 +913,68 @@ func TestReconcileAppliesUnsuffixedNamesForDefaultTenant(t *testing.T) {
 	assertContains(t, names, "payload-pre-processing")
 	assertContains(t, names, "payload-processing-plugins")
 	assertContains(t, names, "payload-processing-reader")
+	for _, kind := range rec.kindSnapshot() {
+		if kind == "HorizontalPodAutoscaler" {
+			t.Fatal("unexpected HPA apply when autoscaling is not configured")
+		}
+	}
+}
+
+func TestReconcileAppliesHPAsWhenAutoscalingConfigured(t *testing.T) {
+	requireManifests(t)
+	scheme := mtcSchemeForTests()
+	mtc := withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	mtc.Object["spec"] = map[string]any{
+		"payloadProcessing": map[string]any{
+			"replicas":    int64(2),
+			"autoscaling": map[string]any{"maxReplicas": int64(6)},
+		},
+		"payloadPreProcessing": map[string]any{
+			"autoscaling": map[string]any{},
+		},
+	}
+	aitenant := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "openshift-ingress", "tenant-ns")
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, newGateway("my-gateway", "openshift-ingress")).WithInterceptorFuncs(rec.funcs()).Build()
+
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	if _, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns")); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	names, _, _ := rec.snapshot()
+	assertContains(t, names, "payload-processing-redteam")
+	assertContains(t, names, "payload-pre-processing-redteam")
+	hpaCount := 0
+	for _, kind := range rec.kindSnapshot() {
+		if kind == "HorizontalPodAutoscaler" {
+			hpaCount++
+		}
+	}
+	if hpaCount != 2 {
+		t.Fatalf("HPA applies = %d, want 2; kinds=%v names=%v", hpaCount, rec.kindSnapshot(), names)
+	}
+}
+
+func TestReconcileDeletesOrphanedHPAsWhenAutoscalingRemoved(t *testing.T) {
+	requireManifests(t)
+	scheme := mtcSchemeForTests()
+	mtc := withMarker(newMTC("tenant-ns", "redteam", PayloadProcessingBackendPraxis, "redteam", "ai-tenants"), PayloadProcessingStatusCleanupComplete)
+	aitenant := newAITenantOwner("redteam", "ai-tenants", AITenantPhaseActive, "my-gateway", "openshift-ingress", "tenant-ns")
+	orphan := &unstructured.Unstructured{}
+	orphan.SetGroupVersionKind(gvkHPA)
+	orphan.SetName(PayloadProcessingHPAName("redteam"))
+	orphan.SetNamespace("openshift-ingress")
+	orphan.SetLabels(map[string]string{LabelManagedBy: ManagedByAIGatewayController})
+	rec := &recorder{}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mtc, aitenant, orphan, newGateway("my-gateway", "openshift-ingress")).WithInterceptorFuncs(rec.funcs()).Build()
+
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient, ManifestPath: manifestPath, Image: "img", MaaSAPIRouteNameBase: "maas-api-route", ResyncInterval: time.Minute}
+	if _, err := r.Reconcile(context.Background(), mtcRequest("tenant-ns")); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	_, _, deleted := rec.snapshot()
+	assertContains(t, deleted, PayloadProcessingHPAName("redteam"))
 }
 
 // TestReconcileRejectsSpoofedOwningAITenantAnnotations covers CWE-639:
@@ -979,6 +1049,8 @@ func expectedCleanupNames(tenantID string) []string {
 		PayloadProcessingNetworkPolicyName(tenantID),
 		PayloadProcessingEnvoyFilterName(tenantID),
 		PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID),
+		PayloadProcessingHPAName(tenantID),
+		PayloadPreProcessingHPAName(tenantID),
 	}
 }
 
@@ -1006,6 +1078,8 @@ func seedPraxisOwnedForCleanup(tenantID, namespace string) []client.Object {
 		mk(gvkDestinationRule, PayloadProcessingServiceName(tenantID), namespace),
 		mk(gvkDestinationRule, PayloadPreProcessingServiceName(tenantID), namespace),
 		mk(gvkClusterRoleBinding, PayloadProcessingReaderClusterRoleBindingNameForTenant(tenantID), ""),
+		mk(gvkHPA, PayloadProcessingHPAName(tenantID), namespace),
+		mk(gvkHPA, PayloadPreProcessingHPAName(tenantID), namespace),
 	}
 }
 
