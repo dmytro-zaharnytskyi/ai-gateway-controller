@@ -201,8 +201,11 @@ before loading that platform image under a local Kind name. The local name is
 a container-runtime transport reference only; the published digest and source
 commit are recorded in provisioning evidence, and the fixture is still the
 published Katan image rather than a mock service.
-`KATAN_IMAGE` overrides the image and `BUILD_KATAN=true` is the explicit local
-source-build path.
+`KATAN_IMAGE` overrides the registry image pulled by the provisioner. Kind
+loads that image under the plain local `KATAN_KIND_IMAGE` tag (default
+`llm-katan:external-model-two-plane`); digest references stay on the pull side
+and are never used as Docker tag targets. `BUILD_KATAN=true` is the explicit
+local source-build path and requires a tag-valued image name.
 
 ### Kind-only security compatibility
 
@@ -266,10 +269,38 @@ content rotation does not alter the pod template; changing the referenced
 Secret set intentionally changes the template and may roll out the tenant
 ExtProc pod.
 
-The shared MaaS/KServe post-auth ExtProc filter remains BUFFERED. The
-ExternalModel-only filter is a separate SEND/NONE chain, disabled by default
-and enabled only by controller-owned route patches. Ordinary KServe routes on
-the same Gateway therefore retain their upstream body-processing behavior.
+The shared MaaS/KServe post-auth ExtProc keeps request buffering and streams
+response-body events so the opt-in Anthropic Messages translator can process
+progressive SSE. Translation filters remain absent when
+`MaasTenantConfig.spec.apiTranslation.enabled` is omitted or false; ordinary
+shared routes still traverse the ExtProc chain. The Kind qualification covers
+default-off passthrough and an unrelated OpenAI SSE route.
+
+The ExternalModel-only filter is a separate route-scoped chain. Controller-
+owned route patches limit its processing to generated ExternalModel routes;
+ordinary KServe routes do not receive this chain. With
+`MaasTenantConfig.spec.apiTranslation.enabled` omitted or false, the controller
+keeps the main-compatible selected-provider path: it omits provider profile
+fields and translation filters, leaves the request model supplied by the client
+unchanged, and does not enable early body delivery. With the setting true, the
+selected-provider profile can rewrite the OpenAI Chat Completions request
+body's `model` to that provider's `ExternalProviderRef.targetModel`, even when
+the selected provider is OpenAI-compatible. The setting therefore opts into
+both API conversion and this provider-specific target-model mapping; there is
+not currently a separate switch for target-model rewriting.
+
+When translation is enabled, the selected-provider request filter applies a
+1 MiB limit before model validation and target-model rewriting, including for
+OpenAI-compatible candidates; larger requests are rejected before the upstream
+provider. The dedicated ExtProc process uses a 10 MiB accumulation ceiling for
+that translation configuration. The Kind request-limit probe currently observes
+Envoy's preselection 413 before the request reaches Praxis, so it does not
+qualify the filter's 1 MiB limit. With translation disabled, the translation
+filter and its bounds are absent and the main `allow_unbounded_body` setting is
+retained. For Anthropic JSON responses, the translator buffers chunks in
+request-local filter state and enforces its 1 MiB limit. SSE remains
+incremental, and OpenAI-compatible responses pass through without this response
+buffer or limit.
 
 The transition fixture uses a real `MaasTenantConfig` explicitly set to
 `ipp` and MaaS model
@@ -324,6 +355,15 @@ is optional in the normal workflow because the default provider image is the
 public digest-pinned artifact; a source checkout is used only for explicit
 development builds.
 
+When the selected MaaS controller revision predates the `MaasTenantConfig`
+`spec.apiTranslation` field, the translation qualification must supply
+`MAAS_API_TRANSLATION_SCHEMA_REPO` pointing to a checkout containing the
+generated schema commit (default `bce7ddd52657a2ad4c2444757761806a8290db44`).
+The harness applies only that generated CRD file, verifies that its sole
+schema delta from the selected MaaS controller source is `spec.apiTranslation`,
+and records both revisions. The MaaS controller binary remains the configured
+controller source; the schema overlay does not deploy the newer MaaS code.
+
 Each run records repository path, remote, branch or detached state, HEAD,
 tracked diff hash, and untracked-content hash before building. After
 publication, the image reference is resolved to a registry digest and the
@@ -333,7 +373,12 @@ state is not silently changed by the harness.
 
 No kubeconfig context is read implicitly. Provisioning uses only
 `kind-${LOCAL_ENV_CLUSTER}`. Images are built from these checkouts when absent
-and loaded into Kind with `imagePullPolicy: Never`.
+and loaded into Kind. The MaaS API is published to a run-owned local registry
+because the active MaaS controller intentionally reconciles its API
+Deployments with `imagePullPolicy: Always`; the Kind node is configured to
+resolve only that registry reference, and the harness verifies the node's
+registry digest and image tag match the source-built image before fixture
+provisioning continues.
 
 ## Mock external provider
 

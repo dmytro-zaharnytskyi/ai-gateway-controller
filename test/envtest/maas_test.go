@@ -8,10 +8,26 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
 )
+
+func TestMaasTenantConfigSchemaPreservesAPITranslation(t *testing.T) {
+	admin := startEnvironment(t, func(ctrl.Manager) {})
+	createNamespace(t, admin, "translation-schema")
+	mtc := tenant.NewMaasTenantConfig()
+	mtc.SetName(tenant.MaasTenantConfigInstanceName)
+	mtc.SetNamespace("translation-schema")
+	mtc.Object["spec"] = map[string]any{"apiTranslation": map[string]any{"enabled": true}}
+	require.NoError(t, admin.Create(t.Context(), mtc))
+	stored := tenant.NewMaasTenantConfig()
+	require.NoError(t, admin.Get(t.Context(), client.ObjectKeyFromObject(mtc), stored))
+	enabled, err := tenant.APITranslationEnabled(stored)
+	require.NoError(t, err)
+	require.True(t, enabled, "API server pruned spec.apiTranslation.enabled")
+}
 
 // maasFixture supplies the external tenant state consumed by this controller.
 // It emits API objects; it does not run or simulate MaaS reconciliation.

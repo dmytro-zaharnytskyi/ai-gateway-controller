@@ -65,6 +65,20 @@ behavior remain outside this change in issue #106. Partial provider withdrawal
 ordering remains a separate issue tracked in
 [#108](https://github.com/opendatahub-io/ai-gateway-controller/issues/108).
 
+### API translation opt-in compatibility
+
+`MaasTenantConfig.spec.apiTranslation.enabled` is an opt-in rendering switch.
+When omitted or false, ExternalModel overlays omit the Praxis provider profile
+fields, the selected-provider translation filters are absent, and OpenAI
+Chat Completions requests keep the client-supplied `model` value. Enabling the
+setting permits Messages candidates and provider-specific request conversion;
+it also allows the selected provider's `ExternalProviderRef.targetModel` to
+replace the OpenAI request body's `model`, including when that provider speaks
+the OpenAI-compatible API. There is no separate target-model rewrite setting.
+This keeps translation-specific fields and their ExtProc compatibility
+requirement opt-in while retaining the route and provider selection supported
+by `origin/main` when translation is disabled.
+
 If a deleting ExternalModel has no resolvable `MaasTenantConfig`/`AITenant` and
 there are sibling models, deletion is conservative: it will not rebuild shared
 Praxis serving state without a live, steady tenant handoff. The ExternalModel

@@ -58,6 +58,12 @@ spec:
           spec:
             description: MaasTenantConfigSpec defines MaaS-owned tenant configuration.
             properties:
+              apiTranslation:
+                description: APITranslation controls tenant permission for provider API translation.
+                properties:
+                  enabled:
+                    type: boolean
+                type: object
               apiKeys:
                 description: APIKeys contains configuration for API key management.
                 properties:

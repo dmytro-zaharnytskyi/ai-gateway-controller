@@ -2,20 +2,22 @@
 set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+source "$ROOT/test/kind-env/lib/image_refs.sh"
+source "$ROOT/test/kind-env/lib/maas_api_image_identity.sh"
+source "$ROOT/test/kind-env/lib/registry_image_identity.sh"
+resolve_katan_image_refs
 CLUSTER=${LOCAL_ENV_CLUSTER:-external-model-two-plane}
 WORKSPACE=$(cd "$ROOT/.." && pwd)
 DEPS_DIR=${LOCAL_ENV_DEPS_DIR:-"$WORKSPACE/deps"}
 LLM_KATAN_REPO=${LLM_KATAN_REPO:-"$DEPS_DIR/llm-katan"}
-KATAN_DEFAULT_IMAGE=ghcr.io/nerdalert/llm-katan@sha256:11379a1ec2fd69dc121eada6c544eb423a7c074414507dc1d474f4abba9df75a
-KATAN_DEFAULT_AMD64_IMAGE=ghcr.io/nerdalert/llm-katan@sha256:a8bf18109e2db641ef4a63efe65f69d4d6554f1128a174053de89a8b81b4284d
-KATAN_EFFECTIVE_IMAGE=${KATAN_IMAGE:-$KATAN_DEFAULT_IMAGE}
-KATAN_KIND_IMAGE=${KATAN_IMAGE:-llm-katan:external-model-two-plane}
-PROVIDER_RECORDER_IMAGE=provider-recorder:issue28-kind
-if [[ "${BUILD_KATAN:-false}" == true ]]; then
-  KATAN_EFFECTIVE_IMAGE=${KATAN_IMAGE:-llm-katan:e2e}
-  KATAN_KIND_IMAGE=$KATAN_EFFECTIVE_IMAGE
-fi
-KATAN_PULL_IMAGE=${KATAN_IMAGE:-$KATAN_DEFAULT_AMD64_IMAGE}
+PROVIDER_RECORDER_IMAGE=${PROVIDER_RECORDER_IMAGE:-provider-recorder:issue28-kind}
+MAAS_API_IMAGE=${MAAS_API_IMAGE:-maas-api:external-model-two-plane}
+REGISTRY_IMAGE=${LOCAL_ENV_REGISTRY_IMAGE:-registry:2.8.3}
+REGISTRY_NETWORK=${LOCAL_ENV_REGISTRY_NETWORK:-${CLUSTER}-registry-net}
+REGISTRY_CONTAINER=${LOCAL_ENV_REGISTRY_CONTAINER:-${CLUSTER}-registry}
+REGISTRY_PORT=
+MAAS_API_RUNTIME_IMAGE=
+REGISTRY_OWNER_LABEL=local-env.opendatahub.io/kind-run
 MAAS_UPSTREAM_URL=${MAAS_UPSTREAM_URL:-https://github.com/opendatahub-io/models-as-a-service.git}
 if [[ -n "${MAAS_CONTROLLER_REPO:-}" ]]; then
   MAAS_SOURCE_MODE=explicit-override
@@ -23,10 +25,14 @@ else
   MAAS_CONTROLLER_REPO="$DEPS_DIR/models-as-a-service"
   MAAS_SOURCE_MODE=canonical-main
 fi
+MAAS_API_TRANSLATION_SCHEMA_REPO=${MAAS_API_TRANSLATION_SCHEMA_REPO:-}
+MAAS_API_TRANSLATION_SCHEMA_REV=${MAAS_API_TRANSLATION_SCHEMA_REV:-bce7ddd52657a2ad4c2444757761806a8290db44}
+MAAS_API_TRANSLATION_SCHEMA_PATH=deployment/base/maas-controller/crd/bases/maas.opendatahub.io_maastenantconfigs.yaml
 APPLY_REAL_OPENAI_FIXTURE=${APPLY_REAL_OPENAI_FIXTURE:-false}
 KSERVE_REPO=${KSERVE_REPO:-"$DEPS_DIR/kserve"}
 KUADRANT_OPERATOR_REPO=${KUADRANT_OPERATOR_REPO:-"$DEPS_DIR/kuadrant-operator"}
 PRAXIS_EXTPROC_REPO=${PRAXIS_EXTPROC_REPO:-"$DEPS_DIR/praxis-extproc"}
+PRAXIS_AI_REPO=${PRAXIS_AI_REPO:-}
 EXTPROC_IMAGE=${EXTPROC_IMAGE:-praxis-extproc:dev}
 ISTIOCTL=${ISTIOCTL:-/tmp/istio-1.27.3/bin/istioctl}
 EVIDENCE_ROOT=${LOCAL_ENV_EVIDENCE_ROOT:-"$ROOT/evidence"}
@@ -46,6 +52,184 @@ KCTL=(kubectl --context "kind-$CLUSTER")
 failures=0
 fail() { echo "FAIL: $*" | tee -a "$EVIDENCE/failures.txt"; failures=$((failures + 1)); }
 check_cmd() { command -v "$1" >/dev/null 2>&1 || fail "missing command: $1"; }
+create_run_registry() {
+  local network_owner container_owner node network_names expected_id runtime_id runtime_info expected_repo_digest node_repo_digest node_tag_present repository hosts_dir config_before config_after
+
+  if docker network inspect "$REGISTRY_NETWORK" >/dev/null 2>&1; then
+    network_owner=$(docker network inspect --format "{{ index .Labels \"$REGISTRY_OWNER_LABEL\" }}" "$REGISTRY_NETWORK")
+    [[ "$network_owner" == "$CLUSTER" ]] || { fail "registry network exists without this run's ownership label: $REGISTRY_NETWORK"; return 1; }
+  else
+    docker network create --driver bridge --label "$REGISTRY_OWNER_LABEL=$CLUSTER" "$REGISTRY_NETWORK" >"$EVIDENCE/registry-network-id.txt"
+  fi
+
+  if ! docker image inspect "$REGISTRY_IMAGE" >/dev/null 2>&1; then
+    timeout 300s docker pull "$REGISTRY_IMAGE"
+  fi
+  docker image inspect "$REGISTRY_IMAGE" --format '{{.Id}}' >"$EVIDENCE/registry-image-id.txt"
+  if docker container inspect "$REGISTRY_CONTAINER" >/dev/null 2>&1; then
+    container_owner=$(docker container inspect --format "{{ index .Config.Labels \"$REGISTRY_OWNER_LABEL\" }}" "$REGISTRY_CONTAINER")
+    [[ "$container_owner" == "$CLUSTER" ]] || { fail "registry container exists without this run's ownership label: $REGISTRY_CONTAINER"; return 1; }
+    docker start "$REGISTRY_CONTAINER" >/dev/null
+  else
+    docker run --detach --restart unless-stopped --name "$REGISTRY_CONTAINER" \
+      --label "$REGISTRY_OWNER_LABEL=$CLUSTER" \
+      --network "$REGISTRY_NETWORK" --network-alias "$REGISTRY_CONTAINER" \
+      --publish 127.0.0.1::5000 "$REGISTRY_IMAGE" >"$EVIDENCE/registry-container-id.txt"
+  fi
+  REGISTRY_PORT=$(docker container inspect --format '{{(index (index .NetworkSettings.Ports "5000/tcp") 0).HostPort}}' "$REGISTRY_CONTAINER")
+  [[ "$REGISTRY_PORT" =~ ^[0-9]+$ ]] || { fail "could not resolve the run-owned registry host port"; return 1; }
+  MAAS_API_RUNTIME_IMAGE="127.0.0.1:${REGISTRY_PORT}/maas-api:${STAMP}"
+  printf 'network=%s\ncontainer=%s\nport=%s\nregistry_image=%s\nregistry_image_id=%s\nmaas_api_runtime_image=%s\n' \
+    "$REGISTRY_NETWORK" "$REGISTRY_CONTAINER" "$REGISTRY_PORT" "$REGISTRY_IMAGE" \
+    "$(<"$EVIDENCE/registry-image-id.txt")" "$MAAS_API_RUNTIME_IMAGE" >"$EVIDENCE/local-registry.txt"
+
+  docker tag "$MAAS_API_IMAGE" "$MAAS_API_RUNTIME_IMAGE"
+  docker image inspect "$MAAS_API_IMAGE" --format '{{.Id}}' >"$EVIDENCE/maas-api-image-id.txt"
+  docker image inspect "$MAAS_API_RUNTIME_IMAGE" --format '{{.Id}}' >"$EVIDENCE/maas-api-registry-tag-image-id.txt"
+  cmp -s "$EVIDENCE/maas-api-image-id.txt" "$EVIDENCE/maas-api-registry-tag-image-id.txt" || {
+    fail "local registry tag does not identify the source-built MaaS API image"; return 1;
+  }
+  docker push "$MAAS_API_RUNTIME_IMAGE" >"$EVIDENCE/maas-api-registry-push.txt" 2>&1
+
+  kind get clusters | rg -qx "$CLUSTER" || KIND_EXPERIMENTAL_DOCKER_NETWORK="$REGISTRY_NETWORK" kind create cluster --name "$CLUSTER"
+  node="${CLUSTER}-control-plane"
+  network_names=$(docker inspect --format '{{range $name, $value := .NetworkSettings.Networks}}{{$name}} {{end}}' "$node")
+  if [[ " $network_names " != *" $REGISTRY_NETWORK "* ]]; then
+    docker network connect --gw-priority=-1 "$REGISTRY_NETWORK" "$node"
+  fi
+
+  hosts_dir="/etc/containerd/certs.d/127.0.0.1:${REGISTRY_PORT}"
+  printf '[host."http://%s:5000"]\n  capabilities = ["pull", "resolve"]\n' "$REGISTRY_CONTAINER" >"$EVIDENCE/registry-hosts.toml"
+  while IFS= read -r node; do
+    [[ -n "$node" ]] || continue
+    docker exec "$node" mkdir -p "$hosts_dir"
+    docker exec -i "$node" sh -c "cat > '$hosts_dir/hosts.toml'" <"$EVIDENCE/registry-hosts.toml"
+    config_before="$EVIDENCE/${node}-containerd-config.before.toml"
+    config_after="$EVIDENCE/${node}-containerd-config.after.toml"
+    docker cp "$node:/etc/containerd/config.toml" "$config_before" >/dev/null
+    python3 - "$config_before" "$config_after" <<'PY'
+import pathlib
+import sys
+
+before, after = map(pathlib.Path, sys.argv[1:])
+config = before.read_text()
+setting = '  config_path = "/etc/containerd/certs.d"'
+if setting not in config:
+    section = '[plugins."io.containerd.grpc.v1.cri".registry]'
+    if section in config:
+        config = config.replace(section, section + "\n" + setting, 1)
+    else:
+        config = config.rstrip() + "\n\n" + section + "\n" + setting + "\n"
+after.write_text(config)
+PY
+    if ! cmp -s "$config_before" "$config_after"; then
+      docker cp "$config_after" "$node:/etc/containerd/config.toml" >/dev/null
+      docker exec "$node" systemctl restart containerd
+      printf '%s\n' "$node restarted after enabling the run-owned containerd registry host configuration" >>"$EVIDENCE/containerd-registry-config.txt"
+    else
+      printf '%s\n' "$node already reads registry host configuration" >>"$EVIDENCE/containerd-registry-config.txt"
+    fi
+    diff -u "$config_before" "$config_after" >"$EVIDENCE/${node}-containerd-config.patch" || true
+  done < <(kind get nodes --name "$CLUSTER")
+  for _ in $(seq 1 60); do
+    if "${KCTL[@]}" wait --for=condition=Ready node "${CLUSTER}-control-plane" --timeout=5s >/dev/null 2>&1; then
+      break
+    fi
+    sleep 2
+  done
+  "${KCTL[@]}" wait --for=condition=Ready node "${CLUSTER}-control-plane" --timeout=5s >/dev/null
+  docker exec "${CLUSTER}-control-plane" crictl pull "$MAAS_API_RUNTIME_IMAGE" >"$EVIDENCE/maas-api-registry-node-pull.txt" 2>&1
+  runtime_info=$(docker exec "${CLUSTER}-control-plane" crictl inspecti "$MAAS_API_RUNTIME_IMAGE")
+  runtime_id=$(jq -r '.status.id' <<<"$runtime_info")
+  expected_id=$(<"$EVIDENCE/maas-api-image-id.txt")
+  repository=${MAAS_API_RUNTIME_IMAGE%:*}
+  expected_repo_digest=$(docker image inspect "$MAAS_API_RUNTIME_IMAGE" --format '{{json .RepoDigests}}' \
+    | jq -r --arg prefix "$repository@" '[.[]? | select(startswith($prefix))][0] // ""')
+  node_repo_digests=$(jq -r '.status.repoDigests // [] | join(",")' <<<"$runtime_info")
+  node_has_expected_repo_digest=false
+  if containerd_image_matches_pushed_ref "$runtime_info" "$expected_repo_digest" "$MAAS_API_RUNTIME_IMAGE"; then
+    node_has_expected_repo_digest=true
+  fi
+  node_tag_present=$(jq -r --arg ref "$MAAS_API_RUNTIME_IMAGE" '(.status.repoTags // []) | index($ref) != null' <<<"$runtime_info")
+  printf 'expected_local_image_id=%s\nnode_containerd_image_id=%s\nexpected_registry_repo_digest=%s\nnode_registry_repo_digests=%s\nnode_has_expected_repo_digest=%s\nnode_tag_present=%s\n' \
+    "$expected_id" "$runtime_id" "$expected_repo_digest" "$node_repo_digests" "$node_has_expected_repo_digest" "$node_tag_present" \
+    >"$EVIDENCE/maas-api-registry-node-image-identity.txt"
+  # Containerd may report both the platform manifest and its parent image
+  # index in repoDigests, in either order. Match the exact digest pushed from
+  # the source-built image by membership rather than treating the first entry
+  # as authoritative. The CRI image ID is the platform config digest, while
+  # Docker's local image ID can identify the index.
+  [[ -n "$expected_repo_digest" && "$node_has_expected_repo_digest" == true && "$node_tag_present" == true ]] || {
+    fail "Kind node is missing the source-built MaaS API registry digest or tag"; return 1;
+  }
+}
+cleanup_run_registry() {
+  local owner
+  if ! command -v docker >/dev/null 2>&1; then
+    echo 'registry_cleanup_complete=false reason=docker_command_unavailable' >"$EVIDENCE/registry-cleanup.txt"
+    fail "docker is unavailable for run-owned registry cleanup"
+    return
+  fi
+  if docker container inspect "$REGISTRY_CONTAINER" >/dev/null 2>&1; then
+    owner=$(docker container inspect --format "{{ index .Config.Labels \"$REGISTRY_OWNER_LABEL\" }}" "$REGISTRY_CONTAINER")
+    if [[ "$owner" == "$CLUSTER" ]]; then
+      docker rm -f "$REGISTRY_CONTAINER" >/dev/null || fail "could not remove run-owned registry container"
+      echo 'registry_container_removed=true' >>"$EVIDENCE/registry-cleanup.txt"
+    else
+      echo 'registry_container_removed=false reason=ownership_label_mismatch' >>"$EVIDENCE/registry-cleanup.txt"
+      fail "refusing to remove registry container without matching ownership label"
+    fi
+  else
+    echo 'registry_container_removed=true reason=already_absent' >>"$EVIDENCE/registry-cleanup.txt"
+  fi
+  if docker network inspect "$REGISTRY_NETWORK" >/dev/null 2>&1; then
+    owner=$(docker network inspect --format "{{ index .Labels \"$REGISTRY_OWNER_LABEL\" }}" "$REGISTRY_NETWORK")
+    if [[ "$owner" == "$CLUSTER" ]]; then
+      docker network rm "$REGISTRY_NETWORK" >/dev/null || fail "could not remove run-owned registry network"
+      echo 'registry_network_removed=true' >>"$EVIDENCE/registry-cleanup.txt"
+    else
+      echo 'registry_network_removed=false reason=ownership_label_mismatch' >>"$EVIDENCE/registry-cleanup.txt"
+      fail "refusing to remove registry network without matching ownership label"
+    fi
+  else
+    echo 'registry_network_removed=true reason=already_absent' >>"$EVIDENCE/registry-cleanup.txt"
+  fi
+}
+apply_maas_api_translation_schema() {
+  local base_schema="$EVIDENCE/maas-main-maastenantconfigs.yaml"
+  local feature_schema="$EVIDENCE/maas-api-translation-maastenantconfigs.yaml"
+  local base_normalized="$EVIDENCE/maas-main-maastenantconfigs.normalized.json"
+  local feature_normalized="$EVIDENCE/maas-api-translation-maastenantconfigs.normalized.json"
+  local feature_sha feature_branch
+
+  if [[ -z "$MAAS_API_TRANSLATION_SCHEMA_REPO" ]]; then
+    printf 'schema_overlay=not_applied reason=MAAS_API_TRANSLATION_SCHEMA_REPO_not_set\n' >"$EVIDENCE/maas-api-translation-schema-source.txt"
+    return 0
+  fi
+  git -C "$MAAS_API_TRANSLATION_SCHEMA_REPO" show "$MAAS_API_TRANSLATION_SCHEMA_REV:$MAAS_API_TRANSLATION_SCHEMA_PATH" >"$feature_schema"
+  git -C "$MAAS_CONTROLLER_REPO" show "HEAD:$MAAS_API_TRANSLATION_SCHEMA_PATH" >"$base_schema"
+  yq eval -o=json "$base_schema" | jq -S . >"$base_normalized"
+  yq eval -o=json "$feature_schema" | jq -S 'del(.spec.versions[] | select(.name == "v1alpha1") | .schema.openAPIV3Schema.properties.spec.properties.apiTranslation)' >"$feature_normalized"
+  cmp -s "$base_normalized" "$feature_normalized" || {
+    fail "MaaS schema source differs from main beyond spec.apiTranslation"; return 1;
+  }
+  yq eval -o=json "$feature_schema" | jq -e '
+    .spec.versions[] | select(.name == "v1alpha1") |
+    .schema.openAPIV3Schema.properties.spec.properties.apiTranslation.properties.enabled.type == "boolean"' >/dev/null || {
+      fail "MaaS apiTranslation schema does not expose enabled as a boolean"; return 1;
+    }
+  feature_sha=$(sha256sum "$feature_schema" | awk '{print $1}')
+  feature_branch=$(git -C "$MAAS_API_TRANSLATION_SCHEMA_REPO" branch --show-current)
+  printf 'controller_source=%s\ncontroller_commit=%s\nschema_source=%s\nschema_branch=%s\nschema_commit=%s\nschema_file=%s\nschema_file_sha256=%s\n' \
+    "$MAAS_CONTROLLER_REPO" "$(git -C "$MAAS_CONTROLLER_REPO" rev-parse HEAD)" \
+    "$MAAS_API_TRANSLATION_SCHEMA_REPO" "$feature_branch" "$MAAS_API_TRANSLATION_SCHEMA_REV" \
+    "$MAAS_API_TRANSLATION_SCHEMA_PATH" "$feature_sha" >"$EVIDENCE/maas-api-translation-schema-source.txt"
+  diff -u "$base_schema" "$feature_schema" >"$EVIDENCE/maas-api-translation-schema.diff" || true
+  "${KCTL[@]}" apply -f "$feature_schema"
+  "${KCTL[@]}" get crd maastenantconfigs.maas.opendatahub.io -o yaml >"$EVIDENCE/maastenantconfigs-crd-after-schema-overlay.yaml"
+  "${KCTL[@]}" get crd maastenantconfigs.maas.opendatahub.io -o json \
+    | jq -e '.spec.versions[] | select(.name == "v1alpha1") | .schema.openAPIV3Schema.properties.spec.properties.apiTranslation.properties.enabled.type == "boolean"' >/dev/null
+}
 wait_for_praxis_handoff() {
   local namespace=$1 status
   for _ in $(seq 1 90); do
@@ -60,7 +244,7 @@ wait_for_praxis_handoff() {
   fail "MaaS/Praxis handoff did not reach steady for $namespace"
   return 1
 }
-check_repo() { local name=$1 path=${!1:-}; [[ -n "$path" && -d "$path/.git" ]] || fail "$name checkout missing: ${path:-unset}"; }
+check_repo() { local name=$1 path=${!1:-}; [[ -n "$path" ]] && git -C "$path" rev-parse --git-dir >/dev/null 2>&1 || fail "$name checkout missing: ${path:-unset}"; }
 dirty_hash() {
   local source=$1 file
   {
@@ -78,6 +262,66 @@ dirty_hash() {
       fi
     done < <(git -C "$source" ls-files --others --exclude-standard -z | sort -z)
   } | sha256sum | awk '{print $1}'
+}
+
+build_extproc_with_local_ai() {
+  local extproc_source=$1 ai_source=$2 image=$3 context="$EVIDENCE/extproc-build-context"
+  python3 - "$extproc_source" "$ai_source" "$context" <<'PY'
+import pathlib
+import shutil
+import sys
+
+extproc_source, ai_source, context = map(pathlib.Path, sys.argv[1:])
+if context.exists():
+    shutil.rmtree(context)
+context.mkdir(parents=True)
+
+def copy_source(source, destination):
+    ignored = shutil.ignore_patterns(".git", "target", "evidence", "node_modules")
+    shutil.copytree(source, destination, dirs_exist_ok=True, ignore=ignored)
+
+copy_source(extproc_source, context / "praxis-extproc")
+copy_source(ai_source, context / "praxis-ai")
+
+cargo_toml = context / "praxis-extproc" / "Cargo.toml"
+cargo = cargo_toml.read_text()
+replacements = {
+    'praxis-ai-apis = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.7.0", default-features = false, optional = true }':
+        'praxis-ai-apis = { path = "../praxis-ai/apis", default-features = false, optional = true }',
+    'praxis-ai-filters = { git = "https://github.com/praxis-proxy/ai.git", tag = "v0.7.0", default-features = false }':
+        'praxis-ai-filters = { path = "../praxis-ai/filters", default-features = false }',
+}
+for old, new in replacements.items():
+    if cargo.count(old) != 1:
+        raise SystemExit(f"expected one ExtProc dependency pin to replace: {old.split()[0]}")
+    cargo = cargo.replace(old, new)
+cargo_toml.write_text(cargo)
+
+containerfile = context / "praxis-extproc" / "Containerfile"
+recipe = containerfile.read_text()
+copy_replacements = {
+    "COPY Cargo.toml Cargo.lock ./": "COPY praxis-extproc/Cargo.toml praxis-extproc/Cargo.lock praxis-extproc/",
+    "COPY proto proto": "COPY praxis-extproc/proto praxis-extproc/proto",
+    "COPY src src": "COPY praxis-extproc/src praxis-extproc/src",
+    "COPY xtask xtask": "COPY praxis-extproc/xtask praxis-extproc/xtask",
+}
+for old, new in copy_replacements.items():
+    if recipe.count(old) != 1:
+        raise SystemExit(f"expected one ExtProc Containerfile source copy: {old}")
+    recipe = recipe.replace(old, new)
+anchor = "COPY praxis-extproc/xtask praxis-extproc/xtask\n"
+if recipe.count(anchor) != 1:
+    raise SystemExit("ExtProc Containerfile source-copy anchor changed")
+recipe = recipe.replace(anchor, anchor + "COPY praxis-ai praxis-ai\nWORKDIR /src/praxis-extproc\n")
+containerfile.write_text(recipe)
+PY
+
+  cargo update --manifest-path "$context/praxis-extproc/Cargo.toml" --offline -p praxis-ai-filters
+  cargo update --manifest-path "$context/praxis-extproc/Cargo.toml" --offline -p praxis-ai-apis
+  diff -u "$extproc_source/Containerfile" "$context/praxis-extproc/Containerfile" >"$EVIDENCE/extproc-local-ai-containerfile.patch" || true
+  diff -u "$extproc_source/Cargo.toml" "$context/praxis-extproc/Cargo.toml" >"$EVIDENCE/extproc-local-ai-cargo.patch" || true
+  sha256sum "$context/praxis-extproc/Cargo.lock" >"$EVIDENCE/extproc-local-ai-cargo-lock.sha256"
+  timeout 1200s docker build --platform linux/amd64 -t "$image" -f "$context/praxis-extproc/Containerfile" "$context"
 }
 
 echo "evidence=$EVIDENCE"
@@ -106,6 +350,7 @@ if [[ "${1:---preflight}" == "--destroy" ]]; then
   else
     echo "cluster_already_absent=true" >"$EVIDENCE/destroy.log"
   fi
+  cleanup_run_registry
   {
     echo "cluster=kind-$CLUSTER"
     echo "run_owned_prior_evidence=$prior_evidence"
@@ -119,15 +364,19 @@ if [[ "${1:---preflight}" == "--destroy" ]]; then
       echo "cluster_removed=true"
     fi
     echo "unrelated_kind_clusters_preserved=$(kind get clusters 2>/dev/null | tr '\n' ' ' || true)"
+    cat "$EVIDENCE/registry-cleanup.txt"
   } >"$EVIDENCE/cleanup-inventory.txt"
   echo "destroyed kind-$CLUSTER"
   (( failures == 0 )) || exit 2
   exit 0
 fi
 
-for cmd in docker kind kubectl helm kustomize go git openssl yq envsubst; do check_cmd "$cmd"; done
+for cmd in docker kind kubectl helm kustomize go git openssl python3 yq envsubst; do check_cmd "$cmd"; done
 check_cmd "$ISTIOCTL"
 check_repo KSERVE_REPO "$KSERVE_REPO"
+if [[ -n "$MAAS_API_TRANSLATION_SCHEMA_REPO" ]]; then
+  check_repo MAAS_API_TRANSLATION_SCHEMA_REPO "$MAAS_API_TRANSLATION_SCHEMA_REPO"
+fi
 mkdir -p "$EVIDENCE_ROOT/.image-inputs"
 
 if [[ "$MAAS_SOURCE_MODE" == canonical-main ]]; then
@@ -178,6 +427,7 @@ if [[ "${BUILD_KATAN:-false}" == true ]]; then check_repo LLM_KATAN_REPO; fi
 check_repo MAAS_CONTROLLER_REPO
 check_repo KUADRANT_OPERATOR_REPO
 check_repo PRAXIS_EXTPROC_REPO
+if [[ -n "$PRAXIS_AI_REPO" ]]; then check_repo PRAXIS_AI_REPO; fi
 if [[ -n "${EXPECTED_EXTPROC_MAIN_SHA:-}" ]]; then
   extproc_branch=$(git -C "$PRAXIS_EXTPROC_REPO" branch --show-current)
   extproc_head=$(git -C "$PRAXIS_EXTPROC_REPO" rev-parse HEAD)
@@ -220,6 +470,13 @@ for pair in \
   printf '%s\n' "$source_diff" >"$EVIDENCE/${label}.diff.sha256"
   if [[ "$label" == extproc ]]; then
     printf 'branch=%s\ncommit=%s\n' "$(git -C "$source" branch --show-current)" "$source_sha" >"$EVIDENCE/extproc-source.txt"
+    if [[ -n "$PRAXIS_AI_REPO" ]]; then
+      ai_sha=$(git -C "$PRAXIS_AI_REPO" rev-parse HEAD)
+      ai_diff=$(dirty_hash "$PRAXIS_AI_REPO")
+      printf 'branch=%s\ncommit=%s\nworktree_fingerprint=%s\n' \
+        "$(git -C "$PRAXIS_AI_REPO" branch --show-current)" "$ai_sha" "$ai_diff" >"$EVIDENCE/praxis-ai-source.txt"
+      printf 'praxis-ai=%s\n%s\n' "$ai_sha" "$ai_diff" >>"$EVIDENCE/${label}.inputs"
+    fi
   fi
   cache="$EVIDENCE_ROOT/.image-inputs/$label"
   rebuild=true
@@ -230,7 +487,13 @@ for pair in \
     case "$label" in
       controller) timeout 900s docker build --platform linux/amd64 -t "$image" -f "$source/$dockerfile" "$source" ;;
       katan) timeout 900s docker build --platform linux/amd64 -t "$image" -f "$source/$dockerfile" "$source" ;;
-      extproc) timeout 1200s docker build --platform linux/amd64 -t "$image" -f "$source/$dockerfile" "$source" ;;
+      extproc)
+        if [[ -n "$PRAXIS_AI_REPO" ]]; then
+          build_extproc_with_local_ai "$source" "$PRAXIS_AI_REPO" "$image"
+        else
+          timeout 1200s docker build --platform linux/amd64 -t "$image" -f "$source/$dockerfile" "$source"
+        fi
+        ;;
       maas-api) timeout 1200s docker build --platform linux/amd64 -t "$image" -f "$source/$dockerfile" "$source" ;;
       maas-controller) timeout 1200s docker build --platform linux/amd64 -t "$image" -f "$source/$dockerfile" "$source" ;;
     esac
@@ -238,6 +501,10 @@ for pair in \
     echo "built_image=$image reason=source-inputs-changed-or-image-missing"
   else
     echo "reused_image=$image reason=source-inputs-unchanged"
+  fi
+  if [[ "$label" == controller ]]; then
+    docker image inspect "$image" --format '{{.Id}}' >"$EVIDENCE/controller-image-id.txt"
+    printf '%s\n' "$image" >"$EVIDENCE/controller-image-reference.txt"
   fi
 done
 
@@ -260,12 +527,32 @@ fi
 
 if [[ "${1:---preflight}" == "--provision" ]]; then
   printf '%s\n' "$EVIDENCE" >"$EVIDENCE_ROOT/.active-run"
-  kind get clusters | rg -qx "$CLUSTER" || kind create cluster --name "$CLUSTER"
+  create_run_registry
   "${KCTL[@]}" cluster-info >"$EVIDENCE/cluster-info.txt"
-  # Stop prior run-owned MaaS pods before replacing their node image tags;
-  # containerd retains images referenced by live containers.
+  # Stop prior run-owned controller pods before replacing their node image
+  # tags; containerd retains images referenced by live containers. A running
+  # AIGC pod can keep the previous image ID attached to a reused local tag.
   "${KCTL[@]}" -n maas-system scale deployment/maas-api deployment/maas-controller --replicas=0 >/dev/null 2>&1 || true
-  for selector in 'app.kubernetes.io/name=maas-api' 'control-plane=maas-controller'; do
+  aigc_deployment=$("${KCTL[@]}" -n opendatahub get deployment ai-gateway-controller -o json 2>/dev/null || true)
+  if [[ -n "$aigc_deployment" ]]; then
+    aigc_selector=$(jq -r '.spec.selector.matchLabels | to_entries | map(.key + "=" + .value) | join(",")' <<<"$aigc_deployment")
+    if [[ -z "$aigc_selector" ]]; then
+      fail "ai-gateway-controller Deployment has no selector before image replacement"
+      exit 2
+    fi
+    "${KCTL[@]}" -n opendatahub scale deployment/ai-gateway-controller --replicas=0 >/dev/null
+    aigc_pods="present"
+    for _ in $(seq 1 60); do
+      aigc_pods=$("${KCTL[@]}" -n opendatahub get pods -l "$aigc_selector" -o name 2>/dev/null || true)
+      [[ -z "$aigc_pods" ]] && break
+      sleep 1
+    done
+    if [[ -n "$aigc_pods" ]]; then
+      fail "prior ai-gateway-controller pods did not stop before image replacement"
+      exit 2
+    fi
+  fi
+  for selector in 'control-plane=maas-controller'; do
     for _ in $(seq 1 60); do
       [[ -z $("${KCTL[@]}" -n maas-system get pods -l "$selector" -o name 2>/dev/null || true) ]] && break
       sleep 1
@@ -358,17 +645,23 @@ if [[ "${1:---preflight}" == "--provision" ]]; then
   "${KCTL[@]}" -n maas-system create secret tls maas-controller-metrics-tls \
     --cert="$controller_tls_tmp/tls.crt" --key="$controller_tls_tmp/tls.key" \
     --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
-  kustomize build "$MAAS_CONTROLLER_REPO/deployment/base/maas-controller/default" | sed -e "s#quay.io/opendatahub/maas-api:latest#${MAAS_API_IMAGE:-maas-api:external-model-two-plane}#g" -e "s#quay.io/opendatahub/maas-controller:latest#${MAAS_CONTROLLER_IMAGE:-maas-controller:external-model-two-plane}#g" -e "s#quay.io/opendatahub/maas-controller:odh-stable#${MAAS_CONTROLLER_IMAGE:-maas-controller:external-model-two-plane}#g" -e 's#openshift-ingress#maas-system#g' -e 's#namespace: opendatahub#namespace: maas-system#g' -e 's#namespace: system#namespace: maas-system#g' | yq eval 'select(.kind != "ServiceMonitor" and .kind != "ValidatingWebhookConfiguration")' - >"$EVIDENCE/maas-controller-kind-rendered.yaml"
+  kustomize build "$MAAS_CONTROLLER_REPO/deployment/base/maas-controller/default" | sed -e "s#quay.io/opendatahub/maas-api:latest#${MAAS_API_RUNTIME_IMAGE}#g" -e "s#quay.io/opendatahub/maas-api:odh-stable#${MAAS_API_RUNTIME_IMAGE}#g" -e "s#quay.io/opendatahub/maas-controller:latest#${MAAS_CONTROLLER_IMAGE:-maas-controller:external-model-two-plane}#g" -e "s#quay.io/opendatahub/maas-controller:odh-stable#${MAAS_CONTROLLER_IMAGE:-maas-controller:external-model-two-plane}#g" -e 's#openshift-ingress#maas-system#g' -e 's#namespace: opendatahub#namespace: maas-system#g' -e 's#namespace: system#namespace: maas-system#g' | yq eval 'select(.kind != "ServiceMonitor" and .kind != "ValidatingWebhookConfiguration")' - >"$EVIDENCE/maas-controller-kind-rendered.yaml"
+  # This run-owned Deployment may contain the literal image override from an
+  # earlier provision. Delete it before applying the upstream valueFrom form;
+  # otherwise apply can merge both env representations and reject the spec.
+  "${KCTL[@]}" -n maas-system delete deployment maas-controller --ignore-not-found --wait=true
   "${KCTL[@]}" apply -f "$EVIDENCE/maas-controller-kind-rendered.yaml"
-  "${KCTL[@]}" -n maas-system patch deployment maas-api --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Never"}]' 2>/dev/null || true
+  apply_maas_api_translation_schema
+  "${KCTL[@]}" -n maas-system set env deployment/maas-controller "RELATED_IMAGE_ODH_MAAS_API_IMAGE=${MAAS_API_RUNTIME_IMAGE}"
   "${KCTL[@]}" -n maas-system patch deployment maas-controller --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Never"}]'
   # The webhook Secret is created below before the controller is restarted.
   # Run the binary directly: a shell wrapper can race projected Secret mounts
   # and obscure the controller's startup error in Kind.
   "${KCTL[@]}" -n maas-system patch deployment maas-controller --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/args/3","value":"--metrics-secure=false"},{"op":"replace","path":"/spec/template/spec/containers/0/command","value":["/manager"]},{"op":"replace","path":"/spec/template/spec/containers/0/args","value":["--leader-elect","--health-probe-bind-address=:8081","--metrics-bind-address=:8080","--metrics-secure=false","--controller-namespace=maas-system","--gateway-name=maas-default-gateway","--gateway-namespace=maas-system","--infra-namespace=AUTO","--maas-subscription-namespace=models-as-a-service","--aitenant-namespace=ai-tenants","--monitoring-namespace=opendatahub","--enable-tenant-namespace-discovery","--metadata-cache-ttl=60","--authz-cache-ttl=60","--log-format=zap"]}]'
-  # The rendered MaaS deployment may already have created an old ReplicaSet
-  # before the pull-policy patch. Force a fresh template so the new pod uses
-  # the exact image loaded into Kind instead of attempting a registry pull.
+  # Restart the source-built controller after the run-owned serving
+  # certificates are available. It will create API Deployments using the
+  # source-built image published to the run-owned registry; its Always pull
+  # policy remains intact.
   "${KCTL[@]}" -n maas-system rollout restart deployment/maas-controller
   "${KCTL[@]}" -n maas-system rollout restart deployment/maas-api 2>/dev/null || true
   # Kind has no OpenShift service-ca injection. The MaaS webhook is therefore
@@ -416,9 +709,10 @@ EOF
   "${KCTL[@]}" -n maas-system create secret tls maas-api-tenant-b-serving-cert --cert="$db_tmp/tenant-b-tls.crt" --key="$db_tmp/tenant-b-tls.key" --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
   "${KCTL[@]}" -n maas-system create secret tls maas-api-transition-serving-cert --cert="$db_tmp/transition-tls.crt" --key="$db_tmp/transition-tls.key" --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
   "${KCTL[@]}" -n kuadrant-system create configmap authorino-maas-api-ca --from-file=ca.crt="$db_tmp/ca.crt" --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
-  # Authorino's operator-supported volume projection mounts the dedicated CA
-  # into /etc/ssl/certs, where Go's system pool discovers it. The mounted file
-  # contains only this run's CA; no system bundle or TLS bypass is configured.
+  # Authorino's operator-supported volume projection mounts this run's CA at
+  # /etc/ssl/certs/maas-api-serving-ca.crt. A standalone file in that directory
+  # is not added to Go's system trust bundle, so point Authorino explicitly at
+  # it. Keep TLS verification enabled; the CA is limited to this run's MaaS API.
   authorino_found=false
   for _ in $(seq 1 60); do
     if "${KCTL[@]}" -n kuadrant-system get authorino authorino >/dev/null 2>&1; then
@@ -429,6 +723,11 @@ EOF
   done
   [[ "$authorino_found" == true ]] || { fail "Kuadrant did not create the run-owned Authorino resource"; exit 2; }
   "${KCTL[@]}" -n kuadrant-system patch authorino authorino --type=merge -p='{"spec":{"volumes":{"defaultMode":420,"items":[{"name":"maas-api-serving-ca","mountPath":"/etc/ssl/certs","configMaps":["authorino-maas-api-ca"],"items":[{"key":"ca.crt","path":"maas-api-serving-ca.crt"}]}]}}}'
+  "${KCTL[@]}" -n kuadrant-system set env deployment/authorino \
+    SSL_CERT_FILE=/etc/ssl/certs/maas-api-serving-ca.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/maas-api-serving-ca.crt
+  printf '%s\n' 'Authorino callback trust: SSL_CERT_FILE and REQUESTS_CA_BUNDLE point to the run-owned MaaS API CA; TLS verification remains enabled.' \
+    >"$EVIDENCE/authorino-callback-trust-config.txt"
   "${KCTL[@]}" -n kuadrant-system get authorino authorino -o yaml >"$EVIDENCE/authorino-ca-config.yaml"
   kustomize build "$MAAS_CONTROLLER_REPO/deployment/base/maas-api/rbac" | sed 's#namespace: opendatahub#namespace: maas-system#g' | "${KCTL[@]}" apply -f -
   "${KCTL[@]}" apply -f "$ROOT/test/kind-env/manifests/31-maas-api-kind-rbac.yaml"
@@ -439,7 +738,19 @@ EOF
   # Repeated local runs may leave the old static maas-api object in place.
   # Let the current MaaS tenant pipeline create its canonical object so
   # server-side apply cannot merge stale OpenShift fields into the Kind spec.
+  # TenantReconciler watches MaasTenantConfig, not child Deployment deletion,
+  # so explicitly enqueue it after removing the stale static objects.
   "${KCTL[@]}" -n maas-system delete deployment maas-api service maas-api --ignore-not-found
+  reconcile_trigger="${STAMP}"
+  if "${KCTL[@]}" -n models-as-a-service get maastenantconfig default-tenant >/dev/null 2>&1; then
+    "${KCTL[@]}" -n models-as-a-service annotate maastenantconfig default-tenant \
+      "local-env.opendatahub.io/provision-reconcile=$reconcile_trigger" --overwrite >/dev/null
+    printf 'tenant=models-as-a-service/default-tenant annotation=local-env.opendatahub.io/provision-reconcile value=%s reason=child-deployment-deletion_is_not_watched\n' \
+      "$reconcile_trigger" >"$EVIDENCE/maas-tenant-reconcile-trigger.txt"
+  else
+    printf 'tenant=models-as-a-service/default-tenant annotation=local-env.opendatahub.io/provision-reconcile action=deferred reason=MaasTenantConfig_is_created_after_AITenant\n' \
+      >"$EVIDENCE/maas-tenant-reconcile-trigger.txt"
+  fi
   if [[ "${LOCAL_ENV_SKIP_UNSUPPORTED_AIGUARDRAIL_CRD:-false}" == true ]]; then
     # The focused provider-selection fixture does not use AIGuardrail. Some
     # Kind API server builds reject its isDuration CEL helper, so omit only
@@ -453,7 +764,58 @@ EOF
   else
   kustomize build "$ROOT/config/crd" | "${KCTL[@]}" apply --server-side -f -
   fi
-  kustomize build "$ROOT/config/self/default" | "${KCTL[@]}" apply --server-side --force-conflicts -f -
+  # OpenShift service-ca creates this secure metrics certificate. Kind does
+  # not run that controller, so provide a run-owned TLS certificate in memory
+  # before creating the Deployment; metrics remain TLS-enabled in the test.
+  if ! "${KCTL[@]}" -n opendatahub get secret ai-gateway-controller-metrics-tls >/dev/null 2>&1; then
+    python3 - "$EVIDENCE/ai-gateway-controller-metrics-cert.crt" <<'PY' | "${KCTL[@]}" apply -f -
+import base64, datetime, pathlib, sys
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ai-gateway-controller-metrics.opendatahub.svc")])
+now = datetime.datetime.now(datetime.timezone.utc)
+cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+        .serial_number(x509.random_serial_number()).not_valid_before(now - datetime.timedelta(minutes=1))
+        .not_valid_after(now + datetime.timedelta(days=2))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False, key_encipherment=True,
+                                     data_encipherment=False, key_agreement=False, key_cert_sign=False,
+                                     crl_sign=False, encipher_only=None, decipher_only=None), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=True)
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(dns) for dns in (
+            "ai-gateway-controller-metrics", "ai-gateway-controller-metrics.opendatahub.svc",
+            "ai-gateway-controller-metrics.opendatahub.svc.cluster.local")]), critical=False)
+        .sign(key, hashes.SHA256()))
+cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+key_pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+                            serialization.NoEncryption())
+pathlib.Path(sys.argv[1]).write_bytes(cert_pem)
+sys.stdout.write("apiVersion: v1\nkind: Secret\nmetadata:\n  name: ai-gateway-controller-metrics-tls\n  namespace: opendatahub\ntype: kubernetes.io/tls\ndata:\n  tls.crt: " + base64.b64encode(cert_pem).decode() + "\n  tls.key: " + base64.b64encode(key_pem).decode() + "\n")
+PY
+    openssl x509 -in "$EVIDENCE/ai-gateway-controller-metrics-cert.crt" \
+      -noout -issuer -subject -serial -fingerprint -sha256 -ext subjectAltName \
+      >"$EVIDENCE/ai-gateway-controller-metrics-cert.txt"
+    sha256sum "$EVIDENCE/ai-gateway-controller-metrics-cert.crt" \
+      >"$EVIDENCE/ai-gateway-controller-metrics-cert.sha256"
+    printf '%s\n' 'run-owned metrics TLS certificate generated in memory because Kind has no OpenShift service-ca; metrics remain TLS-enabled.' \
+      >"$EVIDENCE/ai-gateway-controller-metrics-cert-purpose.txt"
+  fi
+
+  kustomize build "$ROOT/config/self/default" >"$EVIDENCE/ai-gateway-controller-self-rendered.yaml"
+  if "${KCTL[@]}" get crd servicemonitors.monitoring.coreos.com >/dev/null 2>&1; then
+    cp "$EVIDENCE/ai-gateway-controller-self-rendered.yaml" "$EVIDENCE/ai-gateway-controller-self-kind.yaml"
+  else
+    yq eval 'select(.kind != "ServiceMonitor")' "$EVIDENCE/ai-gateway-controller-self-rendered.yaml" \
+      >"$EVIDENCE/ai-gateway-controller-self-kind.yaml"
+    printf '%s\n' \
+      'ServiceMonitor objects omitted because the run-owned Kind cluster does not install Prometheus Operator CRDs; this monitoring object is not used by translation or routing assertions.' \
+      >"$EVIDENCE/kind-servicemonitor-exclusion.txt"
+  fi
+  "${KCTL[@]}" apply --server-side --force-conflicts -f "$EVIDENCE/ai-gateway-controller-self-kind.yaml"
   if [[ "${LOCAL_ENV_PATCH_EXTERNALMODEL_FINALIZER_RBAC:-false}" == true ]]; then
     # The source ClusterRole lacks patch on ExternalModels even though the
     # current controller adds its cleanup finalizer with Patch. This fixture
@@ -486,6 +848,8 @@ EOF
       "--known-cluster=provider-provider-b",
       "--known-cluster=provider-provider-proof-a",
       "--known-cluster=provider-provider-proof-b",
+      "--known-cluster=provider-api-translation-openai",
+      "--known-cluster=provider-api-translation-anthropic",
       "--known-cluster=provider-transition-provider",
       ("--image=" + $extproc_image)
     ] + $extra_known)}
@@ -619,6 +983,7 @@ EOF
   make_katan_tls provider-b-tls provider-b provider-b-ext
   make_katan_tls provider-proof-a-tls provider-proof-a-ext
   make_katan_tls provider-proof-b-tls provider-proof-b-ext
+  make_katan_tls provider-translation-tls provider-translation-ext provider-translation-openai-ext
   make_katan_tls provider-a-tenant-b-tls provider-a-tenant-b
   make_katan_tls provider-b-tenant-b-tls provider-b-tenant-b
   make_katan_tls provider-transition-tls provider-a-legacy
@@ -628,15 +993,43 @@ EOF
   # the generated DestinationRules can verify Katan without
   # insecureSkipVerify or a plaintext exception. Never overwrite a preexisting
   # shared fixture ConfigMap on a non-disposable cluster.
-  if "${KCTL[@]}" -n maas-system get configmap external-model-e2e-provider-ca >/dev/null 2>&1; then
-    fail "maas-system/external-model-e2e-provider-ca already exists; refusing to overwrite shared trust state"
+  provider_ca_configmap=maas-system/external-model-e2e-provider-ca
+  provider_ca_configmap_changed=false
+  provider_ca_get_error="$EVIDENCE/provider-ca-configmap-get.err"
+  if existing_provider_ca=$("${KCTL[@]}" -n maas-system get configmap external-model-e2e-provider-ca -o json 2>"$provider_ca_get_error"); then
+    existing_run_id=$(jq -r '.metadata.labels["external-model-e2e/run-id"] // ""' <<<"$existing_provider_ca")
+    existing_manager=$(jq -r '.metadata.labels["app.kubernetes.io/managed-by"] // ""' <<<"$existing_provider_ca")
+    if [[ "$existing_run_id" != "$CLUSTER" || "$existing_manager" != external-model-e2e ]]; then
+      fail "$provider_ca_configmap exists without matching run ownership; refusing to overwrite shared trust state"
+      exit 2
+    fi
+    existing_provider_ca_sha=$(jq -r '.data["ca.crt"]' <<<"$existing_provider_ca" | sha256sum | awk '{print $1}')
+    new_provider_ca_sha=$(sha256sum "$db_tmp/ca.crt" | awk '{print $1}')
+    if [[ "$existing_provider_ca_sha" != "$new_provider_ca_sha" ]]; then
+      provider_ca_configmap_changed=true
+      printf 'configmap=%s run_id=%s previous_ca_sha256=%s new_ca_sha256=%s action=rotate_run_owned_fixture_ca\n' \
+        "$provider_ca_configmap" "$CLUSTER" "$existing_provider_ca_sha" "$new_provider_ca_sha" \
+        >"$EVIDENCE/provider-ca-configmap-rotation.txt"
+    else
+      printf 'configmap=%s run_id=%s ca_sha256=%s action=retain_matching_run_owned_fixture_ca\n' \
+        "$provider_ca_configmap" "$CLUSTER" "$new_provider_ca_sha" \
+        >"$EVIDENCE/provider-ca-configmap-rotation.txt"
+    fi
+  elif rg -q 'Error from server \(NotFound\): configmaps "external-model-e2e-provider-ca" not found' "$provider_ca_get_error"; then
+    provider_ca_configmap_changed=true
+    printf 'configmap=%s run_id=%s action=create_run_owned_fixture_ca\n' \
+      "$provider_ca_configmap" "$CLUSTER" >"$EVIDENCE/provider-ca-configmap-rotation.txt"
+  else
+    fail "could not verify ownership of $provider_ca_configmap; see provider-ca-configmap-get.err"
     exit 2
   fi
-  "${KCTL[@]}" -n maas-system create configmap external-model-e2e-provider-ca \
-    --from-file=ca.crt="$db_tmp/ca.crt" --dry-run=client -o yaml \
-    | "${KCTL[@]}" apply -f - >/dev/null
-  "${KCTL[@]}" -n maas-system label configmap external-model-e2e-provider-ca \
-    external-model-e2e/run-id="$CLUSTER" app.kubernetes.io/managed-by=external-model-e2e --overwrite >/dev/null
+  if [[ "$provider_ca_configmap_changed" == true ]]; then
+    "${KCTL[@]}" -n maas-system create configmap external-model-e2e-provider-ca \
+      --from-file=ca.crt="$db_tmp/ca.crt" --dry-run=client -o yaml \
+      | "${KCTL[@]}" apply -f - >/dev/null
+    "${KCTL[@]}" -n maas-system label configmap external-model-e2e-provider-ca \
+      external-model-e2e/run-id="$CLUSTER" app.kubernetes.io/managed-by=external-model-e2e --overwrite >/dev/null
+  fi
   for gateway_deployment in maas-default-gateway-istio maas-tenant-b-gateway-istio maas-transition-gateway-istio; do
     if ! "${KCTL[@]}" -n maas-system get deployment "$gateway_deployment" >/dev/null 2>&1; then
       continue
@@ -644,6 +1037,8 @@ EOF
     if ! "${KCTL[@]}" -n maas-system get deployment "$gateway_deployment" -o json \
       | jq -e '.spec.template.spec.volumes[]? | select(.name == "external-model-e2e-provider-ca")' >/dev/null; then
       "${KCTL[@]}" -n maas-system patch deployment "$gateway_deployment" --type=json -p='[{"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"external-model-e2e-provider-ca","configMap":{"name":"external-model-e2e-provider-ca","items":[{"key":"ca.crt","path":"ca.crt"}]}}},{"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"external-model-e2e-provider-ca","mountPath":"/etc/external-model-e2e/provider-ca","readOnly":true}}]' >/dev/null
+    elif [[ "$provider_ca_configmap_changed" == true ]]; then
+      "${KCTL[@]}" -n maas-system rollout restart deployment/"$gateway_deployment" >/dev/null
     fi
     "${KCTL[@]}" -n maas-system rollout status deployment/"$gateway_deployment" --timeout=120s
   done
@@ -653,7 +1048,7 @@ EOF
   # not let the disabled IPP deployment observe the Praxis ExternalModels.
   for manifest in "$ROOT/test/kind-env/manifests"/*.yaml; do
     case "$(basename "$manifest")" in
-      20-fixtures.yaml|21-fixtures-tenant-b.yaml|31-maas-api-kind-rbac.yaml|32-maas-api-kind-network.yaml|40-maas-fixtures.yaml|41-maas-fixtures-tenant-b.yaml|42-transition-fixtures.yaml|provider-proof-external-providers.yaml|provider-selection-proof.yaml) continue ;;
+      20-fixtures.yaml|21-fixtures-tenant-b.yaml|31-maas-api-kind-rbac.yaml|32-maas-api-kind-network.yaml|40-maas-fixtures.yaml|41-maas-fixtures-tenant-b.yaml|42-transition-fixtures.yaml|provider-proof-external-providers.yaml|provider-selection-proof.yaml|shared-translation-backend.yaml|shared-translation-routes.yaml|api-translation-provider-aware-backend.yaml) continue ;;
       45-real-openai-policies.yaml|60-client-kind-patch.yaml) continue ;;
     esac
     if [[ "$(basename "$manifest")" == 00-backends.yaml ]]; then
@@ -791,21 +1186,10 @@ EOF
     "${KCTL[@]}" -n maas-system rollout status deployment/"$ipp_deployment" --timeout=120s
   done
   "${KCTL[@]}" -n maas-system patch gateway maas-transition-gateway --subresource=status --type=merge -p='{"status":{"addresses":[{"type":"Hostname","value":"maas-transition-gateway.maas-system.svc.cluster.local"}]}}'
-  # MaaS API validates the internal gateway service during startup. Restart it
-  # after Istio has programmed the Gateway and populated its run-owned Service.
   # The tenant pipeline creates/reconciles one API Deployment per tenant.
-  # Restart every run-owned API instance after replacing its serving Secret so
-  # the process is definitely using the certificate signed by this run's CA.
-  for api_deployment in maas-api maas-api-tenant-b maas-api-transition; do
-    if "${KCTL[@]}" -n maas-system get deployment "$api_deployment" >/dev/null 2>&1; then
-      "${KCTL[@]}" -n maas-system rollout restart "deployment/$api_deployment"
-    fi
-  done
-  for api_deployment in maas-api maas-api-tenant-b maas-api-transition; do
-    if "${KCTL[@]}" -n maas-system get deployment "$api_deployment" >/dev/null 2>&1; then
-      "${KCTL[@]}" -n maas-system rollout status "deployment/$api_deployment" --timeout=180s
-    fi
-  done
+  # Wait for its first Deployment, then select the exact source-built image
+  # served by the run-owned registry. The controller retains imagePullPolicy
+  # Always and can now resolve every tenant API replica.
   maas_api_created=false
   for _ in $(seq 1 60); do
     if "${KCTL[@]}" -n maas-system get deployment maas-api >/dev/null 2>&1; then
@@ -815,6 +1199,73 @@ EOF
     sleep 3
   done
   [[ "$maas_api_created" == true ]] || { fail "MaaS tenant pipeline did not create the default maas-api"; exit 2; }
+  for api_deployment in maas-api maas-api-tenant-b maas-api-transition; do
+    if "${KCTL[@]}" -n maas-system get deployment "$api_deployment" >/dev/null 2>&1; then
+      "${KCTL[@]}" -n maas-system set image "deployment/$api_deployment" "maas-api=${MAAS_API_RUNTIME_IMAGE}"
+      # MaaS API validates the internal Gateway during startup and must read
+      # the serving certificate signed by this run's CA.
+      "${KCTL[@]}" -n maas-system rollout restart "deployment/$api_deployment"
+      "${KCTL[@]}" -n maas-system rollout status "deployment/$api_deployment" --timeout=180s
+    fi
+  done
+  api_runtime_ready=false
+  expected_maas_api_repo_digest=$(sed -n 's/^expected_registry_repo_digest=//p' "$EVIDENCE/maas-api-registry-node-image-identity.txt")
+  [[ -n "$expected_maas_api_repo_digest" ]] || {
+    fail "source-built MaaS API registry digest is missing from image identity evidence"; exit 2;
+  }
+  for _ in $(seq 1 90); do
+    all_api_runtime_ready=true
+    for api_deployment in maas-api maas-api-tenant-b maas-api-transition; do
+      if ! api_deployment_json=$("${KCTL[@]}" -n maas-system get deployment "$api_deployment" -o json 2>/dev/null) ||
+         ! api_selector=$(maas_api_deployment_pod_selector "$api_deployment_json" 2>/dev/null) ||
+         ! api_pods_json=$("${KCTL[@]}" -n maas-system get pods -l "$api_selector" -o json 2>/dev/null); then
+        all_api_runtime_ready=false
+        break
+      fi
+      if ! maas_api_pods_have_exact_ready_image "$api_pods_json" "$MAAS_API_RUNTIME_IMAGE" "$expected_maas_api_repo_digest"; then
+        all_api_runtime_ready=false
+        break
+      fi
+    done
+    if [[ "$all_api_runtime_ready" == true ]]; then
+      api_runtime_ready=true
+      break
+    fi
+    sleep 2
+  done
+  if [[ "$api_runtime_ready" != true ]]; then
+    "${KCTL[@]}" -n maas-system get deploy,pods -o json >"$EVIDENCE/maas-api-runtime-wait-failure.json"
+    fail "controller-managed MaaS API pods did not become ready on the exact source-built image"
+    exit 2
+  fi
+  api_runtime_records='[]'
+  for api_deployment in maas-api maas-api-tenant-b maas-api-transition; do
+    api_deployment_json=$("${KCTL[@]}" -n maas-system get deployment "$api_deployment" -o json)
+    api_selector=$(maas_api_deployment_pod_selector "$api_deployment_json")
+    api_pods_json=$("${KCTL[@]}" -n maas-system get pods -l "$api_selector" -o json)
+    api_runtime_row=$(jq -cn --argjson deployment "$api_deployment_json" --argjson pods "$api_pods_json" \
+      --arg expected_image "$MAAS_API_RUNTIME_IMAGE" --arg expected_image_digest "$expected_maas_api_repo_digest" '
+      [$deployment.spec.template.spec.containers[] | select(.name == "maas-api")][0] as $container |
+      {deployment:$deployment.metadata.name,image:$container.image,pullPolicy:$container.imagePullPolicy,
+       readyReplicas:($deployment.status.readyReplicas // 0),expectedImage:$expected_image,
+       expectedImageDigest:$expected_image_digest,
+       exactImage:($container.image == $expected_image),controllerManagedAlwaysPull:($container.imagePullPolicy == "Always"),
+       pods:[$pods.items[] | select(.metadata.deletionTimestamp == null) as $pod |
+         $pod.status.containerStatuses[]? | select(.name == "maas-api") |
+         {name:$pod.metadata.name,image:.image,imageID:.imageID,
+          podSpecImage:([$pod.spec.containers[]? | select(.name == "maas-api") | .image] | first),ready:(.ready == true)}],
+       exactReadyPodCount:([$pods.items[] |
+         select(.metadata.deletionTimestamp == null and .status.phase == "Running") |
+         select(any(.spec.containers[]?; .name == "maas-api" and .image == $expected_image)) |
+         select(any(.status.containerStatuses[]?;
+           .name == "maas-api" and .ready == true and ((.imageID // "" | sub("^containerd://"; "")) == $expected_image_digest)))] | length)}')
+    api_runtime_records=$(jq -cn --argjson rows "$api_runtime_records" --argjson row "$api_runtime_row" '$rows + [$row]')
+  done
+  printf '%s\n' "$api_runtime_records" >"$EVIDENCE/maas-api-runtime-deployments.json"
+  jq -e 'length == 3 and all(.[]; .exactImage and .controllerManagedAlwaysPull and .readyReplicas >= 1 and .exactReadyPodCount >= 1)' \
+    "$EVIDENCE/maas-api-runtime-deployments.json" >/dev/null || {
+    fail "all three controller-managed MaaS API Deployments must run the exact registry image with Always pulls"; exit 2;
+    }
   "${KCTL[@]}" -n ai-tenants get aitenant models-as-a-service -o yaml >"$EVIDENCE/aitenant-generated.yaml" 2>&1 || true
   "${KCTL[@]}" -n maas-system get config default -o yaml >"$EVIDENCE/maas-config-generated.yaml" 2>&1 || true
   "${KCTL[@]}" -n maas-system get deployment maas-api -o yaml >"$EVIDENCE/maas-api-generated.yaml" 2>&1 || true
@@ -836,6 +1287,55 @@ EOF
   [[ "$maas_api_target_count" == 1 && "$maas_api_ready_count" == 1 ]] || { fail "shared maas-api Service target must be exactly one Ready real MaaS API pod (targets=$maas_api_target_count ready=$maas_api_ready_count selector=$maas_api_selector)"; exit 2; }
   "${KCTL[@]}" -n maas-system rollout status deployment/maas-controller --timeout=180s
   "${KCTL[@]}" -n opendatahub rollout status deployment/ai-gateway-controller --timeout=180s
+  expected_controller_image=$(<"$EVIDENCE/controller-image-id.txt")
+  expected_controller_reference=$(<"$EVIDENCE/controller-image-reference.txt")
+  controller_deployment=$("${KCTL[@]}" -n opendatahub get deployment ai-gateway-controller -o json)
+  controller_selector=$(jq -r '.spec.selector.matchLabels | to_entries | map(.key + "=" + .value) | join(",")' <<<"$controller_deployment")
+  controller_pods=$("${KCTL[@]}" -n opendatahub get pods -l "$controller_selector" -o json)
+  expected_controller_cri_reference=$expected_controller_reference
+  if [[ "$expected_controller_cri_reference" != */* ]]; then
+    expected_controller_cri_reference="docker.io/library/$expected_controller_cri_reference"
+  fi
+  controller_cri_records='[]'
+  mapfile -t controller_ready_pods < <(jq -r -f "$ROOT/test/kind-env/controller-ready-manager-pods.jq" <<<"$controller_pods")
+  for controller_pod_row in "${controller_ready_pods[@]}"; do
+    IFS=$'\t' read -r controller_pod_name controller_node_name controller_pod_image_id controller_runtime_image <<<"$controller_pod_row"
+    controller_cri_json=$(docker exec "$controller_node_name" crictl inspecti "$expected_controller_cri_reference" 2>/dev/null || true)
+    if ! jq -e '.status.id and (.status.repoTags | type == "array")' <<<"$controller_cri_json" >/dev/null 2>&1; then
+      controller_cri_json='{}'
+    fi
+    controller_cri_record=$(jq -c \
+      --arg pod "$controller_pod_name" \
+      --arg node "$controller_node_name" \
+      --arg image "$controller_runtime_image" \
+      --arg pod_image_id "$controller_pod_image_id" \
+      --arg requested_reference "$expected_controller_cri_reference" \
+      '{name:$pod,node:$node,image:$image,pod_imageID:$pod_image_id,
+        runtime_imageID:(.status.id // null),repoTags:(.status.repoTags // []),
+        requested_tag_present:((.status.repoTags // []) | index($requested_reference) != null)}' \
+      <<<"$controller_cri_json")
+    controller_cri_records=$(jq -cn --argjson records "$controller_cri_records" --argjson record "$controller_cri_record" '$records + [$record]')
+  done
+  jq -n --arg expected_image "$expected_controller_reference" --arg expected_image_id "$expected_controller_image" \
+    --arg expected_cri_reference "$expected_controller_cri_reference" \
+    --argjson deployment "$controller_deployment" --argjson cri_records "$controller_cri_records" '
+      {expected_image:$expected_image,expected_image_id:$expected_image_id,
+       expected_cri_reference:$expected_cri_reference,
+       deployment_image:([ $deployment.spec.template.spec.containers[] | select(.name == "manager") | .image ] | first),
+       desired_replicas:($deployment.spec.replicas // 1),
+       ready_pods:$cri_records}' \
+    >"$EVIDENCE/controller-runtime-image-identity.json"
+  if ! jq -e '
+      . as $identity |
+      $identity.deployment_image == $identity.expected_image and
+      ($identity.ready_pods | length) == $identity.desired_replicas and
+      ([$identity.ready_pods[] |
+        .requested_tag_present == true and
+        .runtime_imageID == (.pod_imageID | sub("^containerd://"; ""))] | all)
+    ' "$EVIDENCE/controller-runtime-image-identity.json" >/dev/null; then
+    fail "running ai-gateway-controller pod is not using the source-built tag content; see controller-runtime-image-identity.json"
+    exit 2
+  fi
   wait_for_extproc() {
     local namespace=$1 name=$2
     for _ in $(seq 1 90); do

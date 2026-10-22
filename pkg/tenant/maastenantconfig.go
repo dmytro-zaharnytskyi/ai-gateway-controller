@@ -16,7 +16,12 @@ limitations under the License.
 
 package tenant
 
-import "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+import (
+	"errors"
+	"fmt"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+)
 
 // NewMaasTenantConfig returns an empty unstructured object with the
 // MaasTenantConfig GVK set, ready for Get or for use with the controller-
@@ -45,6 +50,35 @@ func UsesPraxis(mtc *unstructured.Unstructured) bool {
 	default:
 		return true
 	}
+}
+
+// APITranslationEnabled reads the authoritative MaaS-owned translation
+// permission. Missing fields are default-off. Malformed fields fail closed so
+// an older or incomplete installed CRD cannot silently enable translation.
+func APITranslationEnabled(mtc *unstructured.Unstructured) (bool, error) {
+	if mtc == nil {
+		return false, errors.New("MaasTenantConfig is required to read apiTranslation")
+	}
+	value, found, err := unstructured.NestedFieldNoCopy(mtc.Object, "spec", "apiTranslation")
+	if err != nil {
+		return false, fmt.Errorf("read spec.apiTranslation: %w", err)
+	}
+	if !found {
+		return false, nil
+	}
+	settings, ok := value.(map[string]any)
+	if !ok {
+		return false, fmt.Errorf("spec.apiTranslation must be an object, got %T", value)
+	}
+	enabled, found := settings["enabled"]
+	if !found {
+		return false, nil
+	}
+	flag, ok := enabled.(bool)
+	if !ok {
+		return false, fmt.Errorf("spec.apiTranslation.enabled must be a boolean, got %T", enabled)
+	}
+	return flag, nil
 }
 
 // IdentifierFor derives the per-tenant resource-naming identifier from

@@ -101,7 +101,7 @@ func TestTenantProvidersExcludeModelsBoundToOtherGateways(t *testing.T) {
 	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(
 		local, own, elsewhere, provider("local"), provider("own"), provider("elsewhere"),
 	).Build()}
-	_, required, err := r.providersForTenant(context.Background(), "tenant-a", "gw-a", "gateway-a")
+	_, required, err := r.providersForTenant(context.Background(), "tenant-a", "gw-a", "gateway-a", false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -197,6 +197,34 @@ func routeFilterNames(t *testing.T, r *Reconciler, tenantID, gatewayNamespace st
 	return names
 }
 
+func assertExactSelectedPathRule(t *testing.T, route *unstructured.Unstructured, path, stableID string) {
+	t.Helper()
+	rules := nestedSlice(t, route.Object, "spec", "rules")
+	for ruleIndex := range rules {
+		matches := nestedSlice(t, nestedMapAt(t, rules, ruleIndex), "matches")
+		for _, rawMatch := range matches {
+			match, ok := rawMatch.(map[string]any)
+			if !ok {
+				continue
+			}
+			pathType, hasPath, pathErr := unstructured.NestedString(match, "path", "type")
+			pathValue, _, valueErr := unstructured.NestedString(match, "path", "value")
+			if pathErr != nil || valueErr != nil {
+				t.Fatalf("read exact target path match: type error=%v value error=%v", pathErr, valueErr)
+			}
+			if !hasPath || pathType != "Exact" || pathValue != path {
+				continue
+			}
+			headers := nestedSlice(t, match, "headers")
+			if len(headers) == 1 && nestedString(t, nestedMapAt(t, headers, 0), "name") == selectedProviderHeader &&
+				nestedString(t, nestedMapAt(t, headers, 0), "value") == stableID {
+				return
+			}
+		}
+	}
+	t.Fatalf("no exact target-path match for %q gated by %s=%q", path, selectedProviderHeader, stableID)
+}
+
 func TestUserNamespaceModelServedOnlyAfterRouteAcceptance(t *testing.T) {
 	provider, secret := attachmentProvider("team")
 	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
@@ -762,6 +790,62 @@ func TestTooManyProvidersExcludesOnlyThatModel(t *testing.T) {
 	}
 }
 
+func TestSevenMessagesProvidersFitAttachmentRouteLimit(t *testing.T) {
+	objects := attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")
+	model := attachmentModel("wide", "team", "wide-model", time.Unix(100, 0), gatewayB)
+	model.Spec.ExternalProviderRefs = nil
+	for _, name := range []string{"p1", "p2", "p3", "p4", "p5", "p6", "p7"} {
+		provider, secret := attachmentProvider("team")
+		provider.Name, provider.UID = name, types.UID("uid-"+name)
+		provider.Spec.Provider = "anthropic"
+		objects = append(objects, provider)
+		if name == "p1" {
+			objects = append(objects, secret)
+		}
+		model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, v1alpha1.ExternalProviderRef{
+			Ref: v1alpha1.ExternalProviderReference{Name: name}, TargetModel: "claude", APIFormat: "messages", Path: "/v1/messages",
+		})
+	}
+	r := attachmentReconciler(t, append(objects, model)...)
+	setControllerTranslationEnabled(t, r, "tenant-b", true)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("seven Messages providers should fit 16 rules: phase=%q reason=%q", got.Status.Phase, readyReason(got))
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB)); err != nil {
+		t.Fatalf("16-rule Messages attachment has no route: %v", err)
+	}
+}
+
+func TestEightMessagesProvidersExceedAttachmentRouteLimit(t *testing.T) {
+	objects := attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")
+	model := attachmentModel("wide", "team", "wide-model", time.Unix(100, 0), gatewayB)
+	model.Spec.ExternalProviderRefs = nil
+	for _, name := range []string{"p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"} {
+		provider, secret := attachmentProvider("team")
+		provider.Name, provider.UID = name, types.UID("uid-"+name)
+		provider.Spec.Provider = "anthropic"
+		objects = append(objects, provider)
+		if name == "p1" {
+			objects = append(objects, secret)
+		}
+		model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, v1alpha1.ExternalProviderRef{
+			Ref: v1alpha1.ExternalProviderReference{Name: name}, TargetModel: "claude", APIFormat: "messages", Path: "/v1/messages",
+		})
+	}
+	r := attachmentReconciler(t, append(objects, model)...)
+	setControllerTranslationEnabled(t, r, "tenant-b", true)
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); readyReason(got) != reasonTooManyProviders {
+		t.Fatalf("reason = %q, want %q for 18 HTTPRoute rules", readyReason(got), reasonTooManyProviders)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB)); !apierrors.IsNotFound(err) {
+		t.Fatalf("over-budget Messages attachment received a route: %v", err)
+	}
+}
+
 func TestUnservedHomeAttachmentBlocksAggregateReady(t *testing.T) {
 	gatewayA := v1alpha1.NamespacedObjectReference{Name: "gw-a", Namespace: "gateway-a"}
 	provider, secret := attachmentProvider("tenant-a")
@@ -1276,7 +1360,7 @@ func publishOwnCandidates(t *testing.T, r *Reconciler, namespace string, gateway
 			Model: model, ClientName: model, Namespace: namespace, Provider: "local", Cluster: "provider-local", Weight: 1,
 		}}})
 	}
-	if _, err := r.publishTenantOverlay(context.Background(), namespace, gateway.Name, set, nil, nil, "tenant-source"); err != nil {
+	if _, err := r.publishTenantOverlay(context.Background(), namespace, gateway.Name, set, nil, nil, "tenant-source", false); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1370,6 +1454,84 @@ func TestTenantKeepsAttachmentsWhenItsOwnModelsServeNothing(t *testing.T) {
 		t.Fatalf("own deletion: %v", err)
 	}
 	assertServed("last own model deleted")
+}
+
+func TestTranslationDisabledHomeModelKeepsAttachmentServing(t *testing.T) {
+	r, attachment := servedAttachmentFixture(t)
+	provider, secret := attachmentProvider("tenant-b")
+	provider.Spec.Provider = "anthropic"
+	provider.Spec.Endpoint = "api.anthropic.com"
+	if err := r.Create(context.Background(), provider); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(context.Background(), secret); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatalf("reconcile Anthropic provider: %v", err)
+	}
+	own := attachmentModel("messages", "tenant-b", "anthropic-model", time.Unix(300, 0))
+	own.Spec.ExternalProviderRefs[0].APIFormat = "messages"
+	own.Spec.ExternalProviderRefs[0].Path = "/v1/messages"
+	if err := r.Create(context.Background(), own); err != nil {
+		t.Fatal(err)
+	}
+	setControllerTranslationEnabled(t, r, "tenant-b", true)
+	reconcileModel(t, r, own)
+	if got := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates; len(got) != 2 {
+		t.Fatalf("serving candidates before disabling translation = %#v, want home model and attachment", got)
+	}
+
+	setControllerTranslationEnabled(t, r, "tenant-b", false)
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(own)}); !errors.Is(err, resolver.ErrNoRoutes) {
+		t.Fatalf("reconcile with translation disabled = %v, want ErrNoRoutes", err)
+	}
+	if got := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates; len(got) != 1 || got[0].StableID != "team/chat/team/openai" {
+		t.Fatalf("remaining candidates = %#v, want the cross-namespace attachment", got)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-b", modelRouteName(own.Name)); !apierrors.IsNotFound(err) {
+		t.Fatalf("home HTTPRoute survived translation disable: %v", err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(attachment, gatewayB)); err != nil {
+		t.Fatalf("attachment HTTPRoute was removed with the home route: %v", err)
+	}
+	if names := routeFilterNames(t, r, "tenant-b", "gateway-b"); len(names) != 4 || names[0] != "team."+attachmentRouteName(attachment, gatewayB)+".0" {
+		t.Fatalf("remaining route filter patches = %v, want the attachment's five route rules", names)
+	}
+}
+
+func TestNewAttachmentCarriesEnabledTranslationInHandoff(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	provider.Spec.Provider = "anthropic"
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	model.Spec.ExternalProviderRefs[0].APIFormat = "messages"
+	model.Spec.ExternalProviderRefs[0].Path = "/v1/messages"
+	objects := []client.Object{provider, secret, model}
+	objects = append(objects, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	setControllerTranslationEnabled(t, r, "tenant-b", true)
+
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+
+	got := getModel(t, r, model)
+	condition := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+	if got.Status.Phase != resolver.PhaseReady || condition == nil || condition.Status != metav1.ConditionTrue {
+		t.Fatalf("attached model status = %#v, want Ready after translation-enabled handoff", got.Status)
+	}
+	env := overlayEnvelope(t, r, "tenant-b")
+	if len(env.Overlay.Candidates) != 1 || env.Overlay.Candidates[0].StableID != "team/chat/team/openai" {
+		t.Fatalf("overlay candidates = %#v, want the accepted attachment", env.Overlay.Candidates)
+	}
+	if env.Overlay.Candidates[0].APIFormat != "messages" {
+		t.Fatalf("attachment API format = %q, want messages", env.Overlay.Candidates[0].APIFormat)
+	}
+	route, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertExactSelectedPathRule(t, route, "/v1/messages", env.Overlay.Candidates[0].StableID)
 }
 
 func TestAttachmentKeepsTenantSelectionPolicy(t *testing.T) {

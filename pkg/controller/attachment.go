@@ -50,15 +50,16 @@ const (
 	reasonTenantNotSteady         = "TenantNotSteady"
 	reasonModelNameConflict       = "ModelNameConflict"
 	reasonTooManyProviders        = "TooManyProviders"
+	reasonTranslationDisabled     = "APITranslationDisabled"
 	reasonOverlayCapacityExceeded = "OverlayCapacityExceeded"
 	reasonAttachmentPending       = "AttachmentPending"
 
 	modelPhasePending = "Pending"
 	modelPhaseFailed  = "Failed"
 
-	// maxAttachedProviders keeps an attached model's HTTPRoute within the
-	// Gateway API limit of 16 rules: two per provider plus two sink rules.
-	maxAttachedProviders = 7
+	// Gateway API limits each HTTPRoute to 16 rules. Every provider uses two
+	// rules; the body-routing rule also matches its exact target path.
+	maxHTTPRouteRules = 16
 	// maxOverlayCandidates is the Praxis per-overlay candidate limit.
 	maxOverlayCandidates = 1024
 
@@ -82,17 +83,22 @@ var httpRouteGVK = schema.GroupVersionKind{Group: "gateway.networking.k8s.io", V
 
 // attachmentTenant is the Praxis tenant that owns an attached Gateway.
 type attachmentTenant struct {
-	gateway     v1alpha1.NamespacedObjectReference
-	namespace   string // MaasTenantConfig namespace
-	tenantID    string
-	aitenantUID types.UID
-	mtcUID      types.UID
+	gateway               v1alpha1.NamespacedObjectReference
+	namespace             string // MaasTenantConfig namespace
+	tenantID              string
+	aitenantUID           types.UID
+	mtcUID                types.UID
+	apiTranslationEnabled bool
 }
 
 // handoff is the tenant handoff state the attachment was gated on, re-checked
 // live before writing into the tenant.
 func (t attachmentTenant) handoff() modelTenantContext {
-	return modelTenantContext{aitenantUID: t.aitenantUID, mtcUID: t.mtcUID, gatewayName: t.gateway.Name, gatewayNamespace: t.gateway.Namespace}
+	return modelTenantContext{
+		aitenantUID: t.aitenantUID, mtcUID: t.mtcUID,
+		gatewayName: t.gateway.Name, gatewayNamespace: t.gateway.Namespace,
+		apiTranslationEnabled: t.apiTranslationEnabled,
+	}
 }
 
 // attachmentResult is the outcome of one gateway attachment.
@@ -304,6 +310,7 @@ func (r *Reconciler) gateAttachmentTenant(ctx context.Context, ait *unstructured
 			break
 		}
 		t.aitenantUID, t.mtcUID = live.aitenant.GetUID(), live.mtc.GetUID()
+		t.apiTranslationEnabled = live.apiTranslationEnabled
 		result.ready = true
 	}
 	return t, result, false, nil
@@ -789,7 +796,7 @@ func (r *Reconciler) resolveAttachedModel(ctx context.Context, t attachmentTenan
 		ready.Status.Phase = resolver.PhaseReady
 		providerPtrs = append(providerPtrs, ready)
 	}
-	set, err := resolver.Resolve([]*v1alpha1.ExternalModel{m}, providerPtrs)
+	set, err := resolver.ResolveWithAPITranslation([]*v1alpha1.ExternalModel{m}, providerPtrs, t.apiTranslationEnabled)
 	if err == nil {
 		err = r.validateResolvedCredentials(ctx, set.Routes())
 	}
@@ -806,13 +813,9 @@ func (r *Reconciler) resolveAttachedModel(ctx context.Context, t attachmentTenan
 		return nil
 	}
 	routes := set.Routes()
-	distinct := map[string]bool{}
-	for _, route := range routes {
-		distinct[route.Provider] = true
-	}
-	if len(distinct) > maxAttachedProviders {
+	if count := modelHTTPRouteRuleCount(routes); count > maxHTTPRouteRules {
 		candidate.reason = reasonTooManyProviders
-		candidate.message = fmt.Sprintf("%d providers exceed the limit of %d for an attached model", len(distinct), maxAttachedProviders)
+		candidate.message = fmt.Sprintf("%d HTTPRoute rules exceed the Gateway API limit of %d for an attached model", count, maxHTTPRouteRules)
 		return nil
 	}
 	if err := envelope.ValidateModel(set.Models[0], envelope.Options{KnownClusters: r.KnownClusters}); err != nil {
@@ -930,7 +933,7 @@ func excludedRoutes(attached []attachedModel) map[types.NamespacedName]bool {
 // own candidates followed by the attachments. Without served attachments the
 // own route set is published unchanged.
 func (r *Reconciler) publishTenantOverlay(ctx context.Context, namespace, gatewayName string, own *resolver.ResolvedRouteSet,
-	attached []attachedModel, preserved []envelope.Candidate, sourceUID string) (publisher.Result, error) {
+	attached []attachedModel, preserved []envelope.Candidate, sourceUID string, apiTranslationEnabled bool) (publisher.Result, error) {
 	set := own
 	if served := servedAttachments(attached); len(served) > 0 || own == nil {
 		set = &resolver.ResolvedRouteSet{}
@@ -953,7 +956,7 @@ func (r *Reconciler) publishTenantOverlay(ctx context.Context, namespace, gatewa
 		Network: r.Network, Gateway: gatewayName, Namespace: namespace, LocalSite: r.localSite(),
 	}, envelope.Options{
 		KnownClusters: r.KnownClusters, SourceUID: sourceUID, ProducerVersion: r.ProducerVersion,
-		PreservedCandidates: preserved,
+		PreservedCandidates: preserved, IncludeProviderProfiles: apiTranslationEnabled,
 	})
 }
 
@@ -975,7 +978,7 @@ func (r *Reconciler) keepTenantAttachments(ctx context.Context, t attachmentTena
 	if err := r.cleanupModelTransport(ctx, t.namespace, nil); err != nil {
 		return true, err
 	}
-	_, err = r.publishTenantOverlay(ctx, t.namespace, t.gateway.Name, nil, attached, nil, sourceUID)
+	_, err = r.publishTenantOverlay(ctx, t.namespace, t.gateway.Name, nil, attached, nil, sourceUID, t.apiTranslationEnabled)
 	return true, err
 }
 
@@ -1007,7 +1010,7 @@ func (r *Reconciler) publishAttachmentTenant(ctx context.Context, t attachmentTe
 	if len(preserved) == 0 && len(servedAttachments(admitted)) == 0 {
 		return admitted, r.cleanupOverlay(ctx, t.namespace)
 	}
-	if _, err := r.publishTenantOverlay(ctx, t.namespace, t.gateway.Name, nil, admitted, preserved, string(subject.UID)); err != nil {
+	if _, err := r.publishTenantOverlay(ctx, t.namespace, t.gateway.Name, nil, admitted, preserved, string(subject.UID), t.apiTranslationEnabled); err != nil {
 		return nil, err
 	}
 	return admitted, nil

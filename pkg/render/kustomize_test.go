@@ -112,15 +112,25 @@ func assertRenderedExtProcResource(t *testing.T, resource map[string]any) string
 		t.Fatalf("%s request_body_mode missing: found=%v err=%v", name, found, err)
 	}
 	responseMode, _, _ := unstructured.NestedString(resource, "typed_config", "processing_mode", "response_body_mode")
+	sendBodyBeforeHeader, sendBodyFound, sendBodyErr := unstructured.NestedBool(resource, "typed_config", "send_body_without_waiting_for_header_response")
+	if sendBodyErr != nil {
+		t.Fatalf("%s send_body_without_waiting_for_header_response: %v", name, sendBodyErr)
+	}
 	switch name {
 	case "envoy.filters.http.ext_proc.ipp":
+		if routeCacheAction, found, err := unstructured.NestedString(resource, "typed_config", "route_cache_action"); err != nil || found {
+			t.Fatalf("tenant-independent shared filter must leave route_cache_action unset: value=%q found=%t err=%v", routeCacheAction, found, err)
+		}
 		if mode != "BUFFERED" || responseMode != "BUFFERED" {
-			t.Fatalf("shared post-auth modes = request %q response %q, want BUFFERED/BUFFERED", mode, responseMode)
+			t.Fatalf("rendered shared post-auth modes = request %q response %q, want main-compatible BUFFERED/BUFFERED defaults", mode, responseMode)
 		}
 		return "post"
 	case "envoy.filters.http.ext_proc.external-model":
 		if mode != "NONE" || responseMode != "NONE" {
 			t.Fatalf("ExternalModel post-auth modes = request %q response %q, want NONE/NONE", mode, responseMode)
+		}
+		if sendBodyFound || sendBodyBeforeHeader {
+			t.Fatal("default ExternalModel post-auth filter must retain main request ordering with early body delivery unset")
 		}
 		return "external"
 	default:
@@ -204,6 +214,7 @@ func TestRenderedExtProcPreservesBufferedMaaSAndAddsHeaderPhaseExternalModel(t *
 			externalModelPre++
 		}
 	}
+	preAuthResponseNone := assertRenderedIPPPreResponseNone(t, patches)
 
 	for _, raw := range patches {
 		patch, ok := raw.(map[string]any)
@@ -228,8 +239,35 @@ func TestRenderedExtProcPreservesBufferedMaaSAndAddsHeaderPhaseExternalModel(t *
 		preAuth++
 	}
 
-	if postAuth == 0 || externalModel == 0 || preAuth == 0 || externalModelPre == 0 || externalModelDefaultDisabled < 2 {
-		t.Fatalf("expected buffered post-auth, header-phase ExternalModel, shared pre-auth, fail-closed ExternalModel pre-auth, and default-disabled patches; post=%d external=%d pre=%d externalPre=%d disabled=%d",
-			postAuth, externalModel, preAuth, externalModelPre, externalModelDefaultDisabled)
+	if postAuth != 4 || preAuthResponseNone != 4 || externalModel == 0 || preAuth == 0 || externalModelPre == 0 || externalModelDefaultDisabled < 2 {
+		t.Fatalf(
+			"expected four default-buffered shared post-auth and four ipp-pre response NONE patches, plus the ExternalModel phases and default-disabled patches; "+
+				"post=%d ippPreNone=%d external=%d pre=%d externalPre=%d disabled=%d",
+			postAuth, preAuthResponseNone, externalModel, preAuth, externalModelPre, externalModelDefaultDisabled)
 	}
+}
+
+func assertRenderedIPPPreResponseNone(t *testing.T, patches []any) int {
+	t.Helper()
+	count := 0
+	for _, raw := range patches {
+		patch, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		value, ok := patch["patch"].(map[string]any)
+		if !ok {
+			continue
+		}
+		resource, ok := value["value"].(map[string]any)
+		if !ok || resource["name"] != "envoy.filters.http.ext_proc.ipp-pre" {
+			continue
+		}
+		mode, found, err := unstructured.NestedString(resource, "typed_config", "processing_mode", "response_body_mode")
+		if err != nil || !found || mode != "NONE" {
+			t.Fatalf("pre-auth response_body_mode = %q, found=%t err=%v, want NONE", mode, found, err)
+		}
+		count++
+	}
+	return count
 }

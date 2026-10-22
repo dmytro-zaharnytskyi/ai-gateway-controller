@@ -12,6 +12,8 @@ spec:
   auth:
     type: apikey
     secretRef: {name: provider-proof-a-credentials}
+  config:
+    tls.caCertificates: /etc/external-model-e2e/provider-ca/ca.crt
 ---
 apiVersion: inference.opendatahub.io/v1alpha1
 kind: ExternalProvider
@@ -27,3 +29,5 @@ spec:
   auth:
     type: apikey
     secretRef: {name: provider-proof-b-credentials}
+  config:
+    tls.caCertificates: /etc/external-model-e2e/provider-ca/ca.crt
