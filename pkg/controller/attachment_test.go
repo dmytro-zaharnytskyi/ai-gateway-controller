@@ -28,6 +28,7 @@ import (
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
 )
@@ -863,10 +864,24 @@ func TestUnservedHomeAttachmentBlocksAggregateReady(t *testing.T) {
 	if got := getModel(t, r, model); got.Status.Phase == resolver.PhaseReady || readyReason(got) != reasonTenantNotPraxis {
 		t.Fatalf("status = %q/%q, want the unserved home attachment reported", got.Status.Phase, readyReason(got))
 	}
-	// The provider's IPP cleanup keeps the transport the attachment route uses.
+	// The provider's IPP cleanup keeps the transport the attachment route uses,
+	// read live even while its cache has not seen the route yet.
+	cached, ok := r.Client.(client.WithWatch)
+	if !ok {
+		t.Fatal("the test client must support watches")
+	}
+	r.Client = interceptor.NewClient(cached, interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if routes, ok := list.(*unstructured.UnstructuredList); ok && routes.GetKind() == "HTTPRouteList" {
+				return nil
+			}
+			return c.List(ctx, list, opts...)
+		},
+	})
 	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
 		t.Fatal(err)
 	}
+	r.Client = cached
 	if _, err := getUnstructured(r, schema.GroupVersionKind{Version: "v1", Kind: "Service"}, "tenant-a", "provider-openai"); err != nil {
 		t.Fatalf("provider Service removed while the attachment route uses it: %v", err)
 	}
@@ -880,6 +895,24 @@ func TestUnservedHomeAttachmentBlocksAggregateReady(t *testing.T) {
 	}
 	reconcileModel(t, r, model)
 	assertTransportCollected(t, r, "tenant-a", "chat")
+}
+
+func TestAttachmentRouteIsAppliedBeforeItsTransport(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	r := attachmentReconciler(t, append([]client.Object{provider, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)...)
+	var applied []string
+	r.ApplyResource = func(ctx context.Context, c client.Client, obj unstructured.Unstructured) error {
+		applied = append(applied, obj.GetKind()+"/"+obj.GetName())
+		return render.Apply(ctx, c, []unstructured.Unstructured{obj})
+	}
+	reconcileModel(t, r, model)
+	route := slices.Index(applied, "HTTPRoute/"+attachmentRouteName(model, gatewayB))
+	for _, backend := range []string{"Service/provider-openai", "ServiceEntry/provider-openai", "Service/" + providerSelectionSinkName("chat")} {
+		if i := slices.Index(applied, backend); route < 0 || i < route {
+			t.Fatalf("apply order = %v, want the attachment route before %s", applied, backend)
+		}
+	}
 }
 
 // failingTenantReader fails live reads of one tenant's MaasTenantConfig, as

@@ -1073,9 +1073,11 @@ func (r *Reconciler) ownRoutePatches(ctx context.Context, t attachmentTenant) ([
 	return own, nil
 }
 
-// applyAttachmentRoute applies the model-namespace transport and the
-// attachment's HTTPRoute. Provider Services, ServiceEntries and the selection
-// sink are shared with the model's other attachments.
+// applyAttachmentRoute applies the attachment's HTTPRoute and then the
+// model-namespace transport. Provider Services, ServiceEntries and the
+// selection sink are shared with the model's other attachments. The route
+// goes first, so the provider reconciler's IPP cleanup, which keeps the
+// transport of the routes it reads live, never sees a Service without it.
 func (r *Reconciler) applyAttachmentRoute(ctx context.Context, a attachedModel, t attachmentTenant, providerOwners map[string]*v1alpha1.ExternalProvider) error {
 	m := a.model
 	route := modelHTTPRouteSet(a.routes, m.Namespace, t.gateway.Name, t.gateway.Namespace)
@@ -1117,7 +1119,7 @@ func (r *Reconciler) applyAttachmentRoute(ctx context.Context, a attachedModel, 
 	} else if existing != nil && !isAttachmentRoute(existing, m, t.gateway) {
 		return fmt.Errorf("HTTPRoute %s/%s exists with a different identity; refusing to adopt it", m.Namespace, a.routeName)
 	}
-	return r.applyResources(ctx, append(resources, sink, route))
+	return r.applyResources(ctx, append([]unstructured.Unstructured{route}, append(resources, sink)...))
 }
 
 func (r *Reconciler) applyResources(ctx context.Context, resources []unstructured.Unstructured) error {
@@ -1289,11 +1291,11 @@ func (r *Reconciler) credentialCopyOwned(ctx context.Context, namespace string, 
 }
 
 // listAttachmentRoutes lists controller-owned attachment HTTPRoutes.
-func (r *Reconciler) listAttachmentRoutes(ctx context.Context, opts ...client.ListOption) ([]unstructured.Unstructured, error) {
+func (r *Reconciler) listAttachmentRoutes(ctx context.Context, reader client.Reader, opts ...client.ListOption) ([]unstructured.Unstructured, error) {
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(httpRouteGVK.GroupVersion().WithKind("HTTPRouteList"))
 	opts = append(opts, client.MatchingLabels{"app.kubernetes.io/managed-by": "ai-gateway-controller"}, client.HasLabels{tenant.LabelAttachmentTenant})
-	if err := r.List(ctx, list, opts...); err != nil {
+	if err := reader.List(ctx, list, opts...); err != nil {
 		return nil, fmt.Errorf("list attachment HTTPRoutes: %w", err)
 	}
 	return list.Items, nil
@@ -1390,7 +1392,7 @@ func (r *Reconciler) gcAttachmentState(ctx context.Context, tenantNamespace stri
 		// Never collect across namespaces.
 		return nil
 	}
-	routes, err := r.listAttachmentRoutes(ctx, client.MatchingLabels{tenant.LabelAttachmentTenant: tenantNamespace})
+	routes, err := r.listAttachmentRoutes(ctx, r.Client, client.MatchingLabels{tenant.LabelAttachmentTenant: tenantNamespace})
 	if err != nil {
 		return err
 	}
@@ -1483,7 +1485,7 @@ func (r *Reconciler) collectDeletedAttachments(ctx context.Context) error {
 // removeDetachedRoutes deletes the model's attachment HTTPRoutes for Gateways
 // its gatewayRefs no longer name, or all of them once the model is deleting.
 func (r *Reconciler) removeDetachedRoutes(ctx context.Context, model *v1alpha1.ExternalModel) error {
-	routes, err := r.listAttachmentRoutes(ctx, client.InNamespace(model.Namespace))
+	routes, err := r.listAttachmentRoutes(ctx, r.Client, client.InNamespace(model.Namespace))
 	if err != nil {
 		return err
 	}
@@ -1562,7 +1564,7 @@ func namesAttachmentRoute(m *v1alpha1.ExternalModel) bool {
 // attachedModelSinks returns the models whose selection sinks the
 // namespace's attachment HTTPRoutes use.
 func (r *Reconciler) attachedModelSinks(ctx context.Context, namespace string) (map[string]bool, error) {
-	routes, err := r.listAttachmentRoutes(ctx, client.InNamespace(namespace))
+	routes, err := r.listAttachmentRoutes(ctx, r.Client, client.InNamespace(namespace))
 	if err != nil {
 		return nil, err
 	}

@@ -345,8 +345,10 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 	// owned by Praxis and release our finalizer; IPP remains the status owner.
 	// Attachments from this namespace still serve Praxis tenants through the
 	// provider Service and ServiceEntry; removing the attachment collects them.
+	// Routes are read live and applied before their transport, so a route
+	// created a moment ago is never missed.
 	if !live.missingConfig && !live.selected {
-		routes, err := r.listAttachmentRoutes(ctx, client.InNamespace(provider.Namespace))
+		routes, err := r.listAttachmentRoutes(ctx, r.APIReader, client.InNamespace(provider.Namespace))
 		if err != nil {
 			return reconcile.Result{}, err
 		}
