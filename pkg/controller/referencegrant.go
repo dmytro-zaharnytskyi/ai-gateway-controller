@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 
@@ -74,12 +75,15 @@ func (r *Reconciler) referencePermitted(ctx context.Context, modelNamespace stri
 // Like an attachment's providers they are validated here, not through their
 // own namespace's tenant. A missing or deleting provider is omitted like an
 // unpermitted one, so a reference never discloses whether a provider exists.
-// The provider's own credential is required only when a reference inherits
-// it; an override's model-namespace Secret is validated with its route.
-func (r *Reconciler) foreignProviders(ctx context.Context, modelNamespace string, models []*v1alpha1.ExternalModel) ([]*v1alpha1.ExternalProvider, error) {
+// A provider whose own credential is not ready, while a reference inherits
+// it, is still returned: unready maps it to a message, and only the routes
+// that inherit that credential are skipped (see skipUnreadyCredentials). An
+// override's model-namespace Secret is validated with its route.
+func (r *Reconciler) foreignProviders(ctx context.Context, modelNamespace string, models []*v1alpha1.ExternalModel) (
+	providers []*v1alpha1.ExternalProvider, unready map[types.NamespacedName]string, err error) {
 	if r.Namespace != "" {
 		// A single-namespace controller reads no other namespace.
-		return nil, nil
+		return nil, nil, nil
 	}
 	// Whether a reference to each provider inherits its auth.
 	refs := map[types.NamespacedName]bool{}
@@ -91,11 +95,12 @@ func (r *Reconciler) foreignProviders(ctx context.Context, modelNamespace string
 			}
 		}
 	}
-	providers := make([]*v1alpha1.ExternalProvider, 0, len(refs))
+	providers = make([]*v1alpha1.ExternalProvider, 0, len(refs))
+	unready = map[types.NamespacedName]string{}
 	for key, inherited := range refs {
 		if permitted, err := r.referencePermitted(ctx, modelNamespace, key); err != nil || !permitted {
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			continue
 		}
@@ -104,25 +109,58 @@ func (r *Reconciler) foreignProviders(ctx context.Context, modelNamespace string
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			return nil, fmt.Errorf("get ExternalProvider %s: %w", key, err)
+			return nil, nil, fmt.Errorf("get ExternalProvider %s: %w", key, err)
 		}
 		if !provider.DeletionTimestamp.IsZero() {
 			continue
 		}
-		err := r.validateProvider(ctx, &provider)
-		if err == nil && inherited {
-			err = r.validateProviderCredential(ctx, &provider)
-		}
-		if transientReadError(err) {
-			return nil, err
-		}
 		provider.Status.Phase = resolver.PhaseReady
-		if err != nil {
+		if r.validateProvider(ctx, &provider) != nil {
 			provider.Status.Phase = providerPhaseFailed
+		} else if inherited {
+			if err := r.validateProviderCredential(ctx, &provider); transientReadError(err) {
+				return nil, nil, err
+			} else if err != nil {
+				unready[key] = fmt.Sprintf("the credential of ExternalProvider %s is not ready for references that inherit its auth", key)
+			}
 		}
 		providers = append(providers, &provider)
 	}
-	return providers, nil
+	return providers, unready, nil
+}
+
+// skipUnreadyCredentials skips each route that inherits the credential of a
+// provider in unready, as the resolver skips an unready provider; a route that
+// overrides the credential is kept. It returns the models left with no route
+// by it, with the message to report.
+func skipUnreadyCredentials(set *resolver.ResolvedRouteSet, err error, unready map[types.NamespacedName]string) (
+	*resolver.ResolvedRouteSet, map[string]string, error) {
+	unserved := map[string]string{}
+	if set == nil || len(unready) == 0 || (err != nil && !errors.Is(err, resolver.ErrNoRoutes)) {
+		return set, unserved, err
+	}
+	routes := 0
+	for i := range set.Models {
+		model := &set.Models[i]
+		kept, message := model.Routes[:0], ""
+		for _, route := range model.Routes {
+			if skip, ok := unready[types.NamespacedName{Namespace: route.ProviderNamespace, Name: route.Provider}]; ok && route.SecretRefNamespace() == route.ProviderNamespace {
+				model.Skips = append(model.Skips, resolver.Skip{ModelRef: model.ModelRef, ProviderRef: route.Provider, Reason: resolver.SkipProviderNotReady, Message: skip})
+				message = skip
+				continue
+			}
+			kept = append(kept, route)
+		}
+		model.Routes = kept
+		routes += len(kept)
+		if len(kept) == 0 && message != "" {
+			unserved[model.ModelRef] = message
+		}
+	}
+	if routes == 0 {
+		return set, unserved, resolver.ErrNoRoutes
+	}
+	return set, unserved, err
 }
 
 // deniedReferences maps each model with a provider reference that is not
