@@ -41,7 +41,9 @@ import (
 // model to a tenant from another namespace: an HTTPRoute in the model
 // namespace, and, only after the Gateway accepts that route, a hashed
 // DestinationRule in the Gateway namespace, credential copies in the tenant
-// namespace and the tenant's overlay entries.
+// namespace and the tenant's overlay entries. A model naming no Gateway in a
+// namespace with no MaasTenantConfig attaches implicitly to the default
+// tenant's Gateway, as the default tenant served every namespace in 3.5.
 const (
 	reasonTenantNotResolved       = "TenantNotResolved"
 	reasonGatewayNotManaged       = "GatewayNotManaged"
@@ -147,6 +149,102 @@ func hasGatewayRef(model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObj
 	return slices.Contains(model.Spec.GatewayRefs, gateway)
 }
 
+// implicitlyAttached reports whether the model is eligible for an implicit
+// attachment to the default tenant's Gateway: it names no Gateway and its
+// namespace is no tenant's, holding no MaasTenantConfig and claimed by no
+// AITenant. A model with the home finalizer keeps waiting for its own tenant's
+// MaasTenantConfig instead, and a single-namespace controller serves no
+// attachments.
+func (r *Reconciler) implicitlyAttached(ctx context.Context, model *v1alpha1.ExternalModel) (bool, error) {
+	if r.Namespace != "" || len(model.Spec.GatewayRefs) > 0 || controllerutil.ContainsFinalizer(model, externalModelFinalizer) {
+		return false, nil
+	}
+	err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: tenant.MaasTenantConfigInstanceName}, tenant.NewMaasTenantConfig())
+	if !apierrors.IsNotFound(err) {
+		if err != nil {
+			return false, fmt.Errorf("get MaasTenantConfig %s/%s: %w", model.Namespace, tenant.MaasTenantConfigInstanceName, err)
+		}
+		return false, nil
+	}
+	// A tenant namespace whose MaasTenantConfig is not created yet, or is being
+	// recreated, is never served by another tenant.
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(tenant.AITenantGVK.GroupVersion().WithKind("AITenantList"))
+	if err := r.List(ctx, list); err != nil {
+		return false, fmt.Errorf("list AITenants for namespace %s: %w", model.Namespace, err)
+	}
+	for i := range list.Items {
+		if namespace, ok := tenant.ConfigNamespace(&list.Items[i]); ok && namespace == model.Namespace {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// mayAttachImplicitly is implicitlyAttached for event fan-out, which logs a
+// failed read instead of returning it.
+func (r *Reconciler) mayAttachImplicitly(ctx context.Context, model *v1alpha1.ExternalModel) bool {
+	implicit, err := r.implicitlyAttached(ctx, model)
+	if err != nil {
+		r.Log.Error(err, "check implicit Gateway attachment", "model", client.ObjectKeyFromObject(model))
+	}
+	return implicit
+}
+
+// defaultTenantGateway returns the Gateway of the default tenant (AITenant
+// models-as-a-service), which serves implicit attachments. ok is false unless
+// exactly one default AITenant publishes a Gateway. ipp reports a default
+// tenant that selects IPP: its controller serves models of every namespace
+// itself, so implicit attachments are left to it.
+func (r *Reconciler) defaultTenantGateway(ctx context.Context) (gateway v1alpha1.NamespacedObjectReference, ok, ipp bool, err error) {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(tenant.AITenantGVK.GroupVersion().WithKind("AITenantList"))
+	if err := r.List(ctx, list); err != nil {
+		return gateway, false, false, fmt.Errorf("list AITenants for the default tenant: %w", err)
+	}
+	var owner *unstructured.Unstructured
+	for i := range list.Items {
+		name, namespace, published := tenant.GatewayRef(&list.Items[i])
+		if !published || list.Items[i].GetName() != tenant.DefaultAITenantName {
+			continue
+		}
+		if owner != nil {
+			return v1alpha1.NamespacedObjectReference{}, false, false, nil
+		}
+		owner, gateway = &list.Items[i], v1alpha1.NamespacedObjectReference{Name: name, Namespace: namespace}
+	}
+	if owner == nil {
+		return gateway, false, false, nil
+	}
+	// A missing MaasTenantConfig is reported by the attachment's tenant gate.
+	if tenantNamespace, found := tenant.ConfigNamespace(owner); found {
+		mtc := tenant.NewMaasTenantConfig()
+		if err := r.Get(ctx, client.ObjectKey{Namespace: tenantNamespace, Name: tenant.MaasTenantConfigInstanceName}, mtc); err == nil {
+			ipp = !tenant.UsesPraxis(mtc)
+		} else if !apierrors.IsNotFound(err) {
+			return gateway, false, false, fmt.Errorf("get MaasTenantConfig %s/%s: %w", tenantNamespace, tenant.MaasTenantConfigInstanceName, err)
+		}
+	}
+	return gateway, true, ipp, nil
+}
+
+// modelGateways returns the Gateways the model attaches to: its gatewayRefs
+// or, for an implicit attachment, the Gateway of a default tenant selecting
+// Praxis.
+func (r *Reconciler) modelGateways(ctx context.Context, model *v1alpha1.ExternalModel) ([]v1alpha1.NamespacedObjectReference, error) {
+	if len(model.Spec.GatewayRefs) > 0 {
+		return model.Spec.GatewayRefs, nil
+	}
+	if implicit, err := r.implicitlyAttached(ctx, model); err != nil || !implicit {
+		return nil, err
+	}
+	gateway, ok, ipp, err := r.defaultTenantGateway(ctx)
+	if err != nil || !ok || ipp {
+		return nil, err
+	}
+	return []v1alpha1.NamespacedObjectReference{gateway}, nil
+}
+
 func clientModelName(model *v1alpha1.ExternalModel) string {
 	if model.Spec.ModelName != "" {
 		return model.Spec.ModelName
@@ -193,6 +291,7 @@ func newHTTPRoute() *unstructured.Unstructured {
 }
 
 // gatewayAttachedModels enqueues models attached to the AITenant's Gateway.
+// Implicit attachments follow the default tenant, including its switch to IPP.
 func (r *Reconciler) gatewayAttachedModels(ctx context.Context, ait *unstructured.Unstructured) []reconcile.Request {
 	name, namespace, ok := tenant.GatewayRef(ait)
 	if !ok {
@@ -206,7 +305,8 @@ func (r *Reconciler) gatewayAttachedModels(ctx context.Context, ait *unstructure
 	}
 	var requests []reconcile.Request
 	for i := range models.Items {
-		if r.namespaceAllowed(models.Items[i].Namespace) && hasGatewayRef(&models.Items[i], gateway) {
+		if r.namespaceAllowed(models.Items[i].Namespace) && (hasGatewayRef(&models.Items[i], gateway) ||
+			ait.GetName() == tenant.DefaultAITenantName && r.mayAttachImplicitly(ctx, &models.Items[i])) {
 			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&models.Items[i])})
 		}
 	}
@@ -242,7 +342,8 @@ func (r *Reconciler) sameNameModels(ctx context.Context, obj client.Object) []re
 	var requests []reconcile.Request
 	for i := range models.Items {
 		m := &models.Items[i]
-		if len(m.Spec.GatewayRefs) > 0 && r.namespaceAllowed(m.Namespace) && clientModelName(m) == clientModelName(changed) {
+		if r.namespaceAllowed(m.Namespace) && clientModelName(m) == clientModelName(changed) &&
+			(len(m.Spec.GatewayRefs) > 0 || r.mayAttachImplicitly(ctx, m)) {
 			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(m)})
 		}
 	}
@@ -319,18 +420,19 @@ func (r *Reconciler) gateAttachmentTenant(ctx context.Context, ait *unstructured
 	return t, result, false, nil
 }
 
-// reconcileAttachedModel reconciles a model with explicit gatewayRefs: the
-// home attachment through the existing path, every other attachment on its
-// own, then one aggregated status write.
-func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1.ExternalModel) (reconcile.Result, error) {
+// reconcileAttachedModel reconciles a model attached to the given Gateways,
+// its gatewayRefs or implicit attachment: the home attachment through the
+// existing path, every other attachment on its own, then one aggregated status
+// write.
+func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1.ExternalModel, gateways []v1alpha1.NamespacedObjectReference) (reconcile.Result, error) {
 	type target struct {
 		ait             *unstructured.Unstructured
 		tenantNamespace string
 		result          attachmentResult
 	}
-	targets := make([]target, 0, len(model.Spec.GatewayRefs))
+	targets := make([]target, 0, len(gateways))
 	home := -1
-	for _, gateway := range model.Spec.GatewayRefs {
+	for _, gateway := range gateways {
 		ait, tenantNamespace, result, err := r.resolveGatewayTenant(ctx, gateway)
 		if err != nil {
 			return reconcile.Result{}, err
@@ -394,7 +496,7 @@ func (r *Reconciler) reconcileAttachedModel(ctx context.Context, model *v1alpha1
 			}
 		}
 	}
-	if err := r.removeDetachedRoutes(ctx, model); err != nil {
+	if err := r.removeDetachedRoutes(ctx, model, gateways); err != nil {
 		errs = append(errs, err)
 	} else if !extra {
 		if err := r.setAttachmentFinalizer(ctx, model, false); err != nil {
@@ -451,7 +553,8 @@ func (r *Reconciler) writeAttachedStatus(ctx context.Context, model *v1alpha1.Ex
 			continue
 		}
 		phase := modelPhaseFailed
-		if res.pending {
+		if res.pending || res.reason == reasonTenantNotSteady {
+			// A tenant that is not steady is waited for, not a failure.
 			phase = modelPhasePending
 		}
 		message := fmt.Sprintf("Gateway %s: %s", gatewayKey(res.gateway), res.message)
@@ -738,7 +841,14 @@ func (r *Reconciler) attachmentCandidates(ctx context.Context, t attachmentTenan
 	attached := make([]*v1alpha1.ExternalModel, 0)
 	for i := range models.Items {
 		m := &models.Items[i]
-		if m.Namespace != t.namespace && m.DeletionTimestamp.IsZero() && hasGatewayRef(m, t.gateway) {
+		if m.Namespace == t.namespace || !m.DeletionTimestamp.IsZero() {
+			continue
+		}
+		gateways, err := r.modelGateways(ctx, m)
+		if err != nil {
+			return nil, err
+		}
+		if slices.Contains(gateways, t.gateway) {
 			attached = append(attached, m)
 		}
 	}
@@ -1589,8 +1699,8 @@ func (r *Reconciler) collectDeletedAttachments(ctx context.Context) error {
 }
 
 // removeDetachedRoutes deletes the model's attachment HTTPRoutes for Gateways
-// its gatewayRefs no longer name, or all of them once the model is deleting.
-func (r *Reconciler) removeDetachedRoutes(ctx context.Context, model *v1alpha1.ExternalModel) error {
+// other than the ones it still attaches to.
+func (r *Reconciler) removeDetachedRoutes(ctx context.Context, model *v1alpha1.ExternalModel, gateways []v1alpha1.NamespacedObjectReference) error {
 	routes, err := r.listAttachmentRoutes(ctx, r.Client, client.InNamespace(model.Namespace))
 	if err != nil {
 		return err
@@ -1598,8 +1708,7 @@ func (r *Reconciler) removeDetachedRoutes(ctx context.Context, model *v1alpha1.E
 	for i := range routes {
 		gatewayNamespace, gatewayName, ok := strings.Cut(routes[i].GetAnnotations()[annotationAttachmentGateway], "/")
 		gateway := v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace}
-		if !ok || routes[i].GetAnnotations()[annotationAttachmentModel] != model.Name ||
-			(model.DeletionTimestamp.IsZero() && hasGatewayRef(model, gateway)) {
+		if !ok || routes[i].GetAnnotations()[annotationAttachmentModel] != model.Name || slices.Contains(gateways, gateway) {
 			continue
 		}
 		if err := r.removeAttachmentRoute(ctx, model, gateway); err != nil {
@@ -1610,13 +1719,13 @@ func (r *Reconciler) removeDetachedRoutes(ctx context.Context, model *v1alpha1.E
 }
 
 // releaseAttachments removes every attachment of a deleting model, or of one
-// whose gatewayRefs are all removed, then releases its attachment finalizer.
-// The routes go first; the sweeps then collect what they used, including what
-// routes already removed by namespace or foreground deletion left behind. The
-// finalizer stays until both succeed, so a failed cleanup is retried without
-// needing the route.
+// that no longer attaches to any Gateway, then releases its attachment
+// finalizer. The routes go first; the sweeps then collect what they used,
+// including what routes already removed by namespace or foreground deletion
+// left behind. The finalizer stays until both succeed, so a failed cleanup is
+// retried without needing the route.
 func (r *Reconciler) releaseAttachments(ctx context.Context, model *v1alpha1.ExternalModel) error {
-	if err := r.removeDetachedRoutes(ctx, model); err != nil {
+	if err := r.removeDetachedRoutes(ctx, model, nil); err != nil {
 		return err
 	}
 	if !controllerutil.ContainsFinalizer(model, attachmentFinalizer) {
@@ -1650,7 +1759,7 @@ func (r *Reconciler) setAttachmentFinalizer(ctx context.Context, model *v1alpha1
 }
 
 // clearGatewayStatus removes the per-gateway results of a model without
-// gatewayRefs.
+// Gateway attachments.
 func (r *Reconciler) clearGatewayStatus(ctx context.Context, model *v1alpha1.ExternalModel) error {
 	if len(model.Status.Gateways) == 0 {
 		return nil

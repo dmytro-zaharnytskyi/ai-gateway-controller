@@ -834,6 +834,7 @@ func TestValidateProviderAuthenticationStrategies(t *testing.T) {
 		want       string
 	}{
 		{name: "apikey", authType: "apikey", secretData: map[string][]byte{"api-key": []byte("fixture")}},
+		{name: "simple is apikey", authType: "simple", secretData: map[string][]byte{"api-key": []byte("fixture")}},
 		{name: "sigv4 unsupported", authType: "sigv4", secretData: map[string][]byte{"api-key": []byte("fixture")}, want: "unsupported authentication strategy"},
 		{name: "oauth2 unsupported", authType: "oauth2", secretData: map[string][]byte{"api-key": []byte("fixture")}, want: "unsupported authentication strategy"},
 		{name: "unknown unsupported", authType: "custom", secretData: map[string][]byte{"api-key": []byte("fixture")}, want: "unsupported authentication strategy"},

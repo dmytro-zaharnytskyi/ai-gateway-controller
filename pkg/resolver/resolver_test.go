@@ -486,6 +486,23 @@ func TestResolve_SameNamedProvidersFromTwoNamespaces(t *testing.T) {
 	}
 }
 
+func TestResolve_SimpleAuthIsAPIKey(t *testing.T) {
+	inherited, overridden := ref("prov-a", "gpt", "/v1/chat/completions"), ref("prov-b", "gpt", "/v1/chat/completions")
+	overridden.Auth = &v1alpha1.AuthConfig{Type: "simple", SecretRef: v1alpha1.NameReference{Name: "model-key"}}
+	providerA := provider("ns1", "prov-a", PhaseReady, "a.example.com", nil)
+	providerA.Spec.Auth.Type = "simple"
+	set, err := Resolve([]*v1alpha1.ExternalModel{model("ns1", "my-model", inherited, overridden)},
+		[]*v1alpha1.ExternalProvider{providerA, provider("ns1", "prov-b", PhaseReady, "b.example.com", nil)})
+	if err != nil || len(set.Routes()) != 2 {
+		t.Fatalf("set=%#v err=%v", set, err)
+	}
+	for _, route := range set.Routes() {
+		if route.AuthType != "apikey" {
+			t.Fatalf("route %s auth type = %q, want apikey", route.Provider, route.AuthType)
+		}
+	}
+}
+
 func TestRouteServiceNameFitsServiceNameLimit(t *testing.T) {
 	route := Route{Namespace: "models", ProviderNamespace: "shared", Provider: strings.Repeat("p", 253)}
 	if name := route.ServiceName(); len(name) != 63 || !strings.HasPrefix(name, "provider-ppp") {

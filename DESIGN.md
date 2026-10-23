@@ -317,16 +317,36 @@ compatibility one-pager; this records how it is implemented.
 - **Home attachment.** The tenant whose `MaasTenantConfig` is in the model
   namespace serves the model when `gatewayRefs` is omitted or names its
   Gateway, through the existing tenant-local path with unchanged resources,
-  identifiers and deletion. A model without `gatewayRefs` in a namespace with no
-  `MaasTenantConfig` gets no serving state (`Pending`, `TenantNotResolved`). An
-  explicit binding never falls back to another Gateway.
+  identifiers and deletion. An explicit binding never falls back to another
+  Gateway.
+- **Default tenant** ([RHOAIENG-101754](https://redhat.atlassian.net/browse/RHOAIENG-101754)).
+  As in 3.5, where the default tenant served every namespace, a model without
+  `gatewayRefs` in a namespace with no `MaasTenantConfig` is served by the
+  default tenant (`AITenant` `models-as-a-service`) as an implicit extra
+  attachment to its `status.gatewayRef`: the same identifiers, gating, status
+  and lifecycle, with `spec` unchanged. A namespace an `AITenant` claims, a
+  model that has the home finalizer and a single-namespace controller keep
+  waiting for the namespace's own `MaasTenantConfig` instead. While the default
+  tenant is not steady the model is `Pending` (`TenantNotSteady`), as is every
+  attachment to a tenant that is not steady. Unlike an explicit binding, the
+  implicit attachment follows the default tenant: while no single default
+  `AITenant` publishes a Gateway it is removed and the model is `Pending`
+  (`TenantNotResolved`). A default tenant selecting IPP leaves the model to its
+  IPP, which serves every namespace: only the implicit attachment and its
+  `status.gateways` result are removed. Adding `gatewayRefs` or a
+  `MaasTenantConfig` to the namespace replaces the implicit attachment and
+  removes its objects. A provider in a namespace with no `MaasTenantConfig`
+  that no tenant has served reports only its own configuration and Secret
+  (`Ready` or `Failed`): attachments apply its transport, and it serves a
+  tenant's own models only once that tenant has applied it.
 - **Extra attachments** resolve Gateway → owning `AITenant`
   (`status.gatewayRef`) → its `MaasTenantConfig` (`GatewayNotManaged`,
   `AmbiguousTenant`) and are gated per tenant by the handshake above: Praxis and
   `steady`, otherwise `TenantNotSteady` (existing state retained) or
   `TenantNotPraxis` (a cleanup request: the attachment's route is removed).
 - **Status** ([RHOAIENG-90802](https://redhat.atlassian.net/browse/RHOAIENG-90802)).
-  `status.gateways` holds one result per `gatewayRefs` entry: a `Ready`
+  `status.gateways` holds one result per `gatewayRefs` entry, or for the
+  implicit attachment: a `Ready`
   condition at the model generation with the attachment's own reason (the
   Gateway's reason for an unaccepted route, the winning model for
   `ModelNameConflict`), and `httpRouteRef` only while it is Ready. The
@@ -528,7 +548,8 @@ in the model namespace. Other existing status fields remain available.
 An omitted provider-reference namespace means the model namespace. Inherited
 auth uses the provider-local Secret; an override uses the model-local Secret.
 Secret references remain name-only. Preserve the installed schema's accepted
-names and `auth.type: simple`; schema acceptance does not add auth behavior.
+names and `auth.type: simple`, which 3.5 manifests use and which is served as
+`apikey`, as IPP serves it.
 The schema compatibility test pins the legacy MaaS validation baseline.
 A provider reference to another namespace requires a `ReferenceGrant` (see
 [Cross-namespace providers](#cross-namespace-providers)) and never substitutes

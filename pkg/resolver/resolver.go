@@ -117,6 +117,15 @@ type Route struct {
 	SecretNamespace string
 }
 
+// AuthType returns the auth strategy of a CRD auth.type. "simple", which the
+// installed schema retains from 3.5, is the API key strategy, as IPP serves it.
+func AuthType(crdType string) string {
+	if crdType == "simple" {
+		return "apikey"
+	}
+	return crdType
+}
+
 // CrossNamespace reports whether the route's provider is in another
 // namespace than its model.
 func (r Route) CrossNamespace() bool {
@@ -346,7 +355,7 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 				Path:                  path,
 				APITranslationEnabled: translationEnabled,
 				Weight:                weight,
-				AuthType:              auth.Type,
+				AuthType:              AuthType(auth.Type),
 				SecretName:            auth.SecretRef.Name,
 				SecretKey:             "api-key",
 				SecretNamespace:       secretNamespace,
