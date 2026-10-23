@@ -975,6 +975,36 @@ func TestTenantNamespacesAndSingleNamespaceControllersAttachNothingImplicitly(t 
 	}
 }
 
+func TestModelIneligibleForImplicitAttachmentIsTenantNotResolved(t *testing.T) {
+	for name, setup := range map[string]func() (*Reconciler, *v1alpha1.ExternalModel){
+		// The default tenant's IPP does not report a model of a namespace an
+		// AITenant claims before its MaasTenantConfig exists.
+		"claimed namespace, default tenant on IPP": func() (*Reconciler, *v1alpha1.ExternalModel) {
+			provider, secret := attachmentProvider("team")
+			model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0))
+			return attachmentReconciler(t, append(attachmentTenantObjects(tenant.DefaultAITenantName, "models-as-a-service", defaultGateway, "ipp"),
+				provider, secret, model, controllerAITenant("team", "models-as-a-service", "team", gatewayB.Name, gatewayB.Namespace))...), model
+		},
+		"single-namespace controller, no default tenant": func() (*Reconciler, *v1alpha1.ExternalModel) {
+			provider, secret := attachmentProvider("team")
+			model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0))
+			r := attachmentReconciler(t, provider, secret, model)
+			r.Namespace = "team"
+			return r, model
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, model := setup()
+			reconcileModel(t, r, model)
+			got := getModel(t, r, model)
+			condition := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+			if got.Status.Phase != modelPhasePending || condition == nil || condition.Reason != reasonTenantNotResolved || strings.Contains(condition.Message, "default tenant") {
+				t.Fatalf("status = %#v", got.Status)
+			}
+		})
+	}
+}
+
 func TestProviderOutsideTenantNamespacesReportsItsOwnConfiguration(t *testing.T) {
 	provider, secret := attachmentProvider("team")
 	r := attachmentReconciler(t, provider, secret)

@@ -744,15 +744,21 @@ func (r *Reconciler) prepareModelTenant(ctx context.Context, model *v1alpha1.Ext
 		if len(model.Spec.GatewayRefs) == 0 && !controllerutil.ContainsFinalizer(model, externalModelFinalizer) {
 			// Never served here, nor through an implicit attachment to the
 			// default tenant's Gateway (see implicitlyAttached).
-			_, ok, ipp, err := r.defaultTenantGateway(ctx)
-			if err != nil || ipp {
-				// The default tenant's IPP serves it and owns its status.
+			message := fmt.Sprintf("namespace %s has no MaasTenantConfig; set spec.gatewayRefs to attach this model to a tenant gateway", namespace)
+			implicit, err := r.implicitlyAttached(ctx, model)
+			if err != nil {
 				return modelTenantContext{}, false, err
 			}
-			message := fmt.Sprintf("namespace %s has no MaasTenantConfig; set spec.gatewayRefs to attach this model to a tenant gateway", namespace)
-			if !ok {
-				message = fmt.Sprintf("namespace %s has no MaasTenantConfig and the default tenant (AITenant %s) has no resolvable Gateway; "+
-					"set spec.gatewayRefs to attach this model to a tenant gateway", namespace, tenant.DefaultAITenantName)
+			if implicit {
+				_, ok, ipp, err := r.defaultTenantGateway(ctx)
+				if err != nil || ipp {
+					// The default tenant's IPP serves it and owns its status.
+					return modelTenantContext{}, false, err
+				}
+				if !ok {
+					message = fmt.Sprintf("namespace %s has no MaasTenantConfig and the default tenant (AITenant %s) has no resolvable Gateway; "+
+						"set spec.gatewayRefs to attach this model to a tenant gateway", namespace, tenant.DefaultAITenantName)
+				}
 			}
 			if err := r.setModelStatus(ctx, model, modelPhasePending, false, reasonTenantNotResolved, message, ""); err != nil {
 				return modelTenantContext{}, false, err
