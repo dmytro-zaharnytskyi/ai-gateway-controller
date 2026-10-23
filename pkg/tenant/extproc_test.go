@@ -160,6 +160,105 @@ insecure_options:
 	}
 }
 
+func TestExtprocCredentialsRenderPerEntryHeader(t *testing.T) {
+	// An apikey provider that diverges from the filter default (Azure → api-key)
+	// must render an explicit header on its entry, while a bearer_token entry
+	// (header fixed filter-side) must not.
+	candidates := []envelope.Candidate{
+		{
+			Cluster:  "provider-azure",
+			StableID: envelope.CandidateStableID("model-azure", "azure"),
+			Credential: &envelope.Credential{
+				Strategy:  "apikey",
+				Header:    "api-key",
+				SecretRef: envelope.SecretRef{Name: "azure-secret", Namespace: "tenant-a", Key: "api-key"},
+			},
+		},
+		{
+			Cluster:  "provider-openai",
+			StableID: envelope.CandidateStableID("model-openai", "openai"),
+			Credential: &envelope.Credential{
+				Strategy:  "bearer_token",
+				SecretRef: envelope.SecretRef{Name: "openai-secret", Namespace: "tenant-a", Key: "api-key"},
+			},
+		},
+	}
+	credentials, err := extprocCredentials("tenant-a", candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := extprocPostAuthConfig(candidates, credentials, false)
+	if !strings.Contains(config, "strategy: apikey\n            header: api-key\n") {
+		t.Fatalf("azure entry must render api-key header between strategy and file:\n%s", config)
+	}
+	// The bearer_token entry carries no header override.
+	if strings.Contains(config, "strategy: bearer_token\n            header:") {
+		t.Fatalf("bearer_token entry must not render a header line:\n%s", config)
+	}
+}
+
+func TestExtprocCredentialsDeterministicWhenSecretSharedWithDifferentHeader(t *testing.T) {
+	// Two providers may share one Secret but diverge on the injected header
+	// (e.g. an Azure apikey entry and a bearer_token entry keyed to the same
+	// Secret). Both survive dedup because header is part of the dedup identity,
+	// so the sort key must include it too: otherwise the two entries, equal on
+	// name+key+strategy-prefix terms, could order either way and churn the
+	// config hash, restarting ExtProc for no functional change.
+	azure := envelope.Candidate{
+		Cluster:  "provider-azure",
+		StableID: envelope.CandidateStableID("model-azure", "azure"),
+		Credential: &envelope.Credential{
+			Strategy:  "apikey",
+			Header:    "api-key",
+			SecretRef: envelope.SecretRef{Name: "shared-secret", Namespace: "tenant-a", Key: "api-key"},
+		},
+	}
+	bearer := envelope.Candidate{
+		Cluster:  "provider-openai",
+		StableID: envelope.CandidateStableID("model-openai", "openai"),
+		Credential: &envelope.Credential{
+			Strategy:  "bearer_token",
+			SecretRef: envelope.SecretRef{Name: "shared-secret", Namespace: "tenant-a", Key: "api-key"},
+		},
+	}
+
+	forward, err := extprocCredentials("tenant-a", []envelope.Candidate{azure, bearer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reverse, err := extprocCredentials("tenant-a", []envelope.Candidate{bearer, azure})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(forward) != 2 {
+		t.Fatalf("both entries sharing a Secret with different headers must be retained, got %d: %+v", len(forward), forward)
+	}
+	if forward[0] != reverse[0] || forward[1] != reverse[1] {
+		t.Fatalf("credential order must be independent of candidate input order:\nforward=%+v\nreverse=%+v", forward, reverse)
+	}
+	// Total order resolves the tie on strategy ("apikey" < "bearer_token").
+	if forward[0].strategy != "apikey" || forward[1].strategy != "bearer_token" {
+		t.Fatalf("expected apikey before bearer_token, got %+v", forward)
+	}
+}
+
+func TestExtprocPostAuthConfigNeverEmitsHeaderForBearerToken(t *testing.T) {
+	// The credential_inject filter hard-rejects the entire config if a
+	// bearer_token entry carries a header, taking the tenant's whole ExtProc
+	// config down. Even if a header leaks onto a bearer_token credential (e.g. a
+	// stale copy-Secret annotation restored on the attached path), the render
+	// must not emit it.
+	credentials := []extprocCredential{{
+		name: "openai-secret", namespace: "tenant-a", key: "api-key",
+		strategy: "bearer_token", header: "api-key", // header must be dropped
+		file: "/etc/praxis/credentials/openai-secret-abc/api-key",
+	}}
+	config := extprocPostAuthConfig(nil, credentials, false)
+	if strings.Contains(config, "strategy: bearer_token\n            header:") {
+		t.Fatalf("bearer_token entry must never render a header line:\n%s", config)
+	}
+}
+
 func TestExtprocCredentialsRejectCrossNamespaceProvider(t *testing.T) {
 	candidates := []envelope.Candidate{{
 		StableID: envelope.CandidateStableID("model", "provider"),

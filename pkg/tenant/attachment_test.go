@@ -48,6 +48,72 @@ func TestAttachedOverlayCandidatesSkipRemovedCredentialCopies(t *testing.T) {
 	}
 }
 
+func TestAttachedOverlayCandidatesRestoreCredentialHeader(t *testing.T) {
+	// Credential.Header is json:"-" and does not survive the overlay round-trip.
+	// attachedOverlayCandidates must restore it from the credential-header
+	// annotation the attachment reconciler stamps on the copy Secret, so an
+	// Azure apikey candidate keeps its api-key header through a reconcile that
+	// reads the published overlay back. A bearer_token copy carries no
+	// annotation and its header stays empty.
+	//
+	// The annotation is honored only from a Secret the controller owns as a
+	// credential copy, and only when the value is a header the controller
+	// qualifies: an annotation on an untrusted Secret in the tenant namespace, or
+	// an unrecognized header value, must not drive credential_inject and leaves
+	// the header unset.
+	copyLabels := map[string]string{LabelManagedBy: ManagedByAIGatewayController, LabelCredentialCopy: "true"}
+	candidate := func(stableID, name, secret string) envelope.Candidate {
+		return envelope.Candidate{Cluster: "provider-" + name, StableID: stableID, Name: name,
+			Credential: &envelope.Credential{Strategy: "apikey", SecretRef: envelope.SecretRef{Name: secret, Namespace: "tenant-b", Key: "api-key"}}}
+	}
+	candidates := []envelope.Candidate{
+		candidate("team/chat/team/azure", "azure", "agc-cred-azure"),
+		{Cluster: "provider-openai", StableID: "team/gpt/team/openai", Name: "gpt",
+			Credential: &envelope.Credential{Strategy: "bearer_token", SecretRef: envelope.SecretRef{Name: "agc-cred-openai", Namespace: "tenant-b", Key: "api-key"}}},
+		candidate("team/forged/team/azure", "forged", "agc-cred-forged"),
+		candidate("team/bogus/team/azure", "bogus", "agc-cred-bogus"),
+	}
+	data, err := json.Marshal(envelope.Envelope{Overlay: envelope.Overlay{Candidates: candidates}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlay := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: praxisOverlayName, Namespace: "tenant-b", Labels: map[string]string{managedByLabel: ManagedByAIGatewayController}},
+		Data:       map[string]string{praxisOverlayDataKey: string(data)},
+	}
+	azureCopy := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "agc-cred-azure", Namespace: "tenant-b",
+		Labels: copyLabels, Annotations: map[string]string{AnnotationCredentialHeader: "api-key"}}}
+	openaiCopy := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "agc-cred-openai", Namespace: "tenant-b", Labels: copyLabels}}
+	// Not a controller-owned credential copy: a Secret a tenant planted in its
+	// own namespace under the copy name, carrying a qualified header annotation.
+	forgedCopy := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "agc-cred-forged", Namespace: "tenant-b",
+		Annotations: map[string]string{AnnotationCredentialHeader: "api-key"}}}
+	// A controller copy, but with a header value the controller does not qualify.
+	bogusCopy := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "agc-cred-bogus", Namespace: "tenant-b",
+		Labels: copyLabels, Annotations: map[string]string{AnnotationCredentialHeader: "authorization"}}}
+	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(overlay, azureCopy, openaiCopy, forgedCopy, bogusCopy).Build()}
+	got, unreadable, err := r.attachedOverlayCandidates(context.Background(), "tenant-b")
+	if err != nil || unreadable {
+		t.Fatalf("attachedOverlayCandidates: unreadable=%t err=%v", unreadable, err)
+	}
+	headers := map[string]string{}
+	for _, c := range got {
+		headers[c.StableID] = c.Credential.Header
+	}
+	if headers["team/chat/team/azure"] != "api-key" {
+		t.Fatalf("azure candidate header = %q, want restored api-key; got %#v", headers["team/chat/team/azure"], got)
+	}
+	if headers["team/gpt/team/openai"] != "" {
+		t.Fatalf("bearer_token candidate header = %q, want empty", headers["team/gpt/team/openai"])
+	}
+	if headers["team/forged/team/azure"] != "" {
+		t.Fatalf("untrusted Secret header = %q, want empty (not a controller-owned credential copy)", headers["team/forged/team/azure"])
+	}
+	if headers["team/bogus/team/azure"] != "" {
+		t.Fatalf("unqualified header value = %q, want empty", headers["team/bogus/team/azure"])
+	}
+}
+
 func TestCleanupRemovesTenantAttachmentState(t *testing.T) {
 	owned := map[string]string{LabelManagedBy: ManagedByAIGatewayController}
 	copied := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "agc-cred-0123456789ab", Namespace: "tenant-b",

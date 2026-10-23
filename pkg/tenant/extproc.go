@@ -30,7 +30,13 @@ type extprocCredential struct {
 	namespace string
 	key       string
 	strategy  string
-	file      string
+	// header is the provider-boundary request header the credential_inject
+	// filter injects the credential into. Empty for strategies that fix their
+	// header filter-side (bearer_token → Authorization: Bearer); set for
+	// apikey providers that diverge from the filter default (e.g. Azure's
+	// api-key). See envelope.defaultAuthHeaders.
+	header string
+	file   string
 }
 
 const extprocConfigHashAnnotation = "ai-gateway-controller.opendatahub.io/extproc-config-sha256"
@@ -374,17 +380,35 @@ func extprocCredentials(namespace string, candidates []envelope.Candidate) ([]ex
 		if ref.Name == "" || ref.Key == "" {
 			return nil, fmt.Errorf("candidate %s has an incomplete credential reference", candidate.StableID)
 		}
-		identity := ref.Namespace + "/" + ref.Name + "/" + ref.Key + "/" + candidate.Credential.Strategy
+		identity := ref.Namespace + "/" + ref.Name + "/" + ref.Key + "/" + candidate.Credential.Strategy + "/" + candidate.Credential.Header
 		if seen[identity] {
 			continue
 		}
 		seen[identity] = true
 		hash := sha256.Sum256([]byte(ref.Namespace + "/" + ref.Name + "/" + ref.Key))
 		path := fmt.Sprintf("%s/%s-%s/%s", extprocCredentialDir, ref.Name, hex.EncodeToString(hash[:])[:12], ref.Key)
-		credentials = append(credentials, extprocCredential{name: ref.Name, namespace: ref.Namespace, key: ref.Key, strategy: candidate.Credential.Strategy, file: path})
+		credentials = append(credentials, extprocCredential{name: ref.Name, namespace: ref.Namespace, key: ref.Key, strategy: candidate.Credential.Strategy, header: candidate.Credential.Header, file: path})
 	}
+	// Total order over the full dedup identity (namespace/name/key/strategy/
+	// header). The sort key must include every field that distinguishes a
+	// retained entry, or two providers sharing a Secret but diverging on header
+	// (e.g. Azure api-key vs. a bearer_token candidate) could render in either
+	// order, churning the config hash and restarting ExtProc for no reason.
 	sort.Slice(credentials, func(i, j int) bool {
-		return credentials[i].name+credentials[i].key+credentials[i].strategy < credentials[j].name+credentials[j].key+credentials[j].strategy
+		a, b := credentials[i], credentials[j]
+		if a.namespace != b.namespace {
+			return a.namespace < b.namespace
+		}
+		if a.name != b.name {
+			return a.name < b.name
+		}
+		if a.key != b.key {
+			return a.key < b.key
+		}
+		if a.strategy != b.strategy {
+			return a.strategy < b.strategy
+		}
+		return a.header < b.header
 	})
 	return credentials, nil
 }
@@ -430,7 +454,16 @@ func extprocPostAuthConfig(candidates []envelope.Candidate, credentials []extpro
 		b.WriteString("      - filter: credential_inject\n        credentials:\n")
 		for _, credential := range credentials {
 			fmt.Fprintf(&b, "          - name: %s\n            namespace: %s\n", credential.name, credential.namespace)
-			fmt.Fprintf(&b, "            key: %s\n            strategy: %s\n            file: %s\n", credential.key, credential.strategy, credential.file)
+			fmt.Fprintf(&b, "            key: %s\n            strategy: %s\n", credential.key, credential.strategy)
+			// header is an apikey-only field: the credential_inject filter hard-
+			// rejects the whole config if a bearer_token entry carries one (it
+			// fixes Authorization: Bearer itself), which would take the tenant's
+			// entire ExtProc config down, not just this entry. Guard the emit so a
+			// stray header on a non-apikey entry can never reach the filter.
+			if credential.strategy == "apikey" && credential.header != "" {
+				fmt.Fprintf(&b, "            header: %s\n", credential.header)
+			}
+			fmt.Fprintf(&b, "            file: %s\n", credential.file)
 		}
 	}
 	if !apiTranslationEnabled {

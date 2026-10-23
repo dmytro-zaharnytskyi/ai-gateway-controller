@@ -99,7 +99,7 @@ func TestTenantModelServesGrantedProviderFromAnotherNamespace(t *testing.T) {
 	route := foreignRoute("tenant-b", "shared")
 	serviceName := route.ServiceName()
 	ruleName := attachmentDestinationRuleName(gatewayB, "shared", "openai")
-	copyName := credentialCopyName("tenant-b", "shared", "openai-key", "api-key")
+	copyName := credentialCopyName("tenant-b", "shared", "openai-key", "api-key", "")
 	assertNotServed := func(when string) {
 		t.Helper()
 		if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); !errors.Is(err, resolver.ErrNoRoutes) {
@@ -222,7 +222,7 @@ func TestModelServesSameNamedProvidersFromTwoNamespaces(t *testing.T) {
 			t.Fatalf("DestinationRule for %s/openai: %v", namespace, err)
 		}
 		var copied corev1.Secret
-		if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", namespace, "openai-key", "api-key")}, &copied); err != nil ||
+		if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", namespace, "openai-key", "api-key", "")}, &copied); err != nil ||
 			string(copied.Data["api-key"]) != "sk-"+namespace {
 			t.Fatalf("credential copy for %s: %q %v", namespace, copied.Data["api-key"], err)
 		}
@@ -244,7 +244,7 @@ func TestAttachedModelOverrideCredentialIsModelLocalWithoutFallback(t *testing.T
 	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
 		t.Fatalf("status = %q/%q %q", got.Status.Phase, readyReason(got), readyMessage(got))
 	}
-	modelCopy, sharedCopy := credentialCopyName("tenant-b", "team", "openai-key", "api-key"), credentialCopyName("tenant-b", "shared", "openai-key", "api-key")
+	modelCopy, sharedCopy := credentialCopyName("tenant-b", "team", "openai-key", "api-key", ""), credentialCopyName("tenant-b", "shared", "openai-key", "api-key", "")
 	var copied corev1.Secret
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: modelCopy}, &copied); err != nil || string(copied.Data["api-key"]) != "sk-team" {
 		t.Fatalf("override copy = %q, %v; want the model-namespace value", copied.Data["api-key"], err)
@@ -413,7 +413,7 @@ func TestOverrideServesWithoutTheProviderSecret(t *testing.T) {
 		t.Fatalf("status = %q/%q %q", got.Status.Phase, readyReason(got), readyMessage(got))
 	}
 	candidates := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates
-	if len(candidates) != 1 || candidates[0].Credential.SecretRef.Name != credentialCopyName("tenant-b", "team", "openai-key", "api-key") {
+	if len(candidates) != 1 || candidates[0].Credential.SecretRef.Name != credentialCopyName("tenant-b", "team", "openai-key", "api-key", "") {
 		t.Fatalf("overlay candidates = %#v, want the model-namespace credential", candidates)
 	}
 }

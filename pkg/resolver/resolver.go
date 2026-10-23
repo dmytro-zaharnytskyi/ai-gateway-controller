@@ -378,6 +378,8 @@ func supportedProviderFormat(providerType, apiFormat string) bool {
 		return true
 	case providerType == "anthropic" && apiFormat == "messages":
 		return true
+	case (providerType == "azure" || providerType == "azure-openai") && apiFormat == "openai-chat":
+		return true
 	default:
 		return false
 	}

@@ -709,7 +709,7 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 	}
 	candidates := make([]envelope.Candidate, 0, len(runtimeSet.Routes()))
 	for _, route := range runtimeSet.Routes() {
-		strategy, err := envelope.StrategyFor(route)
+		strategy, header, err := envelope.StrategyFor(route)
 		if err != nil {
 			return nil, false, fmt.Errorf("resolve ExtProc runtime credential for model %s provider %s: %w", route.Model, route.Provider, err)
 		}
@@ -725,6 +725,7 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 		if strategy != "" {
 			candidate.Credential = &envelope.Credential{
 				Strategy:  strategy,
+				Header:    header,
 				SecretRef: envelope.SecretRef{Name: route.SecretName, Namespace: route.Namespace, Key: route.SecretKey},
 			}
 		}
@@ -807,6 +808,18 @@ func (r *Reconciler) attachedOverlayCandidates(ctx context.Context, namespace st
 					continue
 				}
 				return nil, false, fmt.Errorf("get credential copy %s: %w", key, err)
+			}
+			// Credential.Header is json:"-" and is lost on the overlay round-trip;
+			// restore it from the copy Secret stamped at attach time — but only from
+			// a Secret marked as a credential copy, and only when the stamped value is
+			// a header the controller qualifies. A header annotation on an untrusted
+			// or unexpected Secret in the tenant namespace must never drive
+			// credential_inject; an unrecognized value leaves the header unset
+			// (bearer_token semantics), failing closed rather than injecting it.
+			if copySecret.GetLabels()[LabelCredentialCopy] == "true" {
+				if header := copySecret.GetAnnotations()[AnnotationCredentialHeader]; envelope.IsQualifiedAuthHeader(header) {
+					candidate.Credential.Header = header
+				}
 			}
 		}
 		attached = append(attached, candidate)

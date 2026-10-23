@@ -56,7 +56,8 @@ type ExternalModelSpec struct {
 	ExternalProviderRefs []ExternalProviderRef `json:"externalProviderRefs"`
 
 	// GatewayRefs explicitly selects the Praxis gateways that serve this model.
-	// Omission retains tenant-local resolution; it does not select a global gateway.
+	// When omitted, the tenant whose MaasTenantConfig is in the model namespace
+	// serves the model; in a namespace of no tenant, the default tenant's Gateway does.
 	// Names are distinct across namespaces. An explicit empty list is invalid.
 	// +optional
 	// +kubebuilder:validation:MinItems=1

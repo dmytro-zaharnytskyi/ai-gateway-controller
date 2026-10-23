@@ -21,7 +21,7 @@ type AuthConfig struct {
 	// Type identifies the auth type for this provider.
 	// e.g. "apikey" (header based), "sigv4", etc.
 	// +kubebuilder:validation:Required
-	// "simple" is retained for installed-schema compatibility.
+	// "simple" is retained for installed-schema compatibility and is served as "apikey".
 	// +kubebuilder:validation:Enum=apikey;simple;sigv4;oauth2
 	Type string `json:"type"`
 

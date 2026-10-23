@@ -142,7 +142,6 @@ func TestResolveRejectsUnqualifiedActiveProviderBindings(t *testing.T) {
 		providerType string
 		apiFormat    string
 	}{
-		{name: "Azure OpenAI", providerType: "azure-openai", apiFormat: "openai-chat"},
 		{name: "Vertex OpenAI", providerType: "vertex-openai", apiFormat: "openai-chat"},
 		{name: "Bedrock OpenAI", providerType: "bedrock-openai", apiFormat: "openai-chat"},
 		{name: "custom provider", providerType: "custom", apiFormat: "openai-chat"},
@@ -219,14 +218,14 @@ func TestResolveAllReportsUnsupportedMessagesSeparatelyFromTranslationDisabled(t
 
 func TestResolveAllSkipsUnqualifiedDisabledBinding(t *testing.T) {
 	active := ref("active", "target-a", "/v1/chat/completions")
-	disabled := withWeight(ref("azure", "target-b", "/v1/chat/completions"), 0)
+	disabled := withWeight(ref("vertex", "target-b", "/v1/chat/completions"), 0)
 	disabled.APIFormat = "openai-chat"
 	model := model("ns1", "model", active, disabled)
 	providers := []*v1alpha1.ExternalProvider{
 		provider("ns1", "active", PhaseReady, "openai.example.com", nil),
-		provider("ns1", "azure", PhaseReady, "azure.example.com", nil),
+		provider("ns1", "vertex", PhaseReady, "vertex.example.com", nil),
 	}
-	providers[1].Spec.Provider = "azure-openai"
+	providers[1].Spec.Provider = "vertex-openai"
 
 	set, err := ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{model}, providers, true)
 	if err != nil {
@@ -242,13 +241,13 @@ func TestResolveAllSkipsUnqualifiedDisabledBinding(t *testing.T) {
 
 func TestResolveAllSkipsNegativeWeightUnsupportedBinding(t *testing.T) {
 	active := ref("active", "target-a", "/v1/chat/completions")
-	disabled := withWeight(ref("azure", "target-b", "/v1/chat/completions"), -1)
+	disabled := withWeight(ref("vertex", "target-b", "/v1/chat/completions"), -1)
 	model := model("ns1", "model", active, disabled)
 	providers := []*v1alpha1.ExternalProvider{
 		provider("ns1", "active", PhaseReady, "openai.example.com", nil),
-		provider("ns1", "azure", PhaseReady, "azure.example.com", nil),
+		provider("ns1", "vertex", PhaseReady, "vertex.example.com", nil),
 	}
-	providers[1].Spec.Provider = "azure-openai"
+	providers[1].Spec.Provider = "vertex-openai"
 
 	set, err := ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{model}, providers, true)
 	if err != nil {

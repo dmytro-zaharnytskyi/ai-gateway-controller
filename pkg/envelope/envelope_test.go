@@ -182,7 +182,6 @@ func TestRender_APIKeyRejectsUnqualifiedCombinations(t *testing.T) {
 	}{
 		{"anthropic with openai chat format", "anthropic", "openai-chat"},
 		{"openai with anthropic messages format", "openai", "messages"},
-		{"azure with openai chat format", "azure", "openai-chat"},
 		{"azure with anthropic messages format", "azure", "messages"},
 		{"aws-bedrock with openai chat format", "aws-bedrock", "openai-chat"},
 		{"vertex with anthropic messages format", "vertex", "messages"},
@@ -227,6 +226,57 @@ func TestRender_AnthropicMessagesMapsToApikeyReference(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "fixture-only-secret") {
 		t.Error("credential value must never reach the wire")
+	}
+}
+
+func TestRender_AzureOpenAIChatMapsToApikeyWithHeaderOverride(t *testing.T) {
+	// Azure OpenAI uses the api-key header, diverging from the credential_inject
+	// filter's x-api-key default. The wire stays reference-only with the apikey
+	// strategy; the header override rides in-memory (json:"-") into the ExtProc
+	// credential entry, never onto the overlay.
+	for _, providerType := range []string{"azure", "azure-openai"} {
+		t.Run(providerType, func(t *testing.T) {
+			r := route("m1", "p1", 1)
+			r.ProviderType = providerType
+			r.APIFormat = "openai-chat"
+			env, err := Render(routeSet(resolver.ModelRoutes{ModelRef: "ns1/m1", Routes: []resolver.Route{r}}), scope(), Revision{}, Options{})
+			if err != nil {
+				t.Fatalf("Render: %v", err)
+			}
+			cred := env.Overlay.Candidates[0].Credential
+			if cred == nil || cred.Strategy != "apikey" {
+				t.Fatalf("expected apikey strategy, got %+v", cred)
+			}
+			if cred.Header != "api-key" {
+				t.Errorf("header = %q, want api-key", cred.Header)
+			}
+			raw, err := json.Marshal(cred)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := `{"strategy":"apikey","secretRef":{"name":"p1-key","namespace":"ns1","key":"api-key"}}`
+			if string(raw) != want {
+				t.Errorf("credential wire JSON must stay reference-only without header:\n got %s\nwant %s", raw, want)
+			}
+		})
+	}
+}
+
+func TestIsQualifiedAuthHeader(t *testing.T) {
+	// Exactly the non-empty headers StrategyFor emits are qualified; the empty
+	// header (bearer_token, none injected) and any other value are not, so a
+	// consumer can reject an untrusted or unrecognized header annotation.
+	for header, want := range map[string]bool{
+		"api-key":         true,
+		"x-api-key":       true,
+		"":                false,
+		"authorization":   false,
+		"Authorization":   false,
+		"x-forwarded-for": false,
+	} {
+		if got := IsQualifiedAuthHeader(header); got != want {
+			t.Errorf("IsQualifiedAuthHeader(%q) = %t, want %t", header, got, want)
+		}
 	}
 }
 

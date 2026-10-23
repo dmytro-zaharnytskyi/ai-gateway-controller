@@ -252,7 +252,7 @@ func TestUserNamespaceModelServedOnlyAfterRouteAcceptance(t *testing.T) {
 		t.Fatalf("model-namespace provider Service: %v", err)
 	}
 	ruleName := attachmentDestinationRuleName(gatewayB, "team", "openai")
-	copyName := credentialCopyName("tenant-b", "team", "openai-key", "api-key")
+	copyName := credentialCopyName("tenant-b", "team", "openai-key", "api-key", "")
 	assertAttachmentUnpublished := func() {
 		t.Helper()
 		if _, err := getUnstructured(r, destinationRuleGVK, "gateway-b", ruleName); !apierrors.IsNotFound(err) {
@@ -782,7 +782,7 @@ func assertImplicitAttachmentRemoved(t *testing.T, r *Reconciler, model *v1alpha
 		t.Fatalf("implicit attachment DestinationRule remains: %v", err)
 	}
 	var copied corev1.Secret
-	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "models-as-a-service", Name: credentialCopyName("models-as-a-service", "team", "openai-key", "api-key")}, &copied); !apierrors.IsNotFound(err) {
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "models-as-a-service", Name: credentialCopyName("models-as-a-service", "team", "openai-key", "api-key", "")}, &copied); !apierrors.IsNotFound(err) {
 		t.Fatalf("implicit attachment credential copy remains: %v", err)
 	}
 	if got := getModel(t, r, model); controllerutil.ContainsFinalizer(got, attachmentFinalizer) || len(got.Status.Gateways) > 0 {
@@ -805,7 +805,7 @@ func TestModelWithoutGatewayRefsIsServedByTheDefaultTenant(t *testing.T) {
 	}
 	candidates := overlayEnvelope(t, r, "models-as-a-service").Overlay.Candidates
 	if len(candidates) != 1 || candidates[0].StableID != "team/chat/team/openai" ||
-		candidates[0].Credential.SecretRef.Name != credentialCopyName("models-as-a-service", "team", "openai-key", "api-key") {
+		candidates[0].Credential.SecretRef.Name != credentialCopyName("models-as-a-service", "team", "openai-key", "api-key", "") {
 		t.Fatalf("default tenant overlay = %#v", candidates)
 	}
 	if _, err := getUnstructured(r, destinationRuleGVK, "openshift-ingress", attachmentDestinationRuleName(defaultGateway, "team", "openai")); err != nil {
@@ -1504,7 +1504,7 @@ func assertAttachmentWithdrawn(t *testing.T, r *Reconciler) {
 		t.Fatalf("attachment DestinationRule remains: %v", err)
 	}
 	var copied corev1.Secret
-	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key")}, &copied); !apierrors.IsNotFound(err) {
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key", "")}, &copied); !apierrors.IsNotFound(err) {
 		t.Fatalf("credential copy remains: %v", err)
 	}
 }
@@ -1678,11 +1678,179 @@ func TestTransientCredentialReadKeepsServedAttachment(t *testing.T) {
 		t.Fatal("a failed Secret read withdrew the served attachment")
 	}
 	var copied corev1.Secret
-	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key")}, &copied); err != nil {
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key", "")}, &copied); err != nil {
 		t.Fatalf("a failed Secret read deleted the credential copy: %v", err)
 	}
 	if got := getModel(t, r, model); readyReason(got) != reasonReconcileFailed {
 		t.Fatalf("reason = %q, want %q", readyReason(got), reasonReconcileFailed)
+	}
+}
+
+func TestServedAzureAttachmentStampsCredentialHeaderAnnotation(t *testing.T) {
+	// Azure apikey auth qualifies to strategy apikey + api-key header. The
+	// header is json:"-" on Credential and cannot survive the overlay
+	// round-trip, so attach time stamps it on the credential copy Secret for
+	// the tenant reconciler to restore. See envelope.StrategyFor /
+	// tenant.AnnotationCredentialHeader.
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "azure", Namespace: "team", UID: types.UID("provider-azure-team")},
+		Spec: v1alpha1.ExternalProviderSpec{
+			Provider: "azure", Endpoint: "azure.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "azure-key"}},
+		},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "azure-key", Namespace: "team"}, Data: map[string][]byte{"api-key": []byte("azure-secret")}}
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "team", UID: types.UID("uid-team-azure-chat"), CreationTimestamp: metav1.NewTime(time.Unix(100, 0))},
+		Spec: v1alpha1.ExternalModelSpec{
+			ModelName: "chat-model",
+			ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
+				Ref: v1alpha1.ExternalProviderReference{Name: "azure"}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+			}},
+			GatewayRefs: []v1alpha1.NamespacedObjectReference{gatewayB},
+		},
+	}
+	objects := append([]client.Object{provider, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	if len(overlayEnvelope(t, r, "tenant-b").Overlay.Candidates) != 1 {
+		t.Fatal("azure attachment is not served")
+	}
+
+	var copied corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "azure-key", "api-key", "api-key")}, &copied); err != nil {
+		t.Fatalf("credential copy: %v", err)
+	}
+	if got := copied.GetAnnotations()[tenant.AnnotationCredentialHeader]; got != "api-key" {
+		t.Fatalf("credential-header annotation = %q, want %q", got, "api-key")
+	}
+}
+
+func TestSharedSecretWithDivergentHeadersGetsDistinctCopies(t *testing.T) {
+	// The injected header is provider-scoped and part of the credential copy
+	// identity (credentialCopyName), so a source Secret qualified under two
+	// different headers yields two distinct copies, each with its own header
+	// annotation, rather than one copy whose single annotation a later apply
+	// could overwrite. credentialCopyName is a pure function of (tenant, source
+	// Secret, header), so the guarantee holds across separate attached models
+	// that share the Secret too. Here one model binds azure (api-key) and openai
+	// (bearer_token, no header) to the same Secret; each gets its own copy.
+	azure := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "azure", Namespace: "team", UID: types.UID("provider-azure-team")},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "azure", Endpoint: "azure.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "shared-key"}}},
+	}
+	openai := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "openai", Namespace: "team", UID: types.UID("provider-openai-team")},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "openai.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "shared-key"}}},
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "shared-key", Namespace: "team"}, Data: map[string][]byte{"api-key": []byte("k")}}
+	model := &v1alpha1.ExternalModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "team", UID: types.UID("uid-team-shared-chat"), CreationTimestamp: metav1.NewTime(time.Unix(100, 0))},
+		Spec: v1alpha1.ExternalModelSpec{
+			ModelName: "chat-model",
+			ExternalProviderRefs: []v1alpha1.ExternalProviderRef{
+				{Ref: v1alpha1.ExternalProviderReference{Name: "azure"}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+				{Ref: v1alpha1.ExternalProviderReference{Name: "openai"}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+			},
+			GatewayRefs: []v1alpha1.NamespacedObjectReference{gatewayB},
+		},
+	}
+	objects := append([]client.Object{azure, openai, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+
+	if got := getModel(t, r, model); readyReason(got) == reasonReconcileFailed {
+		t.Fatalf("model sharing a Secret under distinct headers must be served, got %+v", got.Status.Conditions)
+	}
+
+	// azure qualifies to the api-key header; openai to bearer_token with none.
+	// The header is part of the identity, so the two copies have distinct names.
+	azureCopyName := credentialCopyName("tenant-b", "team", "shared-key", "api-key", "api-key")
+	openaiCopyName := credentialCopyName("tenant-b", "team", "shared-key", "api-key", "")
+	if azureCopyName == openaiCopyName {
+		t.Fatal("divergent headers must produce distinct copy names")
+	}
+	var azureCopy corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: azureCopyName}, &azureCopy); err != nil {
+		t.Fatalf("azure credential copy: %v", err)
+	}
+	if got := azureCopy.GetAnnotations()[tenant.AnnotationCredentialHeader]; got != "api-key" {
+		t.Fatalf("azure copy header annotation = %q, want api-key", got)
+	}
+	var openaiCopy corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: openaiCopyName}, &openaiCopy); err != nil {
+		t.Fatalf("openai credential copy: %v", err)
+	}
+	if got, ok := openaiCopy.GetAnnotations()[tenant.AnnotationCredentialHeader]; ok {
+		t.Fatalf("bearer_token copy must carry no header annotation, got %q", got)
+	}
+}
+
+func TestCrossNamespaceAzureOverrideSecretGetsHeaderedCopy(t *testing.T) {
+	// A tenant's own model references a cross-namespace Azure provider but brings
+	// its own credential with a model-local override Secret. The override Secret
+	// lives in the tenant namespace, so it would otherwise be mounted directly —
+	// but azure+openai-chat qualifies to the api-key header, which survives the
+	// overlay round-trip only on a copy Secret's annotation (Credential.Header is
+	// not serialized). localizeRoutes must still copy such a tenant-local Secret
+	// so attachedOverlayCandidates can restore the header; skipping the copy would
+	// drop the api-key header and break Azure auth.
+	azure := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "azure", Namespace: "shared", UID: types.UID("provider-azure-shared")},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "azure", Endpoint: "azure.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-key"}}},
+	}
+	model := referenceProvider(attachmentModel("chat", "tenant-b", "chat-model", time.Unix(100, 0)), "shared")
+	model.Spec.ExternalProviderRefs[0].Ref.Name = "azure"
+	// A model-local override: the resolver leaves SecretNamespace empty, so the
+	// Secret is read from the model (tenant) namespace.
+	model.Spec.ExternalProviderRefs[0].Auth = &v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "model-key"}}
+	modelSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "model-key", Namespace: "tenant-b"}, Data: map[string][]byte{"api-key": []byte("sk-model-local")}}
+	objects := append([]client.Object{azure, modelSecret, model, referenceGrant("shared", "tenant-b", "azure")},
+		attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("status = %q/%q %q", got.Status.Phase, readyReason(got), readyMessage(got))
+	}
+
+	// Source namespace is the tenant namespace (model-local override), yet the
+	// headered credential is still copied, carrying its header annotation.
+	copyName := credentialCopyName("tenant-b", "tenant-b", "model-key", "api-key", "api-key")
+	var copied corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: copyName}, &copied); err != nil {
+		t.Fatalf("model-local override copy for a cross-namespace Azure provider: %v", err)
+	}
+	if got := copied.GetAnnotations()[tenant.AnnotationCredentialHeader]; got != "api-key" {
+		t.Fatalf("copy header annotation = %q, want api-key", got)
+	}
+	if string(copied.Data["api-key"]) != "sk-model-local" {
+		t.Fatalf("copy value = %q, want the model-local override", copied.Data["api-key"])
+	}
+	candidates := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates
+	if len(candidates) != 1 || candidates[0].StableID != "tenant-b/chat/shared/azure" ||
+		candidates[0].Credential == nil || candidates[0].Credential.SecretRef.Name != copyName {
+		t.Fatalf("overlay candidates = %#v, want the headered copy", candidates)
+	}
+}
+
+func TestServedBearerAttachmentOmitsCredentialHeaderAnnotation(t *testing.T) {
+	// openai + openai-chat qualifies to bearer_token, whose header is fixed
+	// data-plane side; no header annotation is stamped on the copy Secret.
+	r, _ := servedAttachmentFixture(t)
+	var copied corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key", "")}, &copied); err != nil {
+		t.Fatalf("credential copy: %v", err)
+	}
+	if got, ok := copied.GetAnnotations()[tenant.AnnotationCredentialHeader]; ok {
+		t.Fatalf("bearer_token copy must not carry a credential-header annotation, got %q", got)
 	}
 }
 
@@ -1931,7 +2099,7 @@ func TestSharedProviderStateStaysWhileAnAttachmentUsesIt(t *testing.T) {
 		t.Fatalf("shared provider Service removed while another attachment uses it: %v", err)
 	}
 	var copied corev1.Secret
-	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key")}, &copied); err != nil {
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-b", Name: credentialCopyName("tenant-b", "team", "openai-key", "api-key", "")}, &copied); err != nil {
 		t.Fatalf("shared credential copy removed while another attachment uses it: %v", err)
 	}
 	detach(other)

@@ -193,6 +193,16 @@ const (
 	// from outside the tenant namespace. Copies live in the tenant namespace.
 	LabelCredentialCopy = "inference.opendatahub.io/credential-copy"
 
+	// AnnotationCredentialHeader carries the provider-boundary request header
+	// (envelope.Credential.Header) for an attached candidate's credential. The
+	// header is derived at attach time via envelope.StrategyFor, where the
+	// provider type and API format are known, and stamped on the credential
+	// copy Secret so the tenant reconciler can restore it after reading the
+	// published overlay back: Credential.Header is json:"-" and never survives
+	// the overlay round-trip. Absent (empty) for strategies whose header is
+	// fixed data-plane side, e.g. bearer_token.
+	AnnotationCredentialHeader = "inference.opendatahub.io/credential-header"
+
 	// maxKubernetesNameLength is the Kubernetes object name limit (RFC 1123
 	// label / DNS subdomain component). Rename returns an error rather than
 	// applying a name that would exceed it.

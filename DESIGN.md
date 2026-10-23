@@ -538,7 +538,9 @@ AGC, MaaS and API owners agreed this extension separately from the migration
 baseline.
 
 `spec.gatewayRefs` is optional, with 1–16 unique namespace/name pairs when
-present. Omission retains tenant-local resolution without a global default.
+present. Omission selects the tenant whose `MaasTenantConfig` is in the model
+namespace or, in a namespace of no tenant, the default tenant (see
+[Gateway attachments](#gateway-attachments)).
 `status.gateways` uses the same full identity, optional `httpRouteRef`
 name/namespace, and conditions keyed by type whose `observedGeneration`
 refers to the model generation. Ready attests reconciliation/distribution;
