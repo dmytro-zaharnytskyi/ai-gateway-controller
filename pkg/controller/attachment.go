@@ -912,11 +912,12 @@ func (r *Reconciler) resolveAttachedModel(ctx context.Context, t attachmentTenan
 		ready.Status.Phase = resolver.PhaseReady
 		providerPtrs = append(providerPtrs, ready)
 	}
-	foreign, err := r.foreignProviders(ctx, m.Namespace, []*v1alpha1.ExternalModel{m})
+	foreign, unready, err := r.foreignProviders(ctx, m.Namespace, []*v1alpha1.ExternalModel{m})
 	if err != nil {
 		return err
 	}
 	set, err := resolver.ResolveWithAPITranslation([]*v1alpha1.ExternalModel{m}, append(providerPtrs, foreign...), t.apiTranslationEnabled)
+	set, _, err = skipUnreadyCredentials(set, err, unready)
 	if err == nil {
 		err = r.validateResolvedCredentials(ctx, set.Routes())
 	}

@@ -417,3 +417,67 @@ func TestOverrideServesWithoutTheProviderSecret(t *testing.T) {
 		t.Fatalf("overlay candidates = %#v, want the model-namespace credential", candidates)
 	}
 }
+
+func TestUnreadyProviderCredentialSkipsOnlyInheritingReferences(t *testing.T) {
+	// The shared provider's own Secret is missing.
+	sharedProvider, _ := attachmentProvider("shared")
+	_, modelSecret := attachmentProvider("tenant-b")
+	inheriting := referenceProvider(attachmentModel("inherit", "tenant-b", "inherit-model", time.Unix(100, 0)), "shared")
+	overriding := referenceProvider(attachmentModel("override", "tenant-b", "override-model", time.Unix(200, 0)), "shared")
+	overriding.Spec.ExternalProviderRefs[0].Auth = &v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "openai-key"}}
+	objects := append([]client.Object{sharedProvider, modelSecret, inheriting, overriding, referenceGrant("shared", "tenant-b", "")},
+		attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	for _, model := range []*v1alpha1.ExternalModel{inheriting, overriding} {
+		reconcileModel(t, r, model)
+	}
+
+	if got := getModel(t, r, overriding); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("overriding model status = %q/%q %q, want Ready", got.Status.Phase, readyReason(got), readyMessage(got))
+	}
+	if got := getModel(t, r, inheriting); readyReason(got) != reasonProviderNotReady || !strings.Contains(readyMessage(got), "shared/openai is not ready") {
+		t.Fatalf("inheriting model status = %q %q, want ProviderNotReady", readyReason(got), readyMessage(got))
+	}
+	candidates := overlayEnvelope(t, r, "tenant-b").Overlay.Candidates
+	if len(candidates) != 1 || candidates[0].StableID != "tenant-b/override/shared/openai" ||
+		candidates[0].Credential.SecretRef != (envelope.SecretRef{Name: "openai-key", Namespace: "tenant-b", Key: "api-key"}) {
+		t.Fatalf("overlay candidates = %#v, want only the override", candidates)
+	}
+}
+
+func TestOverrideSecretEventsReconcileTenantLocalModels(t *testing.T) {
+	sharedProvider, sharedSecret := attachmentProvider("shared")
+	modelSecret := func() *corev1.Secret {
+		return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "model-key", Namespace: "tenant-b"}, Data: map[string][]byte{"api-key": []byte("sk-model")}}
+	}
+	model := referenceProvider(attachmentModel("chat", "tenant-b", "chat-model", time.Unix(100, 0)), "shared")
+	model.Spec.ExternalProviderRefs[0].Auth = &v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "model-key"}}
+	objects := append([]client.Object{sharedProvider, sharedSecret, modelSecret(), model, referenceGrant("shared", "tenant-b", "")},
+		attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	reconcileModel(t, r, model)
+	// Each override Secret event must reconcile the model, which has no gatewayRefs.
+	reconcileOnSecretEvent := func() {
+		t.Helper()
+		requests := r.secretModels(context.Background(), modelSecret())
+		if len(requests) != 1 || requests[0].NamespacedName != client.ObjectKeyFromObject(model) {
+			t.Fatalf("override Secret event enqueued %v, want the model", requests)
+		}
+		_, _ = r.Reconcile(context.Background(), requests[0])
+	}
+
+	if err := r.Delete(context.Background(), modelSecret()); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnSecretEvent()
+	if got := getModel(t, r, model); readyReason(got) != reasonProviderNotReady || !strings.Contains(readyMessage(got), "tenant-b/model-key") {
+		t.Fatalf("status after deleting the override Secret = %q %q, want ProviderNotReady", readyReason(got), readyMessage(got))
+	}
+	if err := r.Create(context.Background(), modelSecret()); err != nil {
+		t.Fatal(err)
+	}
+	reconcileOnSecretEvent()
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("status after restoring the override Secret = %q/%q %q, want Ready", got.Status.Phase, readyReason(got), readyMessage(got))
+	}
+}

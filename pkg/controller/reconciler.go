@@ -546,11 +546,12 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		modelPtrs = append(modelPtrs, &models.Items[i])
 		modelOwners[models.Items[i].Name] = &models.Items[i]
 	}
-	foreign, err := r.foreignProviders(ctx, req.Namespace, modelPtrs)
+	foreign, unready, err := r.foreignProviders(ctx, req.Namespace, modelPtrs)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 	set, err := resolver.ResolveWithAPITranslation(modelPtrs, append(providerPtrs, foreign...), modelTenant.apiTranslationEnabled)
+	set, unserved, err := skipUnreadyCredentials(set, err, unready)
 	denied := deniedReferences(set)
 	if errors.Is(err, resolver.ErrNoRoutes) {
 		// A served reference that is no longer permitted must stop serving,
@@ -643,6 +644,11 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	if denial := denied[req.String()]; denial != "" {
 		// The model's permitted references are served; the others are reported.
 		return reconcile.Result{}, report(false, reasonRefNotPermitted, denial, nil)
+	}
+	if message := unserved[req.String()]; message != "" {
+		// Its references inherit a credential that is not ready; other models
+		// keep serving.
+		return reconcile.Result{}, report(false, reasonProviderNotReady, message, nil)
 	}
 
 	message := fmt.Sprintf("distributed routing overlay digest %s generation %d", result.Envelope.Revision.Value, result.Envelope.Provenance.SourceGeneration)
@@ -1051,11 +1057,12 @@ func (r *Reconciler) resolveRemainingHomeModels(
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	foreign, err := r.foreignProviders(ctx, deleted.Namespace, modelPtrs)
+	foreign, unready, err := r.foreignProviders(ctx, deleted.Namespace, modelPtrs)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
 	set, err := resolver.ResolveWithAPITranslation(modelPtrs, append(providerPtrs, foreign...), apiTranslationEnabled)
+	set, _, err = skipUnreadyCredentials(set, err, unready)
 	return set, modelPtrs, modelOwners, foreign, err
 }
 
