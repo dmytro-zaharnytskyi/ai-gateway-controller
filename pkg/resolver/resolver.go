@@ -3,10 +3,11 @@
 //
 // It reproduces the merged-config semantics of the IPP model-provider-resolver
 // (opendatahub-io/ai-gateway-payload-processing): model-ref config overrides
-// provider config except for tls.caCertificates, which configures shared
-// provider transport. Missing, unready, disabled, or policy-excluded refs are
-// skipped; an active binding with no qualified provider/API/credential profile
-// is a hard error so reconciliation cannot publish a silently reduced route.
+// provider config except for tls.caCertificates and tls.credentialName, which
+// configure shared provider transport. Missing, unready, disabled, or
+// policy-excluded refs are skipped; an active binding with no qualified
+// provider/API/credential profile is a hard error so reconciliation cannot
+// publish a silently reduced route.
 package resolver
 
 import (
@@ -17,6 +18,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 )
@@ -97,6 +100,10 @@ type Route struct {
 	// stores certificate bytes. This supports private test/provider CAs while
 	// keeping TLS verification enabled.
 	TLSCACertificates string
+	// TLSCredentialName optionally names a Secret in the Gateway namespace
+	// whose CA verifies the provider. Istio delivers it to the Gateway over
+	// SDS, so nothing is mounted. Exclusive with TLSCACertificates.
+	TLSCredentialName string
 	TargetModel       string
 	APIFormat         string
 	Path              string // fully resolved, no placeholders
@@ -310,15 +317,15 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 				activeProviders[key] = true
 			}
 
-			providerCA := strings.TrimSpace(prov.Spec.Config["tls.caCertificates"])
-			if modelCA, configured := ref.Config["tls.caCertificates"]; configured && strings.TrimSpace(modelCA) != providerCA {
-				return nil, fmt.Errorf("resolver: model %s ref %s: tls.caCertificates cannot override ExternalProvider %s because provider transport is shared; configure it on the ExternalProvider", mref, ref.Ref.Name, prov.Name)
+			for _, key := range []string{"tls.caCertificates", "tls.credentialName"} {
+				if modelValue, configured := ref.Config[key]; configured && strings.TrimSpace(modelValue) != strings.TrimSpace(prov.Spec.Config[key]) {
+					return nil, fmt.Errorf("resolver: model %s ref %s: %s cannot override ExternalProvider %s because provider transport is shared; configure it on the ExternalProvider", mref, ref.Ref.Name, key, prov.Name)
+				}
 			}
 
 			cfg := mergeConfig(prov.Spec.Config, ref.Config)
-			caCertificates := strings.TrimSpace(cfg["tls.caCertificates"])
-			if caCertificates != "" && (!strings.HasPrefix(caCertificates, "/") || strings.Contains(caCertificates, "..")) {
-				return nil, fmt.Errorf("resolver: model %s ref %s: tls.caCertificates must be an absolute mounted file path", mref, ref.Ref.Name)
+			if err := ValidateProviderTLS(cfg); err != nil {
+				return nil, fmt.Errorf("resolver: model %s ref %s: %w", mref, ref.Ref.Name, err)
 			}
 			path, err := resolvePath(ref.Path, ref.TargetModel, cfg)
 			if err != nil {
@@ -349,7 +356,8 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 				ProviderNamespace:     prov.Namespace,
 				ProviderType:          prov.Spec.Provider,
 				Endpoint:              prov.Spec.Endpoint,
-				TLSCACertificates:     caCertificates,
+				TLSCACertificates:     strings.TrimSpace(cfg["tls.caCertificates"]),
+				TLSCredentialName:     strings.TrimSpace(cfg["tls.credentialName"]),
 				TargetModel:           ref.TargetModel,
 				APIFormat:             ref.APIFormat,
 				Path:                  path,
@@ -370,6 +378,28 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 		return set, ErrNoRoutes
 	}
 	return set, nil
+}
+
+// ValidateProviderTLS checks the provider transport trust settings of a
+// config: tls.caCertificates is an absolute file path mounted in the Gateway,
+// and tls.credentialName is the name of a Secret in the Gateway namespace.
+// Istio accepts only one of them on a DestinationRule.
+func ValidateProviderTLS(config map[string]string) error {
+	caCertificates := strings.TrimSpace(config["tls.caCertificates"])
+	credentialName := strings.TrimSpace(config["tls.credentialName"])
+	if caCertificates != "" && (!strings.HasPrefix(caCertificates, "/") || strings.Contains(caCertificates, "..")) {
+		return errors.New("tls.caCertificates must be an absolute mounted file path")
+	}
+	if credentialName == "" {
+		return nil
+	}
+	if errs := validation.IsDNS1123Subdomain(credentialName); len(errs) > 0 {
+		return fmt.Errorf("tls.credentialName must be a valid Secret name: %s", strings.Join(errs, "; "))
+	}
+	if caCertificates != "" {
+		return errors.New("tls.caCertificates and tls.credentialName are mutually exclusive; set only one")
+	}
+	return nil
 }
 
 func supportedProviderFormat(providerType, apiFormat string) bool {

@@ -470,6 +470,36 @@ omitted or equal namespace stays local and needs no grant.
   the tenant's own. Model-namespace transport is collected after the reconcile,
   once no HTTPRoute in the namespace uses it.
 
+### Provider TLS trust
+
+The Gateway reaches every provider with `tls.mode: SIMPLE` and the endpoint
+host as SNI, and verifies the provider certificate against its system roots.
+A provider whose certificate is signed by a private CA
+([RHOAIENG-102015](https://redhat.atlassian.net/browse/RHOAIENG-102015)) sets
+one of two `ExternalProvider` `spec.config` keys, which the Gateway-namespace
+DestinationRule carries for the provider's own tenant and for attachments:
+
+- **`tls.credentialName`** (preferred) names a Secret in the Gateway
+  namespace (`--gateway-namespace`, `openshift-ingress` by default), where
+  maas-controller places every tenant Gateway. Its `cacert` key holds the PEM
+  CA; Istio also reads `ca.crt`. Istio first reads a separate Secret named
+  `<credentialName>-cacert` and falls back to `<credentialName>` only when
+  that Secret does not exist. Istio delivers it to the Gateway over SDS, so
+  nothing is mounted and an updated Secret applies without a restart.
+- **`tls.caCertificates`** is the absolute path of a CA file already mounted
+  in the Gateway pod. The controller mounts nothing.
+
+Either CA must contain the full chain up to the root that issued the provider
+certificate. Istio accepts only one of the two keys, so setting both is
+rejected, as is an invalid Secret name. An `ExternalModel` reference cannot
+override either key, because the provider transport is shared. The provider
+reconciler reads the `tls.credentialName` Secret the way Istio does, in its
+tenant's Gateway namespace, or in the configured Gateway namespace for a
+provider only attachments serve: a missing Secret, or one without a PEM CA,
+fails the provider's `Ready` condition with the Secret named, instead of a TLS
+failure at request time. Events for either Secret name in any namespace
+re-reconcile the providers naming it.
+
 ### Consumer portal auth proxy
 
 `pkg/consumerportal` reconciles the MaaS consumer portal OIDC auth proxy
