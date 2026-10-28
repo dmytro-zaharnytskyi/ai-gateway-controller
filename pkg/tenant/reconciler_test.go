@@ -291,7 +291,7 @@ func TestCleanupExternalModelResourcesRemovesCredentialWorkload(t *testing.T) {
 		owned(gvkEnvoyFilter, PayloadProcessingExternalModelEnvoyFilterName(tenantID), gatewayNamespace),
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
-	r := &Reconciler{Client: fakeClient}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient}
 	if err := r.cleanupExternalModelResources(context.Background(), tenantID, gatewayNamespace, tenantNamespace); err != nil {
 		t.Fatalf("cleanupExternalModelResources: %v", err)
 	}

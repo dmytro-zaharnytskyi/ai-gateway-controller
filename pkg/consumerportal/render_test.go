@@ -172,3 +172,38 @@ func TestRenderAddsProviderCAFilesPerKey(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderSetsCABundleHashAnnotation(t *testing.T) {
+	built, err := render.Build(testManifestPath)
+	if err != nil {
+		t.Fatalf("render.Build: %v", err)
+	}
+	params := Params{
+		Namespace:    testInfraNamespace,
+		CABundleHash: "ca-bundle-hash",
+	}
+	deployment := unstructured.Unstructured{}
+	for _, u := range Render(built, params) {
+		if u.GetKind() == "Deployment" {
+			deployment = u
+			break
+		}
+	}
+	hash, _, _ := unstructured.NestedString(deployment.Object,
+		"spec", "template", "metadata", "annotations", CABundleHashAnnotation)
+	if hash != "ca-bundle-hash" {
+		t.Errorf("CA bundle hash annotation = %q, want ca-bundle-hash", hash)
+	}
+
+	params.CABundleHash = ""
+	for _, u := range Render(built, params) {
+		if u.GetKind() != "Deployment" {
+			continue
+		}
+		hash, found, _ := unstructured.NestedString(u.Object,
+			"spec", "template", "metadata", "annotations", CABundleHashAnnotation)
+		if found || hash != "" {
+			t.Errorf("empty CA bundle hash rendered annotation %q", hash)
+		}
+	}
+}

@@ -508,6 +508,10 @@ another namespace than its `MaasTenantConfig`, cleanup uses the
 `ai-gateway-controller.opendatahub.io/consumer-portal-cleanup` finalizer and
 deletes only objects labeled as managed by this controller.
 
+Changes to the tenant client Secret or `odh-trusted-ca-bundle` roll the proxy
+automatically; the controller hashes each input into a separate pod-template
+annotation, so no manual rotation step is required.
+
 ## Scope
 
 ### Phase 1 — `praxis-extproc` install (implemented)

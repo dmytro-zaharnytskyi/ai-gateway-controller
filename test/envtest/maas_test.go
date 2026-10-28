@@ -29,6 +29,39 @@ func TestMaasTenantConfigSchemaPreservesAPITranslation(t *testing.T) {
 	require.True(t, enabled, "API server pruned spec.apiTranslation.enabled")
 }
 
+func TestAITenantSchemaPreservesCookieExpire(t *testing.T) {
+	admin := startEnvironment(t, func(ctrl.Manager) {})
+	createNamespace(t, admin, "cookie-expire-schema")
+	ait := tenant.NewAITenant()
+	ait.SetName("cookie-expire-tenant")
+	ait.SetNamespace(maasNamespace)
+	ait.Object["spec"] = map[string]any{
+		"oidc": map[string]any{
+			"issuerUrl":    "https://keycloak.example.com/realms/maas",
+			"clientId":     "maas-consumer-portal",
+			"cookieExpire": "8h",
+		},
+	}
+	require.NoError(t, admin.Create(t.Context(), ait))
+	stored := tenant.NewAITenant()
+	require.NoError(t, admin.Get(t.Context(), client.ObjectKeyFromObject(ait), stored))
+	expire, _, err := unstructured.NestedString(stored.Object, "spec", "oidc", "cookieExpire")
+	require.NoError(t, err)
+	require.Equal(t, "8h", expire, "API server pruned spec.oidc.cookieExpire")
+
+	// The cross-field rule compares effective defaults: a cookie lifetime at
+	// or below the 4m default refresh interval must be rejected.
+	ait.Object["spec"] = map[string]any{
+		"oidc": map[string]any{
+			"issuerUrl":    "https://keycloak.example.com/realms/maas",
+			"clientId":     "maas-consumer-portal",
+			"cookieExpire": "2m",
+		},
+	}
+	err = admin.Update(t.Context(), ait)
+	require.ErrorContains(t, err, "cookieExpire must be longer than refreshInterval")
+}
+
 // maasFixture supplies the external tenant state consumed by this controller.
 // It emits API objects; it does not run or simulate MaaS reconciliation.
 type maasFixture struct {

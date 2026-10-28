@@ -879,7 +879,7 @@ func (r *Reconciler) waitForForeignOwnership(ctx context.Context, resources []un
 		}
 		current := &unstructured.Unstructured{}
 		current.SetGroupVersionKind(desired.GroupVersionKind())
-		if err := r.Client.Get(ctx, client.ObjectKeyFromObject(desired), current); err != nil {
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(desired), current); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}
@@ -1082,7 +1082,7 @@ func (r *Reconciler) cleanupAttachmentState(ctx context.Context, tenantNamespace
 		return fmt.Errorf("list credential copies in %s: %w", tenantNamespace, err)
 	}
 	for i := range copies.Items {
-		if err := client.IgnoreNotFound(r.Client.Delete(ctx, &copies.Items[i])); err != nil {
+		if err := client.IgnoreNotFound(r.deleteWithUIDPrecondition(ctx, &copies.Items[i])); err != nil {
 			return fmt.Errorf("delete credential copy %s/%s: %w", tenantNamespace, copies.Items[i].GetName(), err)
 		}
 	}
@@ -1093,7 +1093,7 @@ func (r *Reconciler) cleanupAttachmentState(ctx context.Context, tenantNamespace
 		return fmt.Errorf("list attachment DestinationRules for %s: %w", tenantNamespace, err)
 	}
 	for i := range rules.Items {
-		if err := client.IgnoreNotFound(r.Client.Delete(ctx, &rules.Items[i])); err != nil {
+		if err := client.IgnoreNotFound(r.deleteWithUIDPrecondition(ctx, &rules.Items[i])); err != nil {
 			return fmt.Errorf("delete attachment DestinationRule %s/%s: %w", rules.Items[i].GetNamespace(), rules.Items[i].GetName(), err)
 		}
 	}
@@ -1105,7 +1105,7 @@ func (r *Reconciler) deleteResourceIfOwned(ctx context.Context, gvk schema.Group
 	obj.SetGroupVersionKind(gvk)
 	obj.SetName(name)
 	obj.SetNamespace(namespace)
-	if err := r.Client.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil
 		}
@@ -1114,8 +1114,18 @@ func (r *Reconciler) deleteResourceIfOwned(ctx context.Context, gvk schema.Group
 	if !shouldDeletePraxisResource(obj) {
 		return nil
 	}
-	if err := client.IgnoreNotFound(r.Client.Delete(ctx, obj)); err != nil {
+	if err := client.IgnoreNotFound(r.deleteWithUIDPrecondition(ctx, obj)); err != nil {
 		return fmt.Errorf("delete %s %s/%s: %w", gvk.Kind, namespace, name, err)
 	}
 	return nil
+}
+
+func (r *Reconciler) deleteWithUIDPrecondition(ctx context.Context, obj client.Object) error {
+	uid := obj.GetUID()
+	if uid == "" {
+		return r.Client.Delete(ctx, obj)
+	}
+	return r.Client.Delete(ctx, obj, &client.DeleteOptions{
+		Preconditions: metav1.NewUIDPreconditions(string(uid)),
+	})
 }
