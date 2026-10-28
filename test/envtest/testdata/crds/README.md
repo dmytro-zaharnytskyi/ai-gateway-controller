@@ -8,11 +8,17 @@ the pinned sources below, with the local addition noted after the table.
 | --- | --- |
 | Gateway, HTTPRoute, ReferenceGrant | [Gateway API v1.5.1](https://raw.githubusercontent.com/kubernetes-sigs/gateway-api/v1.5.1/config/crd/standard/) (`gateway.networking.k8s.io_gateways.yaml`, `gateway.networking.k8s.io_httproutes.yaml`, `gateway.networking.k8s.io_referencegrants.yaml`) |
 | DestinationRule, EnvoyFilter, ServiceEntry | [Istio 1.27.3 CRD bundle](https://raw.githubusercontent.com/istio/istio/1.27.3/manifests/charts/base/files/crd-all.gen.yaml) |
-| AITenant | [MaaS at 26e3116f](https://raw.githubusercontent.com/opendatahub-io/models-as-a-service/26e3116f6ddbe50a73fe9c31b61fbd6d3c817411/deployment/base/maas-controller/crd/bases/maas.opendatahub.io_aitenants.yaml) |
+| AITenant | [MaaS at 0cd514a](https://raw.githubusercontent.com/opendatahub-io/models-as-a-service/0cd514ad0d9566b057dfe68a6877695ab2b7c8a6/deployment/base/maas-controller/crd/bases/maas.opendatahub.io_aitenants.yaml) |
 | MaasTenantConfig | [MaaS at 26e3116f](https://raw.githubusercontent.com/opendatahub-io/models-as-a-service/26e3116f6ddbe50a73fe9c31b61fbd6d3c817411/deployment/base/maas-controller/crd/bases/maas.opendatahub.io_maastenantconfigs.yaml) |
 
 The MaasTenantConfig fixture also includes `spec.apiTranslation.enabled` from
 the in-flight MaaS translation change. The pinned MaaS source above predates
+that field; this local addition lets envtest verify that the API server retains
+the tenant setting until the MaaS pin is updated.
+
+The AITenant fixture also includes `spec.oidc.cookieExpire` (with the
+positive-duration and effective-defaults cross-field rules) from the in-flight
+MaaS change (models-as-a-service#1768). The pinned MaaS source above predates
 that field; this local addition lets envtest verify that the API server retains
 the tenant setting until the MaaS pin is updated.
 

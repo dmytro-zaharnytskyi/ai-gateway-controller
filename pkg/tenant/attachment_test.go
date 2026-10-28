@@ -129,7 +129,7 @@ func TestCleanupRemovesTenantAttachmentState(t *testing.T) {
 	}
 	attachedRule, neighborRule := rule("provider-openai-0123456789ab", "tenant-b"), rule("provider-openai-987654321098", "tenant-c")
 	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(copied, unrelated, attachedRule, neighborRule).Build()
-	r := &Reconciler{Client: fakeClient}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient}
 	if err := r.cleanup(context.Background(), "tenant-b", "gateway-b", "tenant-b"); err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestExternalModelCleanupKeepsRouteFilterForAttachments(t *testing.T) {
 	route.SetNamespace("team")
 	route.SetLabels(map[string]string{LabelManagedBy: ManagedByAIGatewayController, LabelAttachmentTenant: "tenant-b"})
 	fakeClient := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(filter, route).Build()
-	r := &Reconciler{Client: fakeClient}
+	r := &Reconciler{Client: fakeClient, APIReader: fakeClient}
 	if err := r.cleanupExternalModelResources(context.Background(), "tenant-b", "gateway-b", "tenant-b"); err != nil {
 		t.Fatal(err)
 	}

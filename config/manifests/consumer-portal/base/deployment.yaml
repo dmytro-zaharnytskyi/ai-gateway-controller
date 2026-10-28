@@ -55,8 +55,8 @@ spec:
             - --redirect-url=CONSUMER_PORTAL_REDIRECT_URL
             - --cookie-domain=CONSUMER_PORTAL_COOKIE_DOMAIN
             - --cookie-name=_maas_consumer_proxy
-            - --cookie-expire=24h0m0s
-            - --cookie-refresh=4m0s
+            - --cookie-expire=CONSUMER_PORTAL_COOKIE_EXPIRE
+            - --cookie-refresh=CONSUMER_PORTAL_COOKIE_REFRESH
             - --cookie-secure=true
             - --cookie-httponly=true
             - --cookie-samesite=lax

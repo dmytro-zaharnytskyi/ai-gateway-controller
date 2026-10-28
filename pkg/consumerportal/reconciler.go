@@ -23,6 +23,8 @@ package consumerportal
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -93,6 +95,10 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Named("consumer-portal").
 		For(tenant.NewMaasTenantConfig()).
 		Watches(tenant.NewAITenant(), handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForAITenant)).
+		// Metadata-only, so Secret data is never cached.
+		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForSecret)).
+		// Metadata-only, so ConfigMap data is never cached.
+		WatchesMetadata(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForCABundle)).
 		Complete(r)
 }
 
@@ -109,6 +115,59 @@ func (r *Reconciler) maasTenantConfigForAITenant(_ context.Context, obj client.O
 		Namespace: namespace,
 		Name:      tenant.MaasTenantConfigInstanceName,
 	}}}
+}
+
+// maasTenantConfigForSecret maps the proxy credentials Secret and the tenant
+// client Secret named by the default AITenant to the default MaasTenantConfig.
+func (r *Reconciler) maasTenantConfigForSecret(ctx context.Context, obj client.Object) []reconcile.Request {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(tenant.AITenantGVK.GroupVersion().WithKind(tenant.AITenantGVK.Kind + "List"))
+	if err := r.Client.List(ctx, list); err != nil {
+		r.Log.Error(err, "unable to list AITenants while mapping Secret event")
+		return nil
+	}
+	for i := range list.Items {
+		aitenant := &list.Items[i]
+		if aitenant.GetName() != tenant.DefaultAITenantName {
+			continue
+		}
+		namespace, ok := tenant.ConfigNamespace(aitenant)
+		if !ok {
+			return nil
+		}
+		name, _, refOK := ClientSecretRef(aitenant)
+		if obj.GetName() == CredentialsSecretName || (refOK && obj.GetNamespace() == namespace && obj.GetName() == name) {
+			return []reconcile.Request{{NamespacedName: types.NamespacedName{
+				Namespace: namespace,
+				Name:      tenant.MaasTenantConfigInstanceName,
+			}}}
+		}
+	}
+	return nil
+}
+
+// maasTenantConfigForCABundle maps the platform CA bundle ConfigMap to the
+// MaasTenantConfigs whose infrastructure namespace contains it.
+func (r *Reconciler) maasTenantConfigForCABundle(ctx context.Context, obj client.Object) []reconcile.Request {
+	if obj.GetName() != TrustedCABundleConfigMap {
+		return nil
+	}
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(tenant.MaasTenantConfigGVK.GroupVersion().WithKind(tenant.MaasTenantConfigGVK.Kind + "List"))
+	if err := r.Client.List(ctx, list); err != nil {
+		return nil
+	}
+	requests := []reconcile.Request{}
+	for i := range list.Items {
+		mtc := &list.Items[i]
+		if InfraNamespace(mtc) == obj.GetNamespace() {
+			requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
+				Namespace: mtc.GetNamespace(),
+				Name:      mtc.GetName(),
+			}})
+		}
+	}
+	return requests
 }
 
 // Reconcile applies the auth proxy when the default AITenant is ready, has a
@@ -167,25 +226,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
 	}
 
-	// The proxy cannot start without its client and cookie secrets, so wait
-	// for them instead of creating a pod that fails on a missing Secret.
-	secret := &corev1.Secret{}
-	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: infraNamespace, Name: CredentialsSecretName}, secret); err != nil {
-		if apierrors.IsNotFound(err) {
-			log.Info("auth proxy credentials Secret does not exist yet; will retry",
-				"namespace", infraNamespace, "secret", CredentialsSecretName)
-			return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
-		}
-		return ctrl.Result{}, fmt.Errorf("get Secret %s/%s: %w", infraNamespace, CredentialsSecretName, err)
+	if err := r.ensureFinalizer(ctx, mtc); err != nil {
+		return ctrl.Result{}, fmt.Errorf("ensure finalizer: %w", err)
 	}
 
-	caKeys, err := r.providerCAKeys(ctx, infraNamespace)
+	// The proxy cannot start without its client and cookie secrets, so wait
+	// for them instead of creating a pod that fails on a missing Secret.
+	credentialsHash, ready, err := r.reconcileCredentials(ctx, log, aitenant, infraNamespace)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	if !ready {
+		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
+	}
 
-	if err := r.ensureFinalizer(ctx, mtc); err != nil {
-		return ctrl.Result{}, fmt.Errorf("ensure finalizer: %w", err)
+	caKeys, caBundleHash, err := r.providerCAKeys(ctx, infraNamespace)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	rendered, err := render.Build(r.ManifestPath)
@@ -201,6 +258,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		GatewayNamespace:   gatewayNamespace,
 		AuthorinoNamespace: r.authorinoNamespace(),
 		ProviderCAKeys:     caKeys,
+		CABundleHash:       caBundleHash,
+		CredentialsHash:    credentialsHash,
+		RefreshInterval:    RefreshInterval(aitenant),
+		CookieExpire:       CookieExpire(aitenant),
 	})
 	if err := render.Apply(ctx, r.Client, resources); err != nil {
 		return ctrl.Result{}, fmt.Errorf("apply: %w", err)
@@ -249,6 +310,21 @@ func (r *Reconciler) cleanup(ctx context.Context, namespace string) error {
 		if err := r.Client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete %s %s/%s: %w", gvk.Kind, namespace, AuthProxyName, err)
 		}
+	}
+	// Credentials the controller built are removed; an administrator's
+	// hand-made Secret is left alone.
+	secret := &corev1.Secret{}
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: CredentialsSecretName}, secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get Secret %s/%s: %w", namespace, CredentialsSecretName, err)
+	}
+	if secret.GetLabels()[tenant.LabelManagedBy] != tenant.ManagedByAIGatewayController {
+		return nil
+	}
+	if err := r.Client.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete Secret %s/%s: %w", namespace, CredentialsSecretName, err)
 	}
 	return nil
 }
@@ -303,23 +379,29 @@ func (r *Reconciler) gatewayHostname(ctx context.Context, namespace, name string
 }
 
 // providerCAKeys returns the odh-trusted-ca-bundle keys that contain
-// certificates. The bundle is optional, and the platform leaves its custom CA
-// key empty when no custom CA is configured.
-func (r *Reconciler) providerCAKeys(ctx context.Context, namespace string) ([]string, error) {
+// certificates and a hash of their contents. The bundle is optional, and the
+// platform leaves its custom CA key empty when no custom CA is configured.
+func (r *Reconciler) providerCAKeys(ctx context.Context, namespace string) ([]string, string, error) {
 	bundle := &corev1.ConfigMap{}
 	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: TrustedCABundleConfigMap}, bundle); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, nil
+			return nil, "", nil
 		}
-		return nil, fmt.Errorf("get ConfigMap %s/%s: %w", namespace, TrustedCABundleConfigMap, err)
+		return nil, "", fmt.Errorf("get ConfigMap %s/%s: %w", namespace, TrustedCABundleConfigMap, err)
 	}
 	var keys []string
+	sum := sha256.New()
 	for _, key := range TrustedCABundleKeys {
-		if strings.Contains(bundle.Data[key], "BEGIN CERTIFICATE") {
+		value, ok := bundle.Data[key]
+		if ok && strings.Contains(value, "BEGIN CERTIFICATE") {
 			keys = append(keys, key)
+			sum.Write([]byte(value))
 		}
 	}
-	return keys, nil
+	if len(keys) == 0 {
+		return nil, "", nil
+	}
+	return keys, hex.EncodeToString(sum.Sum(nil))[:16], nil
 }
 
 func (r *Reconciler) authorinoNamespace() string {
