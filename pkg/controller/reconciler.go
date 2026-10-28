@@ -1344,9 +1344,13 @@ func (r *Reconciler) cleanupModelTransport(ctx context.Context, namespace string
 }
 
 func (r *Reconciler) applyProviderTransport(ctx context.Context, provider *v1alpha1.ExternalProvider, tenantID, gatewayName, gatewayNamespace string) error {
+	port, err := resolver.ProviderPort(provider)
+	if err != nil {
+		return fmt.Errorf("resolve provider %s transport port: %w", provider.Name, err)
+	}
 	route := resolver.Route{
 		Namespace: provider.Namespace, Provider: provider.Name, ProviderType: provider.Spec.Provider,
-		Endpoint: provider.Spec.Endpoint, TLSCACertificates: strings.TrimSpace(provider.Spec.Config["tls.caCertificates"]),
+		Endpoint: provider.Spec.Endpoint, Port: port, TLSCACertificates: strings.TrimSpace(provider.Spec.Config["tls.caCertificates"]),
 		TLSCredentialName: strings.TrimSpace(provider.Spec.Config["tls.credentialName"]),
 	}
 	service := providerService(route, provider.Namespace)
@@ -1632,6 +1636,9 @@ func (r *Reconciler) praxisTenantForNamespace(ctx context.Context, namespace str
 
 func (r *Reconciler) validateProvider(_ context.Context, p *v1alpha1.ExternalProvider) error {
 	if err := validateProviderEndpoint(p.Spec.Endpoint); err != nil {
+		return err
+	}
+	if _, err := resolver.ProviderPort(p); err != nil {
 		return err
 	}
 	authType := resolver.AuthType(strings.ToLower(strings.TrimSpace(p.Spec.Auth.Type)))
@@ -2371,6 +2378,9 @@ func providerEndpointForRoute(route resolver.Route) providerEndpoint {
 		// endpoint structurally inspectable without creating a new fallback in
 		// the live reconcile path.
 		return providerEndpoint{authority: route.Endpoint, host: route.Endpoint, port: 443}
+	}
+	if route.Port != 0 {
+		endpoint.port = route.Port
 	}
 	return endpoint
 }

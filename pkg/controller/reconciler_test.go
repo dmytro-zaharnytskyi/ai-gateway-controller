@@ -726,6 +726,34 @@ func TestProviderTransportPreservesAuthorityPortAndHostnameSNI(t *testing.T) {
 	}
 }
 
+func TestProviderTransportUsesResolvedPort(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		port int64
+		want int64
+	}{
+		{name: "annotated port", port: 8000, want: 8000},
+		{name: "default HTTPS port", want: 443},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			route := resolver.Route{Provider: "provider", Endpoint: "provider.example.com", Port: tc.port}
+			service := providerService(route, "tenant-a")
+			if got := nestedMapAt(t, nestedSlice(t, service.Object, "spec", "ports"), 0)["port"]; got != tc.want {
+				t.Fatalf("Service port = %v, want %d", got, tc.want)
+			}
+			entry := providerServiceEntry(route, "tenant-a")
+			if got := nestedMapAt(t, nestedSlice(t, entry.Object, "spec", "ports"), 0)["number"]; got != tc.want {
+				t.Fatalf("ServiceEntry port = %v, want %d", got, tc.want)
+			}
+			httpRoute := modelHTTPRoute(route, "tenant-a", "gateway", "gateway-system")
+			rules := nestedSlice(t, httpRoute.Object, "spec", "rules")
+			if got := nestedMapAt(t, nestedSlice(t, nestedMapAt(t, rules, 0), "backendRefs"), 0)["port"]; got != tc.want {
+				t.Fatalf("HTTPRoute backend port = %v, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestProviderTransportUsesConfiguredCAFileWithoutDisablingVerification(t *testing.T) {
 	route := resolver.Route{Provider: "provider", Endpoint: "provider.example.com", TLSCACertificates: "/etc/istio/provider-ca/ca.crt"}
 	destination := providerDestinationRule(route, "tenant-a")

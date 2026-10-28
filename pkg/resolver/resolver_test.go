@@ -77,6 +77,31 @@ func TestResolve_SingleHappyPath(t *testing.T) {
 	}
 }
 
+func TestResolve_UsesAnnotatedProviderPort(t *testing.T) {
+	m := model("ns1", "my-model", ref("prov-a", "gpt-4o", "/v1/chat/completions"))
+	p := provider("ns1", "prov-a", PhaseReady, "provider.example.com", nil)
+	p.Annotations = map[string]string{ProviderPortAnnotation: "8000"}
+
+	set, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got := set.Routes()[0].Port; got != 8000 {
+		t.Fatalf("resolved port = %d, want 8000", got)
+	}
+}
+
+func TestProviderPortDefaultsAndRejectsInvalidAnnotation(t *testing.T) {
+	p := provider("ns1", "prov-a", PhaseReady, "provider.example.com", nil)
+	if got, err := ProviderPort(p); err != nil || got != 443 {
+		t.Fatalf("ProviderPort() = (%d, %v), want (443, nil)", got, err)
+	}
+	p.Annotations = map[string]string{ProviderPortAnnotation: "65536"}
+	if _, err := ProviderPort(p); err == nil {
+		t.Fatal("ProviderPort() succeeded for invalid port annotation")
+	}
+}
+
 func TestResolveRejectsDuplicateActiveProviderBindings(t *testing.T) {
 	m := model("ns1", "my-model",
 		ref("prov-a", "gpt-4o-mini", "/v1/chat/completions"),
