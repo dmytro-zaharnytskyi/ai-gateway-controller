@@ -559,6 +559,15 @@ TLS on port 4180 with a service-ca certificate, trusts
 tenant Gateway and Authorino. Its OIDC callback is
 `https://<Gateway HTTPS listener hostname>/oauth2/callback`.
 
+The same reconciliation creates the `maas-consumer-portal` and
+`maas-consumer-portal-oauth2` HTTPRoutes on the default Gateway, a
+ReferenceGrant for the dashboard Service, backend TLS DestinationRules, and
+route-scoped AuthPolicies. The portal slice is applied only after
+`maas-portal` exists in the dashboard namespace, and readiness requires both
+routes to report `Accepted` and `ResolvedRefs`. Authorino validates browser
+sessions by calling the proxy's `/oauth2/auth` endpoint directly and redirects
+unauthenticated portal requests to `/oauth2/start`.
+
 The proxy reads its client and cookie secrets from
 `maas-consumer-portal-auth-proxy-creds` in the same namespace. Until that Secret
 exists the controller does not apply the proxy. Because the proxy lives in
@@ -724,6 +733,7 @@ ai-gateway-controller/
 | `--kube-auth-proxy-image` | `RELATED_IMAGE_ODH_KUBE_AUTH_PROXY_IMAGE`, else `quay.io/opendatahub/odh-kube-auth-proxy:odh-stable` | Consumer portal auth proxy image |
 | `--consumer-portal-manifest-path` | `/config/manifests/consumer-portal/base` | Kustomize entrypoint for the consumer portal auth proxy |
 | `--authorino-namespace` | `kuadrant-system` | Authorino namespace allowed through the auth proxy NetworkPolicy |
+| `--consumer-portal-dashboard-namespace` | `redhat-ods-applications` | Namespace containing the consumer portal Service |
 | `--leader-elect` | `false` | Enable when running multiple replicas |
 | `--metrics-bind-address`, `--health-probe-bind-address` | `:8080`, `:8081` | Standard controller-runtime endpoints |
 

@@ -46,7 +46,9 @@ SKIP_DEPLOYMENT=${SKIP_DEPLOYMENT:-false}
 SKIP_VALIDATION=${SKIP_VALIDATION:-false}
 SKIP_AUTH_CHECK=${SKIP_AUTH_CHECK:-true}
 INSECURE_HTTP=${INSECURE_HTTP:-false}
-EXTERNAL_OIDC=false
+# The group-test lane defaults to no external OIDC; override EXTERNAL_OIDC=true
+# to run the OIDC mode (portal tests) against the same deployment flow.
+EXTERNAL_OIDC=${EXTERNAL_OIDC:-false}
 
 export MAAS_API_IMAGE
 export MAAS_CONTROLLER_IMAGE
@@ -182,7 +184,7 @@ setup_vars_for_tests() {
     export CLUSTER_DOMAIN="$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')"
     [[ -z "$CLUSTER_DOMAIN" ]] && { echo "ERROR: Failed to detect cluster domain"; exit 1; }
     export HOST="maas.${CLUSTER_DOMAIN}"
-    export EXTERNAL_OIDC=false
+    export EXTERNAL_OIDC
 
     if [[ "$INSECURE_HTTP" == "true" ]]; then
         export MAAS_API_BASE_URL="http://${HOST}/maas-api"
