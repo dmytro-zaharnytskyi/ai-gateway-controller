@@ -1808,6 +1808,88 @@ func TestSharedProviderReportsTLSCredentialSecretInGatewayNamespace(t *testing.T
 	}
 }
 
+// failingCASecretReader fails reads of the provider-ca Secrets in namespace.
+type failingCASecretReader struct {
+	client.Reader
+	namespace string
+}
+
+func (r failingCASecretReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.Secret); ok && key.Namespace == r.namespace && strings.HasPrefix(key.Name, "provider-ca") {
+		return apierrors.NewServiceUnavailable("etcd is unavailable")
+	}
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+
+func TestReconcileProviderRetriesTransientCASecretRead(t *testing.T) {
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid"},
+		Spec: v1alpha1.ExternalProviderSpec{
+			Provider: "openai", Endpoint: "api.example.com",
+			Auth:   v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "credentials"}},
+			Config: map[string]string{"tls.credentialName": "provider-ca"},
+		},
+	}
+	credentials := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "tenant-a"}, Data: map[string][]byte{"api-key": []byte("secret")}}
+	caSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-ca", Namespace: "gateway-system"}, Data: map[string][]byte{"cacert": testCACertificatePEM(t)}}
+	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "gateway-system")
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")
+	r := controllerTestClient(t, provider, credentials, caSecret, ait, mtc)
+	ctx := context.Background()
+	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}
+	if _, err := r.ReconcileProvider(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := r.APIReader
+	r.APIReader = failingCASecretReader{Reader: reader, namespace: "gateway-system"}
+	if _, err := r.ReconcileProvider(ctx, req); !apierrors.IsServiceUnavailable(err) {
+		t.Fatalf("ReconcileProvider() on a failed CA Secret read = %v, want ServiceUnavailable to retry", err)
+	}
+	var got v1alpha1.ExternalProvider
+	if err := r.Get(ctx, req.NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("provider phase after a failed CA Secret read = %q, want Ready", got.Status.Phase)
+	}
+	rule := &unstructured.Unstructured{}
+	rule.SetGroupVersionKind(destinationRuleGVK)
+	if err := r.Get(ctx, client.ObjectKey{Namespace: "gateway-system", Name: "provider-provider-tenant"}, rule); err != nil {
+		t.Fatalf("DestinationRule after a failed CA Secret read: %v", err)
+	}
+
+	r.APIReader = reader
+	if _, err := r.ReconcileProvider(ctx, req); err != nil {
+		t.Fatalf("recovery reconcile = %v", err)
+	}
+}
+
+func TestSharedProviderRetriesTransientCASecretRead(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	provider.Spec.Config = map[string]string{"tls.credentialName": "provider-ca"}
+	caSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-ca", Namespace: "openshift-ingress"}, Data: map[string][]byte{"cacert": testCACertificatePEM(t)}}
+	r := controllerTestClient(t, provider, secret, caSecret)
+	r.GatewayNamespace = "openshift-ingress"
+	ctx := context.Background()
+	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}
+	if _, err := r.ReconcileProvider(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+
+	r.APIReader = failingCASecretReader{Reader: r.APIReader, namespace: "openshift-ingress"}
+	if _, err := r.ReconcileProvider(ctx, req); !apierrors.IsServiceUnavailable(err) {
+		t.Fatalf("ReconcileProvider() on a failed CA Secret read = %v, want ServiceUnavailable to retry", err)
+	}
+	var got v1alpha1.ExternalProvider
+	if err := r.Get(ctx, req.NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("provider phase after a failed CA Secret read = %q, want Ready", got.Status.Phase)
+	}
+}
+
 func TestValidateProviderCACredentialFollowsIstioLookup(t *testing.T) {
 	provider := &v1alpha1.ExternalProvider{Spec: v1alpha1.ExternalProviderSpec{Config: map[string]string{"tls.credentialName": "provider-ca"}}}
 	ca := map[string][]byte{"cacert": testCACertificatePEM(t)}

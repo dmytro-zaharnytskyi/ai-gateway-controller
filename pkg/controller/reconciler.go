@@ -477,16 +477,7 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 			return reconcile.Result{}, err
 		}
 		if !tenantNamespace {
-			if _, _, ipp, err := r.defaultTenantGateway(ctx); err != nil || ipp {
-				return reconcile.Result{}, err
-			}
-			if validationErr == nil {
-				validationErr = r.validateProviderCACredential(ctx, &provider, r.gatewayNamespace())
-			}
-			if validationErr != nil {
-				return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error())
-			}
-			return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, resolver.PhaseReady, reasonValidated, "provider Secret reference is ready; Gateway attachments apply its transport")
+			return r.reconcileAttachmentOnlyProvider(ctx, &provider, validationErr)
 		}
 	}
 	// Claim the provider before any tenant gate: an absent MaasTenantConfig is
@@ -509,6 +500,11 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 
 	if validationErr == nil {
 		validationErr = r.validateProviderCACredential(ctx, &provider, gatewayNamespace)
+		if transientReadError(validationErr) {
+			// A failed Secret read is not the provider's own failure: retry
+			// instead of withdrawing its transport and reporting it Failed.
+			return reconcile.Result{}, validationErr
+		}
 	}
 	if validationErr != nil {
 		cleanupErr := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name)
@@ -546,6 +542,26 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
+}
+
+// reconcileAttachmentOnlyProvider reports the status of a provider in a
+// namespace no tenant claims, given the result of its own validation.
+func (r *Reconciler) reconcileAttachmentOnlyProvider(ctx context.Context, provider *v1alpha1.ExternalProvider, validationErr error) (reconcile.Result, error) {
+	if _, _, ipp, err := r.defaultTenantGateway(ctx); err != nil || ipp {
+		return reconcile.Result{}, err
+	}
+	if validationErr == nil {
+		validationErr = r.validateProviderCACredential(ctx, provider, r.gatewayNamespace())
+		if transientReadError(validationErr) {
+			// A failed Secret read is not the provider's own failure: retry
+			// instead of reporting it Failed.
+			return reconcile.Result{}, validationErr
+		}
+	}
+	if validationErr != nil {
+		return reconcile.Result{}, r.updateProviderStatus(ctx, provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error())
+	}
+	return reconcile.Result{}, r.updateProviderStatus(ctx, provider, resolver.PhaseReady, reasonValidated, "provider Secret reference is ready; Gateway attachments apply its transport")
 }
 
 func (r *Reconciler) ensureExternalProviderFinalizer(ctx context.Context, provider *v1alpha1.ExternalProvider) error {
