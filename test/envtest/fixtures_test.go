@@ -120,6 +120,9 @@ func awaitModelPublished(t *testing.T, c client.Client, model *inferencev1alpha1
 			Namespace: model.Namespace, Name: "payload-processing-external-model-" + model.Namespace,
 		}, &extProc))
 		require.NoError(collect, markAvailable(t.Context(), c, &extProc))
+		// It also waits for the Gateway to accept its route; envtest runs no
+		// Gateway controller either.
+		require.NoError(collect, markRouteAccepted(t.Context(), c, model.Namespace, "external-model-"+model.Name))
 		var actual inferencev1alpha1.ExternalModel
 		require.NoError(collect, c.Get(t.Context(), client.ObjectKeyFromObject(model), &actual))
 		require.Contains(collect, actual.Finalizers, externalModelFinalizer)
@@ -198,6 +201,32 @@ func markAvailable(ctx context.Context, c client.Client, deployment *appsv1.Depl
 		Type: appsv1.DeploymentAvailable, Status: corev1.ConditionTrue, Reason: "MinimumReplicasAvailable",
 	})
 	return c.Status().Update(ctx, deployment)
+}
+
+// markRouteAccepted reports the HTTPRoute Accepted by the tenant's gateway, as
+// its Gateway controller would.
+func markRouteAccepted(ctx context.Context, c client.Client, namespace, name string) error {
+	route := &unstructured.Unstructured{}
+	route.SetAPIVersion("gateway.networking.k8s.io/v1")
+	route.SetKind("HTTPRoute")
+	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, route); err != nil {
+		return err
+	}
+	if parents, _, _ := unstructured.NestedSlice(route.Object, "status", "parents"); len(parents) > 0 {
+		return nil
+	}
+	parents := []any{map[string]any{
+		"parentRef":      map[string]any{"group": "gateway.networking.k8s.io", "kind": "Gateway", "name": gatewayName, "namespace": gatewayNamespace},
+		"controllerName": "istio.io/gateway-controller",
+		"conditions": []any{map[string]any{
+			"type": "Accepted", "status": string(metav1.ConditionTrue), "reason": "Accepted", "message": "Route was valid",
+			"observedGeneration": route.GetGeneration(), "lastTransitionTime": metav1.Now().UTC().Format(time.RFC3339),
+		}},
+	}}
+	if err := unstructured.SetNestedSlice(route.Object, parents, "status", "parents"); err != nil {
+		return err
+	}
+	return c.Status().Update(ctx, route)
 }
 
 func projectedSecretNames(deployment appsv1.Deployment) []string {

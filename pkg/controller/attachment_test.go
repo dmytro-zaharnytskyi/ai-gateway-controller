@@ -2563,6 +2563,33 @@ func TestHomeModelWaitsForTenantExtProc(t *testing.T) {
 	}
 }
 
+// Requests to a home route fail until the Gateway accepts it, so the model
+// waits for the Gateway's decision too.
+func TestHomeModelWaitsForGatewayToAcceptRoute(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	ctx := context.Background()
+	accepting := r.Client
+	undecided, ok := r.APIReader.(client.WithWatch)
+	if !ok {
+		t.Fatal("the test reader must be the fake client")
+	}
+	r.Client = undecided // no Gateway has reported on the route yet
+	result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := getModel(t, r, model)
+	if got.Status.Phase != modelPhasePending || readyReason(got) != reasonAttachmentPending || result.RequeueAfter != attachmentRequeueInterval {
+		t.Fatalf("model before the Gateway accepts its route: result %#v, status %#v", result, got.Status)
+	}
+
+	r.Client = accepting
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("model whose route the Gateway accepted = %#v", got.Status)
+	}
+}
+
 // A home route the Gateway rejects serves nothing: the model reports the
 // Gateway's reason, and the route's status update reconciles it again.
 func TestHomeModelReportsRouteRejectedByGateway(t *testing.T) {

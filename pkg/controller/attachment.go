@@ -854,7 +854,7 @@ func (r *Reconciler) reconcileAttachment(ctx context.Context, model *v1alpha1.Ex
 // waitingReason reports a reason that is waited for, not a failure: the model
 // is Pending and rechecked.
 func waitingReason(reason string) bool {
-	return reason == reasonExtProcNotReady
+	return reason == reasonExtProcNotReady || reason == reasonAttachmentPending
 }
 
 // extProcAvailable reports whether the tenant's ExternalModel ExtProc
@@ -887,16 +887,24 @@ func (r *Reconciler) extProcAvailable(ctx context.Context, namespace, tenantID s
 }
 
 // homeServingState explains why a model whose overlay its own tenant
-// published does not serve: the Gateway rejected its HTTPRoute, or the
-// tenant's ExtProc is not available yet. An empty reason means it serves. A
-// route the Gateway has not decided on, or that is not in the cache yet, is
-// not reported; the route's status update reconciles the model again.
+// published does not serve: the Gateway has not accepted its HTTPRoute yet or
+// rejected it, or the tenant's ExtProc is not available yet. An empty reason
+// means it serves. A route the Gateway has not decided on, or that is not in
+// the cache yet, is waited for; the route's events reconcile the model again.
 func (r *Reconciler) homeServingState(ctx context.Context, model *v1alpha1.ExternalModel, home attachmentTenant) (string, string) {
+	routeName := modelRouteName(model.Name)
 	route := newHTTPRoute()
-	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: modelRouteName(model.Name)}, route); err == nil {
-		if accepted, reason, message := routeAccepted(route, home.gateway); !accepted && reason != reasonAttachmentPending {
-			return reason, fmt.Sprintf("Gateway %s did not accept HTTPRoute %s: %s", gatewayKey(home.gateway), route.GetName(), message)
+	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: routeName}, route); err != nil {
+		if !apierrors.IsNotFound(err) {
+			r.Log.Error(err, "read model HTTPRoute", "namespace", model.Namespace, "name", routeName)
 		}
+		route = nil
+	}
+	if accepted, reason, message := routeAccepted(route, home.gateway); !accepted {
+		if reason == reasonAttachmentPending {
+			return reason, fmt.Sprintf("waiting for Gateway %s to accept HTTPRoute %s", gatewayKey(home.gateway), routeName)
+		}
+		return reason, fmt.Sprintf("Gateway %s did not accept HTTPRoute %s: %s", gatewayKey(home.gateway), routeName, message)
 	}
 	if available, message := r.extProcAvailable(ctx, home.namespace, home.tenantID); !available {
 		return reasonExtProcNotReady, message

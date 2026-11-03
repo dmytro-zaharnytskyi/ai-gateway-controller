@@ -24,6 +24,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -53,7 +54,35 @@ func controllerTestClient(t *testing.T, objects ...client.Object) *Reconciler {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&v1alpha1.ExternalModel{}, &v1alpha1.ExternalProvider{}).
 		WithObjects(withTenantExtProcs(objects)...).Build()
-	return &Reconciler{Client: fakeClient, APIReader: fakeClient}
+	return &Reconciler{Client: interceptor.NewClient(fakeClient, interceptor.Funcs{Get: acceptHomeRoute}), APIReader: fakeClient}
+}
+
+// acceptHomeRoute reads a home HTTPRoute that has no parent status as
+// Accepted by each of its parents, as the tenant's Gateway reports it. A test
+// writes the status itself to have the Gateway reject or not decide on it.
+func acceptHomeRoute(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if err := c.Get(ctx, key, obj, opts...); err != nil {
+		return err
+	}
+	route, ok := obj.(*unstructured.Unstructured)
+	if !ok || route.GroupVersionKind() != httpRouteGVK || route.GetLabels()[tenant.LabelManagedBy] != "ai-gateway-controller" {
+		return nil
+	}
+	if _, attachment := route.GetLabels()[tenant.LabelAttachmentTenant]; attachment {
+		return nil
+	}
+	if parents, _, _ := unstructured.NestedSlice(route.Object, "status", "parents"); len(parents) > 0 {
+		return nil
+	}
+	refs, _, _ := unstructured.NestedSlice(route.Object, "spec", "parentRefs")
+	parents := make([]any, 0, len(refs))
+	for _, ref := range refs {
+		parents = append(parents, map[string]any{
+			"parentRef":  ref,
+			"conditions": []any{map[string]any{"type": "Accepted", "status": string(metav1.ConditionTrue), "reason": "Accepted"}},
+		})
+	}
+	return unstructured.SetNestedSlice(route.Object, parents, "status", "parents")
 }
 
 // withTenantExtProcs adds an available ExternalModel ExtProc Deployment for
