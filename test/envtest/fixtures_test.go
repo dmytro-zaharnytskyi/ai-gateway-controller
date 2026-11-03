@@ -155,6 +155,21 @@ func awaitModelPublished(t *testing.T, c client.Client, model *inferencev1alpha1
 	return routeName
 }
 
+// awaitModelFailed waits until model reports Failed with reason and names no
+// HTTPRoute.
+func awaitModelFailed(t *testing.T, c client.Client, model *inferencev1alpha1.ExternalModel, reason string) {
+	t.Helper()
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		var actual inferencev1alpha1.ExternalModel
+		require.NoError(collect, c.Get(t.Context(), client.ObjectKeyFromObject(model), &actual))
+		require.Equal(collect, "Failed", actual.Status.Phase)
+		ready := apimeta.FindStatusCondition(actual.Status.Conditions, "Ready")
+		require.NotNil(collect, ready)
+		require.Equal(collect, reason, ready.Reason, ready.Message)
+		require.Empty(collect, actual.Status.HTTPRouteName)
+	}, eventuallyTimeout, pollInterval, "the model must report %s", reason)
+}
+
 func awaitModelRemoved(t *testing.T, c client.Client, model *inferencev1alpha1.ExternalModel, routeName string) {
 	t.Helper()
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {

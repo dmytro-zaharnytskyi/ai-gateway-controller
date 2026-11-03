@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -64,7 +65,10 @@ const (
 	externalProviderFinalizer     = "inference.opendatahub.io/external-provider-cleanup"
 )
 
-var errCredentialNotReady = errors.New("effective provider credential is not ready")
+var (
+	errCredentialNotReady = errors.New("effective provider credential is not ready")
+	errInvalidModelName   = errors.New("ExternalModel name cannot be rendered")
+)
 
 // Reconciler coordinates Praxis ExternalModel routes and ExternalProvider
 // transport. The model loop resolves one namespace-scoped route set and
@@ -1856,6 +1860,11 @@ func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver
 	bindings := make(map[string]bool)
 	duplicateProviders := make(map[string]bool)
 	for _, model := range set.Models {
+		if len(model.Routes) > 0 {
+			if err := validateModelName(model.Routes[0].Model); err != nil {
+				rejected[model.ModelRef] = err
+			}
+		}
 		if count := modelHTTPRouteRuleCount(model.Routes); count > maxHTTPRouteRules {
 			rejected[model.ModelRef] = fmt.Errorf("%d HTTPRoute rules exceed the Gateway API limit of %d", count, maxHTTPRouteRules)
 		}
@@ -1890,6 +1899,27 @@ func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver
 	return valid, rejected
 }
 
+// validateModelName rejects an ExternalModel name that cannot be the value of
+// the label on the objects rendered for the model, so at most 63 characters
+// (RHOAIENG-100314). The model's HTTPRoute name and overlay stable_id then fit
+// their limits too, and a selection sink name that is not a valid Service name
+// is hashed (see providerSelectionSinkName).
+func validateModelName(name string) error {
+	if problems := validation.IsValidLabelValue(name); len(problems) > 0 {
+		return fmt.Errorf("%w: %q is not a valid label value (%s); use a shorter metadata.name and set spec.modelName to the client-facing name",
+			errInvalidModelName, name, strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// rejectionReason is the status reason for a model excludeUnsupportedModelSelection rejects.
+func rejectionReason(err error) string {
+	if errors.Is(err, errInvalidModelName) {
+		return reasonInvalidName
+	}
+	return reasonReconcileFailed
+}
+
 func (r *Reconciler) validateModelRouteSet(ctx context.Context, set *resolver.ResolvedRouteSet,
 	owners map[string]*v1alpha1.ExternalModel, current *v1alpha1.ExternalModel, report modelStatusReporter) (*resolver.ResolvedRouteSet, error) {
 	valid, rejected := excludeUnsupportedModelSelection(set)
@@ -1898,13 +1928,13 @@ func (r *Reconciler) validateModelRouteSet(ctx context.Context, set *resolver.Re
 			if owner.Namespace == current.Namespace && owner.Name == current.Name {
 				continue
 			}
-			if err := r.updateModelStatus(ctx, owner, false, reasonReconcileFailed, rejection.Error(), nil); err != nil {
+			if err := r.updateModelStatus(ctx, owner, false, rejectionReason(rejection), rejection.Error(), nil); err != nil {
 				return nil, err
 			}
 		}
 	}
 	if err := rejected[current.Namespace+"/"+current.Name]; err != nil {
-		if statusErr := report(false, reasonReconcileFailed, err.Error(), nil); statusErr != nil {
+		if statusErr := report(false, rejectionReason(err), err.Error(), nil); statusErr != nil {
 			return nil, statusErr
 		}
 		return nil, err
@@ -2647,8 +2677,23 @@ func removeInternalRoutingHeaders() map[string]any {
 	}}
 }
 
+// providerSelectionSinkName names the model's selection sink Service. A model
+// name that makes it an invalid Service name (a DNS-1035 label: no dots, at
+// most 63 characters), such as gpt-4.1, gets
+// provider-selection-required--<model prefix>-<hash12> instead
+// (RHOAIENG-100314). Model names start with an alphanumeric, so the double
+// dash never matches a valid name, and every valid name keeps its form.
 func providerSelectionSinkName(model string) string {
-	return providerSelectionSinkPrefix + strings.ToLower(strings.ReplaceAll(model, "/", "-"))
+	name := providerSelectionSinkPrefix + strings.ToLower(strings.ReplaceAll(model, "/", "-"))
+	if len(validation.IsDNS1035Label(name)) == 0 {
+		return name
+	}
+	hash := shortHash(model)
+	base := strings.ReplaceAll(strings.TrimPrefix(name, providerSelectionSinkPrefix), ".", "-")
+	if limit := 63 - len(providerSelectionSinkPrefix) - len(hash) - 2; len(base) > limit {
+		base = strings.TrimRight(base[:limit], "-")
+	}
+	return providerSelectionSinkPrefix + "-" + base + "-" + hash
 }
 
 func providerSelectionSink(route resolver.Route, namespace string) unstructured.Unstructured {

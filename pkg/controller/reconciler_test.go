@@ -20,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -731,6 +732,61 @@ func TestExternalModelHTTPRouteRuleLimitByFormat(t *testing.T) {
 				t.Fatalf("rejected = %v, want %t", rejected["tenant-a/model"], tc.wantRejected)
 			}
 		})
+	}
+}
+
+// A model name that is not a valid Service name, such as gpt-4.1, still gets a
+// valid selection sink, and every valid name keeps its form (RHOAIENG-100314).
+func TestProviderSelectionSinkNameIsAValidServiceName(t *testing.T) {
+	for _, model := range []string{"model", "gpt-4-1", strings.Repeat("m", 35)} {
+		if got, want := providerSelectionSinkName(model), providerSelectionSinkPrefix+model; got != want {
+			t.Errorf("sink for %q = %q, want the unchanged %q", model, got, want)
+		}
+	}
+	// A valid name that spells out a hashed form keeps its own sink.
+	lookalike := "gpt-4-1-" + shortHash("gpt-4.1")
+	sinks := map[string]string{}
+	for _, model := range []string{"gpt-4.1", "gpt-4-1", lookalike, strings.Repeat("m", 36), strings.Repeat("m", 63), "meta-llama-3.1-70b-instruct-external"} {
+		sink := providerSelectionSinkName(model)
+		if problems := validation.IsDNS1035Label(sink); len(problems) > 0 {
+			t.Errorf("sink for %q = %q: %v", model, sink, problems)
+		}
+		if other, seen := sinks[sink]; seen {
+			t.Errorf("models %q and %q share the sink %q", other, model, sink)
+		}
+		sinks[sink] = model
+	}
+	if got, want := providerSelectionSinkName("gpt-4.1"), providerSelectionSinkPrefix+"-gpt-4-1-"+shortHash("gpt-4.1"); got != want {
+		t.Errorf("sink for gpt-4.1 = %q, want %q", got, want)
+	}
+}
+
+// A model whose name cannot label its objects is reported alone; the other
+// models of its namespace are still published (RHOAIENG-100314).
+func TestInvalidModelNameExcludesOnlyThatModel(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	ctx := context.Background()
+	long := model.DeepCopy()
+	long.Name, long.UID, long.ResourceVersion = strings.Repeat("m", 64), "long-uid", ""
+	if err := r.Create(ctx, long); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(long)}); !errors.Is(err, errInvalidModelName) {
+		t.Fatalf("reconcile of the long-named model = %v, want %v", err, errInvalidModelName)
+	}
+	if got := getModel(t, r, long); got.Status.Phase != modelPhaseFailed || readyReason(got) != reasonInvalidName {
+		t.Fatalf("long-named model status = %#v", got.Status)
+	}
+
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("sibling of the long-named model = %#v", got.Status)
+	}
+	if got := getModel(t, r, long); readyReason(got) != reasonInvalidName {
+		t.Fatalf("long-named model after its sibling's reconcile = %#v", got.Status)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", modelRouteName(long.Name)); !apierrors.IsNotFound(err) {
+		t.Fatalf("long-named model received a route: %v", err)
 	}
 }
 

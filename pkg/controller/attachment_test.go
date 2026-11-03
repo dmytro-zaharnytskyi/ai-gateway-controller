@@ -1116,6 +1116,20 @@ func TestTooManyProvidersExcludesOnlyThatModel(t *testing.T) {
 	}
 }
 
+func TestInvalidModelNameExcludesOnlyThatAttachment(t *testing.T) {
+	objects := attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel(strings.Repeat("m", 64), "team", "long-model", time.Unix(100, 0), gatewayB)
+	r := attachmentReconciler(t, append(objects, provider, secret, model)...)
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); readyReason(got) != reasonInvalidName {
+		t.Fatalf("reason = %q, want %q", readyReason(got), reasonInvalidName)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB)); !apierrors.IsNotFound(err) {
+		t.Fatalf("long-named model received a route: %v", err)
+	}
+}
+
 func TestSevenMessagesProvidersFitAttachmentRouteLimit(t *testing.T) {
 	objects := attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")
 	model := attachmentModel("wide", "team", "wide-model", time.Unix(100, 0), gatewayB)

@@ -52,6 +52,7 @@ const (
 	reasonTenantNotSteady         = "TenantNotSteady"
 	reasonModelNameConflict       = "ModelNameConflict"
 	reasonTooManyProviders        = "TooManyProviders"
+	reasonInvalidName             = "InvalidName"
 	reasonTranslationDisabled     = "APITranslationDisabled"
 	reasonOverlayCapacityExceeded = "OverlayCapacityExceeded"
 	reasonAttachmentPending       = "AttachmentPending"
@@ -1115,6 +1116,10 @@ func (r *Reconciler) resolveAttachedModel(ctx context.Context, t attachmentTenan
 		return nil
 	}
 	routes := set.Routes()
+	if err := validateModelName(m.Name); err != nil {
+		candidate.reason, candidate.message = reasonInvalidName, err.Error()
+		return nil //nolint:nilerr // excludes only this model
+	}
 	if count := modelHTTPRouteRuleCount(routes); count > maxHTTPRouteRules {
 		candidate.reason = reasonTooManyProviders
 		candidate.message = fmt.Sprintf("%d HTTPRoute rules exceed the Gateway API limit of %d for an attached model", count, maxHTTPRouteRules)
