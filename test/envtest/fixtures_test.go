@@ -3,6 +3,7 @@
 package envtest_test
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -111,6 +112,14 @@ func awaitModelPublished(t *testing.T, c client.Client, model *inferencev1alpha1
 	t.Helper()
 	var routeName string
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		// The model is Ready only once its tenant's ExtProc is available.
+		// envtest runs no Deployment controller, so mark it available as its
+		// pods would make it.
+		var extProc appsv1.Deployment
+		require.NoError(collect, c.Get(t.Context(), client.ObjectKey{
+			Namespace: model.Namespace, Name: "payload-processing-external-model-" + model.Namespace,
+		}, &extProc))
+		require.NoError(collect, markAvailable(t.Context(), c, &extProc))
 		var actual inferencev1alpha1.ExternalModel
 		require.NoError(collect, c.Get(t.Context(), client.ObjectKeyFromObject(model), &actual))
 		require.Contains(collect, actual.Finalizers, externalModelFinalizer)
@@ -161,6 +170,19 @@ func awaitModelRemoved(t *testing.T, c client.Client, model *inferencev1alpha1.E
 		key.Name = "payload-processing-external-model-" + model.Namespace
 		require.True(collect, apierrors.IsNotFound(c.Get(t.Context(), key, &appsv1.Deployment{})), "ExtProc workload remains")
 	}, eventuallyTimeout, pollInterval, "deleting the last model must remove its routing and workload")
+}
+
+// markAvailable sets the Deployment's Available condition.
+func markAvailable(ctx context.Context, c client.Client, deployment *appsv1.Deployment) error {
+	for _, condition := range deployment.Status.Conditions {
+		if condition.Type == appsv1.DeploymentAvailable && condition.Status == corev1.ConditionTrue {
+			return nil
+		}
+	}
+	deployment.Status.Conditions = append(deployment.Status.Conditions, appsv1.DeploymentCondition{
+		Type: appsv1.DeploymentAvailable, Status: corev1.ConditionTrue, Reason: "MinimumReplicasAvailable",
+	})
+	return c.Status().Update(ctx, deployment)
 }
 
 func projectedSecretNames(deployment appsv1.Deployment) []string {

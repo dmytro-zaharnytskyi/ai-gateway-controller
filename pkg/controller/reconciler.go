@@ -386,6 +386,11 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 
 	live, err := r.liveTenantResolution(ctx, provider.Namespace)
 	if err != nil {
+		// A provider in a namespace no tenant claims keeps no finalizer (see
+		// below), so the resolution is only retried.
+		if tenantNamespace, nsErr := r.tenantNamespace(ctx, provider.Namespace); nsErr == nil && !tenantNamespace {
+			return reconcile.Result{}, err
+		}
 		// Tenant resolution fails on an unreadable or inconsistent AITenant
 		// owner. Claim the provider and report Pending before returning: a bare
 		// error would leave it with neither our finalizer nor a status writer,
@@ -420,33 +425,42 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 	if !live.missingConfig && live.status == "" {
 		// Praxis is selected but the handoff has not started (see
 		// tenant.LegacyServes): IPP still serves this namespace and owns
-		// provider status until maas-controller writes cleanup-complete.
-		return reconcile.Result{}, nil
+		// provider status until maas-controller writes cleanup-complete. A
+		// claim left by a failed tenant lookup is released, so IPP reports
+		// the provider again.
+		return reconcile.Result{}, r.releaseProviderClaim(ctx, &provider)
 	}
 	validationErr := r.validateProvider(ctx, &provider)
 	if validationErr == nil {
 		validationErr = r.validateProviderCredential(ctx, &provider)
 	}
-	if live.missingConfig && !controllerutil.ContainsFinalizer(&provider, externalProviderFinalizer) {
+	if live.missingConfig {
 		// A namespace no tenant claims is served only through Gateway
 		// attachments: its provider has no tenant-local transport, so only its
 		// own configuration is reported. While IPP serves the default tenant,
 		// it serves this namespace's models and reports their providers'
-		// status instead. A tenant namespace whose MaasTenantConfig
-		// maas-controller has not created yet falls through and is claimed
-		// below.
+		// status instead, and a claim of ours, such as one a former tenant of
+		// the namespace left, is released. Otherwise that claim keeps the
+		// namespace's last serving state and falls through, as does a tenant
+		// namespace whose MaasTenantConfig maas-controller has not created yet.
 		tenantNamespace, err := r.tenantNamespace(ctx, provider.Namespace)
 		if err != nil {
 			return reconcile.Result{}, err
 		}
 		if !tenantNamespace {
-			if _, _, ipp, err := r.defaultTenantGateway(ctx); err != nil || ipp {
+			_, _, ipp, err := r.defaultTenantGateway(ctx)
+			if err != nil {
 				return reconcile.Result{}, err
 			}
-			if validationErr != nil {
-				return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error())
+			if ipp {
+				return reconcile.Result{}, r.releaseProviderClaim(ctx, &provider)
 			}
-			return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, resolver.PhaseReady, reasonValidated, "provider Secret reference is ready; Gateway attachments apply its transport")
+			if !controllerutil.ContainsFinalizer(&provider, externalProviderFinalizer) {
+				if validationErr != nil {
+					return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error())
+				}
+				return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, resolver.PhaseReady, reasonValidated, "provider Secret reference is ready; Gateway attachments apply its transport")
+			}
 		}
 	}
 	// Claim the provider before any tenant gate: an absent MaasTenantConfig is
@@ -503,6 +517,24 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
+}
+
+// releaseProviderClaim removes our claim from a provider we do not serve, such
+// as the claim a failed tenant lookup leaves: the transport we applied is
+// removed, except what attachment routes from its namespace still use, and
+// then our finalizer. A provider without the finalizer has nothing to release.
+func (r *Reconciler) releaseProviderClaim(ctx context.Context, provider *v1alpha1.ExternalProvider) error {
+	if !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		return nil
+	}
+	routes, err := r.listAttachmentRoutes(ctx, r.APIReader, client.InNamespace(provider.Namespace))
+	if err != nil {
+		return err
+	}
+	if err := r.cleanupProviderTransportExcept(ctx, provider.Namespace, provider.Name, routeBackends(routes)); err != nil {
+		return err
+	}
+	return r.removeExternalProviderFinalizer(ctx, provider)
 }
 
 func (r *Reconciler) ensureExternalProviderFinalizer(ctx context.Context, provider *v1alpha1.ExternalProvider) error {
@@ -730,11 +762,34 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		return reconcile.Result{}, report(false, reason, message, nil)
 	}
 
+	// The overlay is published, but the model serves only once the Gateway
+	// accepts its route and the tenant's ExtProc is available.
+	if result, served, err := r.reportUnserved(ctx, model, home, report); err != nil || !served {
+		return result, err
+	}
+
 	message := fmt.Sprintf("distributed routing overlay digest %s generation %d", result.Envelope.Revision.Value, result.Envelope.Provenance.SourceGeneration)
 	if err := report(true, reasonReconciled, message, &result.Envelope); err != nil {
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
+}
+
+// reportUnserved reports a model whose overlay is published but which does
+// not serve yet (see homeServingState). served is false once it is reported;
+// a model waiting for its tenant is rechecked.
+func (r *Reconciler) reportUnserved(ctx context.Context, model *v1alpha1.ExternalModel, home attachmentTenant, report modelStatusReporter) (reconcile.Result, bool, error) {
+	reason, message := r.homeServingState(ctx, model, home)
+	if reason == "" {
+		return reconcile.Result{}, true, nil
+	}
+	if err := report(false, reason, message, nil); err != nil {
+		return reconcile.Result{}, false, err
+	}
+	if waitingReason(reason) {
+		return reconcile.Result{RequeueAfter: attachmentRequeueInterval}, false, nil
+	}
+	return reconcile.Result{}, false, nil
 }
 
 func (r *Reconciler) handleHomeRouteResolutionError(
@@ -2260,7 +2315,10 @@ func (r *Reconciler) updateModelStatus(ctx context.Context, m *v1alpha1.External
 			setCondition(&m.Status.Conditions, conditionOverlayDistributed, metav1.ConditionTrue, reasonReconciled, message)
 		}
 	} else {
-		m.Status.Phase = "Failed"
+		m.Status.Phase = modelPhaseFailed
+		if waitingReason(reason) {
+			m.Status.Phase = modelPhasePending
+		}
 		setCondition(&m.Status.Conditions, conditionOverlayDistributed, metav1.ConditionFalse, reason, message)
 		if r.staleRouteName(ctx, m) {
 			m.Status.HTTPRouteName = ""

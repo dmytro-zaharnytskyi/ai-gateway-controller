@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -50,8 +51,49 @@ func controllerTestClient(t *testing.T, objects ...client.Object) *Reconciler {
 	scheme.AddKnownTypeWithName(tenant.MaasTenantConfigGVK.GroupVersion().WithKind("MaasTenantConfigList"), &unstructured.UnstructuredList{})
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&v1alpha1.ExternalModel{}, &v1alpha1.ExternalProvider{}).
-		WithObjects(objects...).Build()
+		WithObjects(withTenantExtProcs(objects)...).Build()
 	return &Reconciler{Client: fakeClient, APIReader: fakeClient}
+}
+
+// withTenantExtProcs adds an available ExternalModel ExtProc Deployment for
+// each AITenant, as the tenant reconciler starts one, unless the test passes
+// its own.
+func withTenantExtProcs(objects []client.Object) []client.Object {
+	present := map[client.ObjectKey]bool{}
+	for _, object := range objects {
+		if u, ok := object.(*unstructured.Unstructured); ok && u.GroupVersionKind() == deploymentGVK {
+			present[client.ObjectKeyFromObject(u)] = true
+		}
+	}
+	out := slices.Clone(objects)
+	for _, object := range objects {
+		u, ok := object.(*unstructured.Unstructured)
+		if !ok || u.GroupVersionKind() != tenant.AITenantGVK {
+			continue
+		}
+		tenantNamespace, _, _ := unstructured.NestedString(u.Object, "status", "tenantNamespace")
+		if tenantNamespace == "" {
+			continue
+		}
+		extProc := tenantExtProc(tenantNamespace, tenant.ID(u.GetName()), true)
+		if !present[client.ObjectKeyFromObject(extProc)] {
+			present[client.ObjectKeyFromObject(extProc)] = true
+			out = append(out, extProc)
+		}
+	}
+	return out
+}
+
+// tenantExtProc returns the tenant's ExternalModel ExtProc Deployment.
+func tenantExtProc(namespace, tenantID string, available bool) *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(deploymentGVK)
+	u.SetNamespace(namespace)
+	u.SetName(tenant.PayloadProcessingExternalModelDeploymentName(tenantID))
+	u.Object["status"] = map[string]any{"conditions": []any{map[string]any{
+		"type": "Available", "status": string(boolStatus(available)),
+	}}}
+	return u
 }
 
 func legacyExternalModelRouteFilter(name, namespace, managedBy string) *unstructured.Unstructured {

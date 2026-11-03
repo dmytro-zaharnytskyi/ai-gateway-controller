@@ -2305,3 +2305,376 @@ func TestAttachedModelReportsWhyNoProviderResolved(t *testing.T) {
 		t.Fatalf("failed model keeps httpRouteName %q", got.Status.HTTPRouteName)
 	}
 }
+
+// ippRoute returns the HTTPRoute a 3.5 IPP creates for model: named after it,
+// owned by it and attached to gateway.
+func ippRoute(model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference) *unstructured.Unstructured {
+	route := newHTTPRoute()
+	route.SetNamespace(model.Namespace)
+	route.SetName(model.Name)
+	route.SetLabels(map[string]string{tenant.LabelManagedBy: ippRouteManager})
+	route.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: v1alpha1.GroupVersion.String(), Kind: "ExternalModel", Name: model.Name, UID: model.UID}})
+	route.Object["spec"] = map[string]any{"parentRefs": []any{map[string]any{"name": gateway.Name, "namespace": gateway.Namespace}}}
+	return route
+}
+
+// setIPPStatus writes the status IPP reports for a model it serves.
+func setIPPStatus(t *testing.T, r *Reconciler, model *v1alpha1.ExternalModel) {
+	t.Helper()
+	got := getModel(t, r, model)
+	got.Status.Phase, got.Status.HTTPRouteName = resolver.PhaseReady, model.Name
+	got.Status.Conditions = []metav1.Condition{{Type: conditionReady, Status: metav1.ConditionTrue, Reason: "Reconciled", Message: "HTTPRoute created successfully", LastTransitionTime: metav1.Now()}}
+	if err := r.Status().Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A model naming the Gateway of a tenant whose migration is blocked is still
+// served by that tenant's 3.5 IPP, which ignores gatewayRefs and writes the
+// model's status. Our result would flip it against IPP's Ready.
+func TestGatewayRefsModelOfIPPServedTenantKeepsIPPStatus(t *testing.T) {
+	ait, mtc := blockedDefaultTenantObjects()
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), defaultGateway)
+	r := attachmentReconciler(t, provider, secret, model, ait, mtc, ippRoute(model, defaultGateway))
+	setIPPStatus(t, r, model)
+	// A result written before IPP's route was recognised.
+	written := getModel(t, r, model)
+	written.Status.Gateways = []v1alpha1.ExternalModelGatewayStatus{{NamespacedObjectReference: defaultGateway, Conditions: []metav1.Condition{{
+		Type: conditionReady, Status: metav1.ConditionFalse, Reason: reasonTenantNotSteady, LastTransitionTime: metav1.Now(),
+	}}}}
+	if err := r.Status().Update(context.Background(), written); err != nil {
+		t.Fatal(err)
+	}
+
+	reconcileModel(t, r, model)
+	got := getModel(t, r, model)
+	if got.Status.Phase != resolver.PhaseReady || readyReason(got) != "Reconciled" || got.Status.HTTPRouteName != "chat" || len(got.Status.Gateways) > 0 {
+		t.Fatalf("status of a model IPP serves = %#v", got.Status)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, defaultGateway)); !apierrors.IsNotFound(err) {
+		t.Fatalf("attached to a tenant IPP still serves: %v", err)
+	}
+
+	// Without IPP's route nothing serves the model, which is reported.
+	if err := r.Delete(context.Background(), ippRoute(model, defaultGateway)); err != nil {
+		t.Fatal(err)
+	}
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != modelPhasePending || readyReason(got) != reasonTenantNotSteady {
+		t.Fatalf("status without IPP's route = %#v", got.Status)
+	}
+}
+
+// A route left by an IPP whose tenant has moved to Praxis no longer serves:
+// the model's status is ours again.
+func TestGatewayRefsModelIgnoresRouteOfIPPThatNoLongerServes(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), defaultGateway)
+	objects := append([]client.Object{provider, secret, model, ippRoute(model, defaultGateway)},
+		attachmentTenantObjects(tenant.DefaultAITenantName, "models-as-a-service", defaultGateway, "praxis")...)
+	r := attachmentReconciler(t, objects...)
+	setIPPStatus(t, r, model)
+	reconcileModel(t, r, model)
+	setRouteParentStatus(t, r, model, defaultGateway, metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	got := getModel(t, r, model)
+	if got.Status.Phase != resolver.PhaseReady || got.Status.HTTPRouteName != attachmentRouteName(model, defaultGateway) || len(got.Status.Gateways) != 1 {
+		t.Fatalf("status of a model served through Praxis = %#v", got.Status)
+	}
+}
+
+// One failed tenant lookup claims a provider IPP serves. Once the lookup
+// works again the claim is released and IPP's status is left alone.
+func TestTransientTenantLookupErrorReleasesProviderClaim(t *testing.T) {
+	tests := []struct {
+		name      string
+		namespace string
+		claims    bool
+		objects   func() []client.Object
+	}{{
+		// A provider outside tenant namespaces keeps no finalizer, so the
+		// failed lookup is only retried.
+		name:      "outside tenant namespaces while IPP serves the default tenant",
+		namespace: "team",
+		claims:    false,
+		objects: func() []client.Object {
+			ait, mtc := blockedDefaultTenantObjects()
+			return []client.Object{ait, mtc}
+		},
+	}, {
+		name:      "tenant namespace IPP still serves",
+		namespace: "tenant-b",
+		claims:    true,
+		objects: func() []client.Object {
+			objects := attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")
+			mtc, ok := objects[1].(*unstructured.Unstructured)
+			if !ok {
+				t.Fatalf("MaasTenantConfig fixture is %T", objects[1])
+			}
+			annotations := mtc.GetAnnotations()
+			delete(annotations, tenant.AnnotationPayloadProcessingStatus)
+			mtc.SetAnnotations(annotations)
+			return objects
+		},
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider, secret := attachmentProvider(tt.namespace)
+			r := controllerTestClient(t, append(tt.objects(), provider, secret)...)
+			ctx := context.Background()
+			key := client.ObjectKeyFromObject(provider)
+			base, ok := r.APIReader.(client.WithWatch)
+			if !ok {
+				t.Fatal("APIReader must be a client.WithWatch")
+			}
+			failed := false
+			r.APIReader = interceptor.NewClient(base, interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, k client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if u, ok := obj.(*unstructured.Unstructured); ok && !failed && k.Namespace == tt.namespace && u.GetKind() == "MaasTenantConfig" {
+						failed = true
+						return apierrors.NewTimeoutError("injected API server timeout", 1)
+					}
+					return c.Get(ctx, k, obj, opts...)
+				},
+			})
+			if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: key}); err == nil {
+				t.Fatal("first reconcile: want the injected error")
+			}
+			var got v1alpha1.ExternalProvider
+			if err := r.Get(ctx, key, &got); err != nil {
+				t.Fatal(err)
+			}
+			if controllerutil.ContainsFinalizer(&got, externalProviderFinalizer) != tt.claims {
+				t.Fatalf("finalizers after a failed lookup = %v, want claimed %v", got.Finalizers, tt.claims)
+			}
+			// IPP serves the namespace and writes the provider's status.
+			got.Status.Phase = resolver.PhaseReady
+			got.Status.Conditions = []metav1.Condition{{Type: conditionReady, Status: metav1.ConditionTrue, Reason: "Reconciled", Message: "IPP", LastTransitionTime: metav1.Now()}}
+			if err := r.Status().Update(ctx, &got); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: key}); err != nil {
+				t.Fatalf("reconcile after recovery: %v", err)
+			}
+			if err := r.Get(ctx, key, &got); err != nil {
+				t.Fatal(err)
+			}
+			if controllerutil.ContainsFinalizer(&got, externalProviderFinalizer) || got.Status.Phase != resolver.PhaseReady {
+				t.Fatalf("provider IPP serves after recovery: finalizers %v, status %#v", got.Finalizers, got.Status)
+			}
+			if condition := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady); condition == nil || condition.Message != "IPP" {
+				t.Fatalf("IPP's provider status overwritten: %#v", got.Status.Conditions)
+			}
+		})
+	}
+}
+
+// A claim on a provider outside tenant namespaces is a former tenant's: it
+// keeps the namespace's last serving state, as a missing MaasTenantConfig does
+// not by itself remove serving resources.
+func TestFormerTenantProviderClaimIsRetained(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	controllerutil.AddFinalizer(provider, externalProviderFinalizer)
+	objects := append([]client.Object{provider, secret}, attachmentTenantObjects(tenant.DefaultAITenantName, "models-as-a-service", defaultGateway, "praxis")...)
+	r := controllerTestClient(t, objects...)
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatal(err)
+	}
+	var got v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(&got, externalProviderFinalizer) {
+		t.Fatalf("former tenant's provider claim released: %v", got.Finalizers)
+	}
+}
+
+// While IPP serves the default tenant it reports the providers of namespaces
+// no tenant claims, so such a claim of ours is released.
+func TestProviderClaimOutsideTenantsIsReleasedWhileIPPServes(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	controllerutil.AddFinalizer(provider, externalProviderFinalizer)
+	ait, mtc := blockedDefaultTenantObjects()
+	r := controllerTestClient(t, provider, secret, ait, mtc)
+	if _, err := r.ReconcileProvider(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+		t.Fatal(err)
+	}
+	var got v1alpha1.ExternalProvider
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(provider), &got); err != nil {
+		t.Fatal(err)
+	}
+	if controllerutil.ContainsFinalizer(&got, externalProviderFinalizer) || got.Status.Phase != "" {
+		t.Fatalf("provider IPP serves: finalizers %v, status %#v", got.Finalizers, got.Status)
+	}
+}
+
+// setExtProcAvailable sets the Available condition of the tenant's ExtProc
+// Deployment.
+func setExtProcAvailable(t *testing.T, r *Reconciler, namespace, tenantID string, available bool) {
+	t.Helper()
+	extProc, err := getUnstructured(r, deploymentGVK, namespace, tenant.PayloadProcessingExternalModelDeploymentName(tenantID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	extProc.Object["status"] = tenantExtProc(namespace, tenantID, available).Object["status"]
+	if err := r.Status().Update(context.Background(), extProc); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The tenant's first model is published before its ExtProc runs; requests
+// fail until it is available, so the model waits.
+func TestHomeModelWaitsForTenantExtProc(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	ctx := context.Background()
+	setExtProcAvailable(t, r, "tenant-a", tenant.ID("tenant"), false)
+	result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := getModel(t, r, model)
+	if got.Status.Phase != modelPhasePending || readyReason(got) != reasonExtProcNotReady || result.RequeueAfter != attachmentRequeueInterval {
+		t.Fatalf("model before its ExtProc is available: result %#v, status %#v", result, got.Status)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "tenant-a", modelRouteName(model.Name)); err != nil {
+		t.Fatalf("route not published while the ExtProc starts: %v", err)
+	}
+
+	setExtProcAvailable(t, r, "tenant-a", tenant.ID("tenant"), true)
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("model with an available ExtProc = %#v", got.Status)
+	}
+}
+
+// A home route the Gateway rejects serves nothing: the model reports the
+// Gateway's reason, and the route's status update reconciles it again.
+func TestHomeModelReportsRouteRejectedByGateway(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	reconcileModel(t, r, model)
+	gateway := v1alpha1.NamespacedObjectReference{Name: "gateway", Namespace: "tenant-a"}
+	route, err := getUnstructured(r, httpRouteGVK, "tenant-a", modelRouteName(model.Name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.attachmentRouteModels(context.Background(), route); !slices.Contains(got, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}) {
+		t.Fatalf("home route event enqueued %v", got)
+	}
+	setHomeRouteParentStatus := func(status metav1.ConditionStatus, reason string) {
+		t.Helper()
+		route, err := getUnstructured(r, httpRouteGVK, "tenant-a", modelRouteName(model.Name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		parents := []any{map[string]any{
+			"parentRef":  map[string]any{"name": gateway.Name, "namespace": gateway.Namespace},
+			"conditions": []any{map[string]any{"type": "Accepted", "status": string(status), "reason": reason, "message": "not allowed"}},
+		}}
+		if err := unstructured.SetNestedSlice(route.Object, parents, "status", "parents"); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Update(context.Background(), route); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	setHomeRouteParentStatus(metav1.ConditionFalse, "NotAllowedByListeners")
+	reconcileModel(t, r, model)
+	got := getModel(t, r, model)
+	ready := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+	if got.Status.Phase != modelPhaseFailed || ready == nil || ready.Reason != "NotAllowedByListeners" || !strings.Contains(ready.Message, "did not accept HTTPRoute") {
+		t.Fatalf("model whose route the Gateway rejects = %#v", got.Status)
+	}
+
+	setHomeRouteParentStatus(metav1.ConditionTrue, "Accepted")
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("model whose route is accepted again = %#v", got.Status)
+	}
+}
+
+// An attachment serves through the attached tenant's ExtProc, so it waits for
+// that ExtProc too.
+func TestAttachmentWaitsForAttachedTenantExtProc(t *testing.T) {
+	r, model := implicitAttachmentFixture(t, append(attachmentTenantObjects(tenant.DefaultAITenantName, "models-as-a-service", defaultGateway, "praxis"),
+		tenantExtProc("models-as-a-service", tenant.ID(tenant.DefaultAITenantName), false))...)
+	setRouteParentStatus(t, r, model, defaultGateway, metav1.ConditionTrue, "Accepted")
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := getModel(t, r, model)
+	if got.Status.Phase != modelPhasePending || readyReason(got) != reasonExtProcNotReady || result.RequeueAfter != attachmentRequeueInterval {
+		t.Fatalf("attachment before the tenant ExtProc is available: result %#v, status %#v", result, got.Status)
+	}
+	setExtProcAvailable(t, r, "models-as-a-service", tenant.ID(tenant.DefaultAITenantName), true)
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("attachment with an available ExtProc = %#v", got.Status)
+	}
+}
+
+// A model that attaches to a Praxis tenant keeps our status, which MaaS reads
+// per Gateway, even while a 3.5 IPP of a blocked default tenant claims it too.
+func TestGatewayRefsModelOfPraxisTenantKeepsOurStatusDuringBlockedMigration(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		gateways []v1alpha1.NamespacedObjectReference
+	}{
+		{name: "Praxis tenant only", gateways: []v1alpha1.NamespacedObjectReference{gatewayB}},
+		{name: "IPP-served and Praxis tenants", gateways: []v1alpha1.NamespacedObjectReference{defaultGateway, gatewayB}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ait, mtc := blockedDefaultTenantObjects()
+			provider, secret := attachmentProvider("team")
+			model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), tt.gateways...)
+			objects := append([]client.Object{provider, secret, model, ait, mtc, ippRoute(model, defaultGateway)},
+				attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+			r := attachmentReconciler(t, objects...)
+			setIPPStatus(t, r, model)
+			reconcileModel(t, r, model)
+			got := getModel(t, r, model)
+			if len(got.Status.Gateways) != len(tt.gateways) {
+				t.Fatalf("status.gateways = %#v, want one result per gatewayRefs entry", got.Status.Gateways)
+			}
+			gatewayResult(t, got, gatewayB)
+		})
+	}
+}
+
+func TestIPPRouteEventsRecheckTheModel(t *testing.T) {
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), defaultGateway)
+	r := controllerTestClient(t, model)
+	if got := r.attachmentRouteModels(context.Background(), ippRoute(model, defaultGateway)); !slices.Equal(got, []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(model)}}) {
+		t.Fatalf("IPP route event enqueued %v", got)
+	}
+}
+
+// A failed read of the ExtProc Deployment is retried, never reported as the
+// model's failure.
+func TestExtProcReadErrorKeepsAttachmentPending(t *testing.T) {
+	r, model := implicitAttachmentFixture(t, attachmentTenantObjects(tenant.DefaultAITenantName, "models-as-a-service", defaultGateway, "praxis")...)
+	setRouteParentStatus(t, r, model, defaultGateway, metav1.ConditionTrue, "Accepted")
+	base, ok := r.APIReader.(client.WithWatch)
+	if !ok {
+		t.Fatal("APIReader must be a client.WithWatch")
+	}
+	r.APIReader = interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, k client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if u, ok := obj.(*unstructured.Unstructured); ok && u.GroupVersionKind() == deploymentGVK {
+				return apierrors.NewTimeoutError("injected API server timeout", 1)
+			}
+			return c.Get(ctx, k, obj, opts...)
+		},
+	})
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := getModel(t, r, model)
+	if got.Status.Phase != modelPhasePending || readyReason(got) != reasonExtProcNotReady || result.RequeueAfter != attachmentRequeueInterval {
+		t.Fatalf("attachment after a failed ExtProc read: result %#v, status %#v", result, got.Status)
+	}
+}
