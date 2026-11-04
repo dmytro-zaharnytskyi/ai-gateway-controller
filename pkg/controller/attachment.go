@@ -887,22 +887,29 @@ func (r *Reconciler) extProcAvailable(ctx context.Context, namespace, tenantID s
 }
 
 // homeServingState explains why a model whose overlay its own tenant
-// published does not serve: the Gateway has not accepted its HTTPRoute yet or
-// rejected it, or the tenant's ExtProc is not available yet. An empty reason
-// means it serves. A route the Gateway has not decided on, or that is not in
-// the cache yet, is waited for; the route's events reconcile the model again.
+// published does not serve: the Gateway has not accepted the current
+// generation of its HTTPRoute yet or rejected it, or the tenant's ExtProc is
+// not available yet. An empty reason means it serves. The route is read live,
+// as after an update the cache can still hold the earlier generation and the
+// Gateway's acceptance of it. A route the Gateway has not decided on is waited
+// for; the route's events reconcile the model again.
 func (r *Reconciler) homeServingState(ctx context.Context, model *v1alpha1.ExternalModel, home attachmentTenant) (string, string) {
 	routeName := modelRouteName(model.Name)
+	pending := fmt.Sprintf("waiting for Gateway %s to accept HTTPRoute %s", gatewayKey(home.gateway), routeName)
+	var reader client.Reader = r.Client
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
 	route := newHTTPRoute()
-	if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: routeName}, route); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: routeName}, route); err != nil {
 		if !apierrors.IsNotFound(err) {
 			r.Log.Error(err, "read model HTTPRoute", "namespace", model.Namespace, "name", routeName)
 		}
-		route = nil
+		return reasonAttachmentPending, pending
 	}
-	if accepted, reason, message := routeAccepted(route, home.gateway); !accepted {
+	if accepted, reason, message := routeAcceptedSince(route, home.gateway, route.GetGeneration()); !accepted {
 		if reason == reasonAttachmentPending {
-			return reason, fmt.Sprintf("waiting for Gateway %s to accept HTTPRoute %s", gatewayKey(home.gateway), routeName)
+			return reason, pending
 		}
 		return reason, fmt.Sprintf("Gateway %s did not accept HTTPRoute %s: %s", gatewayKey(home.gateway), routeName, message)
 	}
@@ -1565,8 +1572,17 @@ func isAttachmentRoute(route *unstructured.Unstructured, model *v1alpha1.Externa
 
 // routeAccepted reads the route's parent status for the Gateway. The Gateway
 // enforces listener allowedRoutes; its Accepted=False reason is reported
-// unchanged.
+// unchanged. An acceptance of any generation counts: while the Gateway
+// processes an update it keeps serving the generation it accepted, so the
+// attachment's overlay entry, copies and DestinationRules stay.
 func routeAccepted(route *unstructured.Unstructured, gateway v1alpha1.NamespacedObjectReference) (bool, string, string) {
+	return routeAcceptedSince(route, gateway, 0)
+}
+
+// routeAcceptedSince is routeAccepted counting only an acceptance the Gateway
+// observed for generation or a later one. A condition without
+// observedGeneration is taken as current.
+func routeAcceptedSince(route *unstructured.Unstructured, gateway v1alpha1.NamespacedObjectReference, generation int64) (bool, string, string) {
 	if route == nil {
 		return false, reasonAttachmentPending, "waiting for the attachment HTTPRoute"
 	}
@@ -1593,7 +1609,10 @@ func routeAccepted(route *unstructured.Unstructured, gateway v1alpha1.Namespaced
 				continue
 			}
 			if condition["status"] == string(metav1.ConditionTrue) {
-				return true, "", ""
+				if observed, ok := condition["observedGeneration"].(int64); !ok || observed >= generation {
+					return true, "", ""
+				}
+				continue
 			}
 			if gatewayReason, _ := condition["reason"].(string); gatewayReason != "" {
 				reason = gatewayReason
@@ -1687,15 +1706,27 @@ func (r *Reconciler) applyCredentialCopies(ctx context.Context, a attachedModel,
 
 // credentialCopyOwned reports whether a Secret exists at the copy name and
 // whether it is the controller-owned copy of the same source. Secret metadata
-// is read from the metadata-only cache.
+// is read from the metadata-only cache; on a cache miss the API server is read
+// directly before concluding the copy is absent, because the cache can lag a
+// copy applied earlier in the same reconcile (admitAttachments checks
+// readiness right after applyCredentialCopies wrote the copy) and the
+// adoption guard below must not be skipped because of that lag.
 func (r *Reconciler) credentialCopyOwned(ctx context.Context, namespace string, copied credentialCopy) (bool, bool, error) {
 	existing := &metav1.PartialObjectMetadata{}
 	existing.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
 	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: copied.name}, existing); err != nil {
-		if apierrors.IsNotFound(err) {
+		if !apierrors.IsNotFound(err) {
+			return false, false, fmt.Errorf("get credential copy %s/%s: %w", namespace, copied.name, err)
+		}
+		if r.APIReader == nil {
 			return false, false, nil
 		}
-		return false, false, fmt.Errorf("get credential copy %s/%s: %w", namespace, copied.name, err)
+		if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: copied.name}, existing); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, false, nil
+			}
+			return false, false, fmt.Errorf("live get credential copy %s/%s: %w", namespace, copied.name, err)
+		}
 	}
 	return true, existing.GetLabels()[tenant.LabelCredentialCopy] == "true" &&
 		existing.GetAnnotations()[annotationCredentialSource] == copied.source(), nil

@@ -126,7 +126,8 @@ func controllerTestClient(t *testing.T, objects ...client.Object) *Reconciler {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&v1alpha1.ExternalModel{}, &v1alpha1.ExternalProvider{}).
 		WithObjects(withTenantExtProcs(objects)...).Build()
-	return &Reconciler{Client: interceptor.NewClient(fakeClient, interceptor.Funcs{Get: acceptHomeRoute}), APIReader: fakeClient}
+	accepting := interceptor.NewClient(fakeClient, interceptor.Funcs{Get: acceptHomeRoute})
+	return &Reconciler{Client: accepting, APIReader: accepting}
 }
 
 // acceptHomeRoute reads a home HTTPRoute that has no parent status as

@@ -309,8 +309,14 @@ func markRouteAccepted(ctx context.Context, c client.Client, namespace, name str
 	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, route); err != nil {
 		return err
 	}
-	if parents, _, _ := unstructured.NestedSlice(route.Object, "status", "parents"); len(parents) > 0 {
-		return nil
+	// Accepted already, unless for an earlier generation of the route.
+	if parents, _, _ := unstructured.NestedSlice(route.Object, "status", "parents"); len(parents) == 1 {
+		parent, _ := parents[0].(map[string]any)
+		if conditions, _, _ := unstructured.NestedSlice(parent, "conditions"); len(conditions) == 1 {
+			if condition, _ := conditions[0].(map[string]any); condition["observedGeneration"] == route.GetGeneration() {
+				return nil
+			}
+		}
 	}
 	parents := []any{map[string]any{
 		"parentRef":      map[string]any{"group": "gateway.networking.k8s.io", "kind": "Gateway", "name": gatewayName, "namespace": gatewayNamespace},

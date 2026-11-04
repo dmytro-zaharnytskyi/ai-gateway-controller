@@ -2568,12 +2568,22 @@ func TestHomeModelWaitsForTenantExtProc(t *testing.T) {
 func TestHomeModelWaitsForGatewayToAcceptRoute(t *testing.T) {
 	r, model := reconcilerFixture(t)
 	ctx := context.Background()
-	accepting := r.Client
-	undecided, ok := r.APIReader.(client.WithWatch)
+	accepting, ok := r.APIReader.(client.WithWatch)
 	if !ok {
-		t.Fatal("the test reader must be the fake client")
+		t.Fatal("APIReader must be a client.WithWatch")
 	}
-	r.Client = undecided // no Gateway has reported on the route yet
+	// No Gateway has reported on the route yet.
+	r.APIReader = interceptor.NewClient(accepting, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := c.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+			if route, ok := obj.(*unstructured.Unstructured); ok && route.GroupVersionKind() == httpRouteGVK {
+				unstructured.RemoveNestedField(route.Object, "status")
+			}
+			return nil
+		},
+	})
 	result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
 	if err != nil {
 		t.Fatal(err)
@@ -2583,7 +2593,7 @@ func TestHomeModelWaitsForGatewayToAcceptRoute(t *testing.T) {
 		t.Fatalf("model before the Gateway accepts its route: result %#v, status %#v", result, got.Status)
 	}
 
-	r.Client = accepting
+	r.APIReader = accepting
 	reconcileModel(t, r, model)
 	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
 		t.Fatalf("model whose route the Gateway accepted = %#v", got.Status)
@@ -2633,6 +2643,48 @@ func TestHomeModelReportsRouteRejectedByGateway(t *testing.T) {
 	reconcileModel(t, r, model)
 	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
 		t.Fatalf("model whose route is accepted again = %#v", got.Status)
+	}
+}
+
+// After an update the Gateway's acceptance of the route's earlier generation
+// remains until it processes the new spec, so the model waits for the current
+// generation to be accepted.
+func TestHomeModelWaitsForAcceptanceOfCurrentRouteGeneration(t *testing.T) {
+	r, model := reconcilerFixture(t)
+	reconcileModel(t, r, model)
+	setAccepted := func(generation, observedGeneration int64) {
+		t.Helper()
+		route, err := getUnstructured(r, httpRouteGVK, "tenant-a", modelRouteName(model.Name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		route.SetGeneration(generation)
+		parents := []any{map[string]any{
+			"parentRef":  map[string]any{"name": "gateway", "namespace": "tenant-a"},
+			"conditions": []any{map[string]any{"type": "Accepted", "status": string(metav1.ConditionTrue), "reason": "Accepted", "observedGeneration": observedGeneration}},
+		}}
+		if err := unstructured.SetNestedSlice(route.Object, parents, "status", "parents"); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Update(context.Background(), route); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	setAccepted(2, 1)
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := getModel(t, r, model)
+	if got.Status.Phase != modelPhasePending || readyReason(got) != reasonAttachmentPending || result.RequeueAfter != attachmentRequeueInterval {
+		t.Fatalf("model whose route generation 2 the Gateway has not accepted yet: result %#v, status %#v", result, got.Status)
+	}
+
+	setAccepted(2, 2)
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("model whose current route generation is accepted = %#v", got.Status)
 	}
 }
 
@@ -2717,5 +2769,56 @@ func TestExtProcReadErrorKeepsAttachmentPending(t *testing.T) {
 	got := getModel(t, r, model)
 	if got.Status.Phase != modelPhasePending || readyReason(got) != reasonExtProcNotReady || result.RequeueAfter != attachmentRequeueInterval {
 		t.Fatalf("attachment after a failed ExtProc read: result %#v, status %#v", result, got.Status)
+	}
+}
+
+func TestCredentialCopyOwnedFallsBackToLiveRead(t *testing.T) {
+	copyName := "agc-cred-lagged"
+	copied := credentialCopy{name: copyName, sourceNamespace: "llm", sourceName: "api-key", key: "token"}
+	owned := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Namespace:   "tenant-a",
+		Name:        copyName,
+		Labels:      map[string]string{tenant.LabelCredentialCopy: "true"},
+		Annotations: map[string]string{annotationCredentialSource: copied.source()},
+	}}
+	r := controllerTestClient(t, owned)
+	cached, ok := r.Client.(client.WithWatch)
+	if !ok {
+		t.Fatal("the test client must support watches")
+	}
+	// Simulate metadata-cache lag: the cached client has not seen the Secret
+	// yet, while the API server (APIReader) already serves it.
+	r.Client = interceptor.NewClient(cached, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, meta := obj.(*metav1.PartialObjectMetadata); meta && key.Name == copyName {
+				return apierrors.NewNotFound(corev1.Resource("secrets"), copyName)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	if exists, isOwned, err := r.credentialCopyOwned(context.Background(), "tenant-a", copied); err != nil || !exists || !isOwned {
+		t.Fatalf("cache-miss read: exists=%v owned=%v err=%v, want the live read to find the controller-owned copy", exists, isOwned, err)
+	}
+
+	// When the Secret is truly absent, the live read confirms the miss
+	// instead of speculatively marking the copy ready.
+	if exists, _, err := r.credentialCopyOwned(context.Background(), "tenant-a", credentialCopy{name: "agc-cred-absent", sourceNamespace: "llm", sourceName: "api-key", key: "token"}); err != nil || exists {
+		t.Fatalf("absent copy: exists=%v err=%v, want exists=false", exists, err)
+	}
+
+	// A foreign Secret at the copy name must not be adopted through the
+	// live-read fallback either.
+	foreign := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: "agc-cred-foreign"}}
+	writer, canWrite := r.APIReader.(client.Client)
+	if !canWrite {
+		t.Fatal("the test APIReader must be a writable client")
+	}
+	if err := writer.Create(context.Background(), foreign); err != nil {
+		t.Fatal(err)
+	}
+	foreignCopy := credentialCopy{name: "agc-cred-foreign", sourceNamespace: "llm", sourceName: "api-key", key: "token"}
+	if exists, isOwned, err := r.credentialCopyOwned(context.Background(), "tenant-a", foreignCopy); err != nil || !exists || isOwned {
+		t.Fatalf("foreign copy: exists=%v owned=%v err=%v, want owned=false", exists, isOwned, err)
 	}
 }
