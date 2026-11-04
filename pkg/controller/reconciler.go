@@ -70,6 +70,10 @@ const (
 
 var errCredentialNotReady = errors.New("effective provider credential is not ready")
 
+// errProviderCANotReady reports a tls.credentialName Secret that is missing or
+// has no CA, without saying which (see validateProviderCACredential).
+var errProviderCANotReady = errors.New("tls.credentialName must name a Secret in the Gateway namespace with a PEM CA certificate in key cacert or ca.crt")
+
 // Reconciler coordinates Praxis ExternalModel routes and ExternalProvider
 // transport. The model loop resolves one namespace-scoped route set and
 // renders the serving resources and routing overlay from that result; the
@@ -287,6 +291,16 @@ func (r *Reconciler) secretModels(ctx context.Context, obj client.Object) []reco
 		}
 	}
 	requests := r.modelsReferencingProviders(ctx, obj.GetNamespace(), providerNames)
+	// Attachments and cross-namespace references check a provider's CA Secret
+	// in their own Gateway's namespace, so its events reach their models.
+	var trusting v1alpha1.ExternalProviderList
+	if err := r.List(ctx, &trusting, client.MatchingFields{providerCredentialNameIndex: obj.GetName()}); err != nil {
+		r.Log.Error(err, "list providers for CA Secret event", "secret", obj.GetName())
+		return requests
+	}
+	for i := range trusting.Items {
+		requests = append(requests, r.modelsReferencingProviders(ctx, trusting.Items[i].Namespace, map[string]bool{trusting.Items[i].Name: true})...)
+	}
 	// Models re-validate an auth override Secret, and credential copies
 	// follow it, whether or not they attach to other tenants.
 	var models v1alpha1.ExternalModelList
@@ -771,7 +785,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		modelPtrs = append(modelPtrs, &models.Items[i])
 		modelOwners[models.Items[i].Name] = &models.Items[i]
 	}
-	foreign, unready, err := r.foreignProviders(ctx, req.Namespace, modelPtrs)
+	foreign, unready, err := r.foreignProviders(ctx, req.Namespace, gatewayNamespace, modelPtrs)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -1331,7 +1345,7 @@ func (r *Reconciler) resolveRemainingHomeModels(
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	foreign, unready, err := r.foreignProviders(ctx, deleted.Namespace, modelPtrs)
+	foreign, unready, err := r.foreignProviders(ctx, deleted.Namespace, gatewayNamespace, modelPtrs)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -1914,6 +1928,9 @@ func (r *Reconciler) validateProvider(_ context.Context, p *v1alpha1.ExternalPro
 // the provider, so this is reported on the provider instead of failing TLS.
 // Like Istio, it reads <name>-cacert and falls back to <name> only when that
 // Secret does not exist, taking the CA from the cacert key, or from ca.crt.
+// Tenants cannot read the Gateway namespace, so a missing Secret and one
+// without a CA return the same errProviderCANotReady; a failed read is
+// returned for retry.
 func (r *Reconciler) validateProviderCACredential(ctx context.Context, p *v1alpha1.ExternalProvider, gatewayNamespace string) error {
 	name := strings.TrimSpace(p.Spec.Config["tls.credentialName"])
 	if name == "" {
@@ -1923,21 +1940,22 @@ func (r *Reconciler) validateProviderCACredential(ctx context.Context, p *v1alph
 		return errors.New("APIReader is required for CA Secret reads")
 	}
 	var secret corev1.Secret
-	key := client.ObjectKey{Namespace: gatewayNamespace, Name: name + istioCASuffix}
-	err := r.APIReader.Get(ctx, key, &secret)
+	err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: gatewayNamespace, Name: name + istioCASuffix}, &secret)
 	if apierrors.IsNotFound(err) {
-		key.Name = name
-		err = r.APIReader.Get(ctx, key, &secret)
+		err = r.APIReader.Get(ctx, client.ObjectKey{Namespace: gatewayNamespace, Name: name}, &secret)
+	}
+	if apierrors.IsNotFound(err) {
+		return errProviderCANotReady
 	}
 	if err != nil {
-		return fmt.Errorf("tls.credentialName Secret %s/%s is not ready: %w", key.Namespace, key.Name, err)
+		return fmt.Errorf("read tls.credentialName Secret: %w", err)
 	}
 	ca := secret.Data["cacert"]
 	if len(ca) == 0 {
 		ca = secret.Data["ca.crt"]
 	}
 	if !x509.NewCertPool().AppendCertsFromPEM(ca) {
-		return fmt.Errorf("tls.credentialName Secret %s/%s has no PEM CA certificate in key cacert or ca.crt", key.Namespace, key.Name)
+		return errProviderCANotReady
 	}
 	return nil
 }

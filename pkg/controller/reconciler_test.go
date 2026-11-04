@@ -1921,6 +1921,12 @@ func testCACertificatePEM(t *testing.T) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
+// providerCASecret returns a provider-ca Secret holding a CA in namespace.
+func providerCASecret(t *testing.T, namespace string) *corev1.Secret {
+	t.Helper()
+	return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-ca", Namespace: namespace}, Data: map[string][]byte{"cacert": testCACertificatePEM(t)}}
+}
+
 func TestReconcileProviderReportsTLSCredentialSecretInGatewayNamespace(t *testing.T) {
 	provider := &v1alpha1.ExternalProvider{
 		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-a", UID: "provider-uid"},
@@ -1955,25 +1961,27 @@ func TestReconcileProviderReportsTLSCredentialSecretInGatewayNamespace(t *testin
 		}
 		return got.Status
 	}
-	assertFailed := func(want string) {
+	// A missing Secret and one without a CA read the same, so the tenant's
+	// status does not disclose what the Gateway namespace holds.
+	assertFailed := func() {
 		t.Helper()
 		status := reconcileStatus()
 		ready := apiMeta.FindStatusCondition(status.Conditions, conditionReady)
-		if status.Phase != providerPhaseFailed || ready == nil || ready.Status != metav1.ConditionFalse || !strings.Contains(ready.Message, want) {
-			t.Fatalf("provider status = %#v, want Failed with %q", status, want)
+		if status.Phase != providerPhaseFailed || ready == nil || ready.Status != metav1.ConditionFalse || ready.Message != errProviderCANotReady.Error() {
+			t.Fatalf("provider status = %#v, want Failed with %q", status, errProviderCANotReady)
 		}
 		if _, err := getRule(); !apierrors.IsNotFound(err) {
 			t.Fatalf("DestinationRule without its CA Secret: err = %v, want NotFound", err)
 		}
 	}
 
-	assertFailed("tls.credentialName Secret gateway-system/provider-ca is not ready")
+	assertFailed()
 
 	caSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-ca", Namespace: "gateway-system"}, Data: map[string][]byte{"tls.crt": testCACertificatePEM(t)}}
 	if err := r.Create(ctx, caSecret); err != nil {
 		t.Fatal(err)
 	}
-	assertFailed("tls.credentialName Secret gateway-system/provider-ca has no PEM CA certificate in key cacert")
+	assertFailed()
 
 	caSecret.Data = map[string][]byte{"cacert": testCACertificatePEM(t)}
 	if err := r.Update(ctx, caSecret); err != nil {
@@ -2011,9 +2019,8 @@ func TestSharedProviderReportsTLSCredentialSecretInGatewayNamespace(t *testing.T
 
 	// No MaasTenantConfig serves this namespace; attachments still render the
 	// credential, so its Secret is checked in the Gateway namespace.
-	want := "tls.credentialName Secret openshift-ingress/provider-ca is not ready"
-	if phase, ready := reconcileStatus(); phase != providerPhaseFailed || ready == nil || !strings.Contains(ready.Message, want) {
-		t.Fatalf("provider = %s/%#v, want Failed with %q", phase, ready, want)
+	if phase, ready := reconcileStatus(); phase != providerPhaseFailed || ready == nil || ready.Message != errProviderCANotReady.Error() {
+		t.Fatalf("provider = %s/%#v, want Failed with %q", phase, ready, errProviderCANotReady)
 	}
 	caSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "provider-ca", Namespace: "openshift-ingress"}, Data: map[string][]byte{"cacert": testCACertificatePEM(t)}}
 	if err := r.Create(ctx, caSecret); err != nil {
@@ -2113,20 +2120,23 @@ func TestValidateProviderCACredentialFollowsIstioLookup(t *testing.T) {
 	secret := func(name string, data map[string][]byte) client.Object {
 		return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "gateway-system"}, Data: data}
 	}
+	elsewhere := secret("provider-ca", ca)
+	elsewhere.SetNamespace("tenant-a")
 	for name, tc := range map[string]struct {
 		secrets []client.Object
-		wantErr string
+		wantErr error
 	}{
-		"single Secret":            {secrets: []client.Object{secret("provider-ca", ca)}},
-		"separate CA Secret":       {secrets: []client.Object{secret("provider-ca-cacert", ca)}},
-		"separate CA Secret first": {secrets: []client.Object{secret("provider-ca", ca), secret("provider-ca-cacert", noCA)}, wantErr: "gateway-system/provider-ca-cacert has no PEM CA certificate"},
-		"neither Secret":           {wantErr: "gateway-system/provider-ca is not ready"},
+		"single Secret":             {secrets: []client.Object{secret("provider-ca", ca)}},
+		"ca.crt key":                {secrets: []client.Object{secret("provider-ca", map[string][]byte{"ca.crt": ca["cacert"]})}},
+		"separate CA Secret":        {secrets: []client.Object{secret("provider-ca-cacert", ca)}},
+		"separate CA Secret first":  {secrets: []client.Object{secret("provider-ca", ca), secret("provider-ca-cacert", noCA)}, wantErr: errProviderCANotReady},
+		"neither Secret":            {wantErr: errProviderCANotReady},
+		"only in another namespace": {secrets: []client.Object{elsewhere}, wantErr: errProviderCANotReady},
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := controllerTestClient(t, tc.secrets...)
-			err := r.validateProviderCACredential(context.Background(), provider, "gateway-system")
-			if tc.wantErr == "" && err != nil || tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
-				t.Fatalf("validateProviderCACredential() = %v, want %q", err, tc.wantErr)
+			if err := r.validateProviderCACredential(context.Background(), provider, "gateway-system"); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("validateProviderCACredential() = %v, want %v", err, tc.wantErr)
 			}
 		})
 	}
@@ -2153,6 +2163,22 @@ func TestCACredentialSecretEventsEnqueueTrustingProviders(t *testing.T) {
 	r.Namespace = "tenant-b"
 	if got := r.secretProviders(context.Background(), secret); len(got) != 0 {
 		t.Fatalf("secretProviders() outside the namespace scope = %v, want none", got)
+	}
+}
+
+func TestCACredentialSecretEventsEnqueueModelsOfTrustingProviders(t *testing.T) {
+	provider, secret := attachmentProvider("team")
+	provider.Spec.Config = map[string]string{"tls.credentialName": "provider-ca"}
+	attached := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	// A same-named provider in another namespace does not trust the Secret.
+	unrelated := attachmentModel("other", "elsewhere", "other-model", time.Unix(100, 0), gatewayB)
+	r := controllerTestClient(t, provider, secret, attached, unrelated)
+	want := []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(attached)}}
+	for _, name := range []string{"provider-ca", "provider-ca-cacert"} {
+		event := &metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: gatewayB.Namespace}}
+		if got := r.secretModels(context.Background(), event); !reflect.DeepEqual(got, want) {
+			t.Fatalf("secretModels(%s) = %v, want %v", name, got, want)
+		}
 	}
 }
 

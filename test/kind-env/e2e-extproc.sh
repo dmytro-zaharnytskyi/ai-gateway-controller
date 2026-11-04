@@ -585,8 +585,10 @@ if wait_provider_phase Failed; then
   ca_missing_message=$(kctl -n "$NS" get externalprovider provider-a -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null || true)
 fi
 printf 'ready_message=%s\n' "$ca_missing_message" >"$EVIDENCE/provider-ca-credential-missing.txt"
-if [[ "$ca_missing_message" == *"tls.credentialName Secret $API_NS/$PROVIDER_CA_NAME is not ready"* ]]; then
-  record 38 ca_credential_missing_reported PASS "phase=Failed secret=$API_NS/$PROVIDER_CA_NAME"
+# The tenant-readable message names neither the Secret read nor its namespace.
+if [[ "$ca_missing_message" == *"tls.credentialName must name a Secret in the Gateway namespace"* &&
+  "$ca_missing_message" != *"$API_NS/"* ]]; then
+  record 38 ca_credential_missing_reported PASS "phase=Failed message=generic"
 else
   record 38 ca_credential_missing_reported FAIL "expected=phase=Failed observed_message=${ca_missing_message:-none}"
 fi
