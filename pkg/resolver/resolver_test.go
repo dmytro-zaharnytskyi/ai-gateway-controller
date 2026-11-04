@@ -168,7 +168,6 @@ func TestResolveRejectsUnqualifiedActiveProviderBindings(t *testing.T) {
 		apiFormat    string
 	}{
 		{name: "Vertex OpenAI", providerType: "vertex-openai", apiFormat: "openai-chat"},
-		{name: "Bedrock OpenAI", providerType: "bedrock-openai", apiFormat: "openai-chat"},
 		{name: "custom provider", providerType: "custom", apiFormat: "openai-chat"},
 		{name: "custom format", providerType: "openai", apiFormat: "vendor-chat"},
 	}
@@ -190,6 +189,26 @@ func TestResolveRejectsUnqualifiedActiveProviderBindings(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestResolveBedrockMantleOpenAIChat(t *testing.T) {
+	model := model("ns1", "mantle-model", ref("bedrock", "openai.gpt-oss-20b", "/v1/chat/completions"))
+	provider := provider("ns1", "bedrock", PhaseReady, "bedrock-mantle.us-east-2.api.aws", nil)
+	provider.Spec.Provider = "bedrock-openai"
+
+	set, err := ResolveWithAPITranslation([]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider}, false)
+	if err != nil {
+		t.Fatalf("ResolveWithAPITranslation(): %v", err)
+	}
+	if len(set.Routes()) != 1 {
+		t.Fatalf("routes = %+v, want one Mantle route", set.Routes())
+	}
+	route := set.Routes()[0]
+	if route.ProviderType != "bedrock-openai" || route.APIFormat != "openai-chat" ||
+		route.Endpoint != "bedrock-mantle.us-east-2.api.aws" ||
+		route.Path != "/v1/chat/completions" || route.TargetModel != "openai.gpt-oss-20b" || route.AuthType != "apikey" {
+		t.Fatalf("resolved Bedrock Mantle route = %+v", route)
 	}
 }
 
@@ -426,6 +445,48 @@ func TestResolve_SkipAggregationKeepsGoodRefs(t *testing.T) {
 	}
 	if len(set.Models[0].Skips) != 2 {
 		t.Errorf("want 2 aggregated skips, got %+v", set.Models[0].Skips)
+	}
+}
+
+func TestResolveExplicitZeroWeightPrecedesProviderAvailabilityAndPermission(t *testing.T) {
+	pending := provider("ns1", "pending", "Pending", "pending.example.com", nil)
+	cases := []struct {
+		name      string
+		ref       v1alpha1.ExternalProviderRef
+		providers []*v1alpha1.ExternalProvider
+	}{
+		{
+			name: "missing provider",
+			ref:  withWeight(ref("missing", "target", "/v1/chat/completions"), 0),
+		},
+		{
+			name:      "unready provider",
+			ref:       withWeight(ref("pending", "target", "/v1/chat/completions"), 0),
+			providers: []*v1alpha1.ExternalProvider{pending},
+		},
+		{
+			name: "unpermitted cross-namespace provider",
+			ref: func() v1alpha1.ExternalProviderRef {
+				r := withWeight(ref("foreign", "target", "/v1/chat/completions"), 0)
+				r.Ref.Namespace = "provider-ns"
+				return r
+			}(),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			set, err := Resolve([]*v1alpha1.ExternalModel{model("ns1", "model", tc.ref)}, tc.providers)
+			if !errors.Is(err, ErrNoRoutes) {
+				t.Fatalf("Resolve() error = %v, want ErrNoRoutes", err)
+			}
+			if got := set.Routes(); len(got) != 0 {
+				t.Fatalf("disabled binding produced routes: %+v", got)
+			}
+			if len(set.Models) != 1 || len(set.Models[0].Skips) != 1 ||
+				set.Models[0].Skips[0].Reason != SkipWeightDisabled {
+				t.Fatalf("disabled binding result = %+v, want only WeightDisabled", set.Models)
+			}
+		})
 	}
 }
 

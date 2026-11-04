@@ -112,6 +112,7 @@ type recorderConfig struct {
 	expectedCredential  string
 	openAICredential    string
 	anthropicCredential string
+	bedrockCredential   string
 	requestIDPattern    *regexp.Regexp
 	streamEventDelay    time.Duration
 	overlayReloadDelay  time.Duration
@@ -164,11 +165,12 @@ func loadRecorderConfig() recorderConfig {
 	providerLabel, ok := map[string]string{
 		"proof-a":        "proof-a",
 		"proof-b":        "proof-b",
+		"proof-c":        "proof-c",
 		"translation":    "translation",
 		"provider-aware": "provider-aware",
 	}[provider]
 	if !ok {
-		log.Fatal("PROVIDER_NAME must be proof-a, proof-b, translation, or provider-aware")
+		log.Fatal("PROVIDER_NAME must be proof-a, proof-b, proof-c, translation, or provider-aware")
 	}
 	responseMode := os.Getenv("RESPONSE_MODE")
 	if responseMode == "" {
@@ -197,6 +199,7 @@ func loadRecorderConfig() recorderConfig {
 		if config.responseMode == "provider-aware" {
 			config.openAICredential = readCredential("OPENAI_CREDENTIAL_FILE")
 			config.anthropicCredential = readCredential("ANTHROPIC_CREDENTIAL_FILE")
+			config.bedrockCredential = readCredential("BEDROCK_CREDENTIAL_FILE")
 		} else {
 			config.expectedCredential = readCredential("CREDENTIAL_FILE")
 		}
@@ -232,7 +235,7 @@ func (config recorderConfig) handleInference(w http.ResponseWriter, r *http.Requ
 	expectedHost := expectedHostFor(r.Host, config.expectedHosts)
 	sniOK := !config.tlsRequired || (expectedHost != "" && r.TLS != nil && r.TLS.ServerName == expectedHost)
 	authorityOK := len(config.expectedHosts) == 0 || expectedHost != "" && r.Host == expectedHost
-	credentialOK := config.validCredential(r)
+	credentialOK := config.validCredential(r, requestBody)
 	status := http.StatusOK
 	if !sniOK || !authorityOK {
 		status = http.StatusMisdirectedRequest
@@ -281,7 +284,7 @@ func (config recorderConfig) handleInference(w http.ResponseWriter, r *http.Requ
 	writeProofResponse(w, response{Provider: config.provider, TLS: r.TLS != nil, SNI: sniOK, Authority: authorityOK, Credential: credentialOK})
 }
 
-func (config recorderConfig) validCredential(r *http.Request) bool {
+func (config recorderConfig) validCredential(r *http.Request, requestBody map[string]any) bool {
 	if !config.credentialRequired {
 		return true
 	}
@@ -293,6 +296,9 @@ func (config recorderConfig) validCredential(r *http.Request) bool {
 	expected := config.expectedCredential
 	if config.responseMode == "provider-aware" {
 		expected = config.openAICredential
+		if model, _ := requestBody["model"].(string); model == "openai.gpt-oss-20b" || model == "openai.gpt-oss-20b-reloaded" {
+			expected = config.bedrockCredential
+		}
 	}
 	credential := strings.TrimPrefix(authorization, bearerPrefix)
 	return strings.HasPrefix(authorization, bearerPrefix) && constantTimeEqual(credential, expected)
@@ -330,6 +336,17 @@ func durationFromEnv(name string) time.Duration {
 	return duration
 }
 
+func bedrockOverlayReloadDelay(requestBody map[string]any) time.Duration {
+	if !hasMessageMarker(requestBody, "externalmodel-overlay-reload-active-bedrock-stream") {
+		return 0
+	}
+	delay, err := time.ParseDuration(os.Getenv("BEDROCK_OVERLAY_RELOAD_STREAM_EVENT_DELAY"))
+	if err != nil || delay <= 0 {
+		return 0
+	}
+	return delay
+}
+
 func readCredential(envName string) string {
 	credentialFile := required(envName)
 	credential, err := os.ReadFile(credentialFile)
@@ -356,12 +373,15 @@ func constantTimeEqual(actual, expected string) bool {
 	return len(actual) == len(expected) && subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) == 1
 }
 
-func hasMessageMarker(body map[string]any, marker string) bool {
+func hasMessageMarker(body map[string]any, markers ...string) bool {
 	messages, _ := body["messages"].([]any)
 	for _, value := range messages {
 		message, _ := value.(map[string]any)
-		if strings.Contains(fmt.Sprint(message["content"]), marker) {
-			return true
+		content := fmt.Sprint(message["content"])
+		for _, marker := range markers {
+			if strings.Contains(content, marker) {
+				return true
+			}
 		}
 	}
 	return false
@@ -623,7 +643,8 @@ func safeRoutingDiagnostic(value string) string {
 
 func safeRoutingCandidate(value string) string {
 	switch value {
-	case "demo-model/provider-api-translation-openai", "demo-model/provider-api-translation-anthropic":
+	case "demo-model/provider-api-translation-openai", "demo-model/provider-api-translation-anthropic",
+		"demo-model/provider-api-translation-bedrock-mantle":
 		return value
 	default:
 		return ""
@@ -676,6 +697,9 @@ func writeOpenAIResponse(w http.ResponseWriter, requestBody map[string]any) {
 		w.Header().Set("Cache-Control", "no-cache")
 		flusher, _ := w.(http.Flusher)
 		streamEventDelay, _ := time.ParseDuration(os.Getenv("STREAM_EVENT_DELAY"))
+		if overlayDelay := bedrockOverlayReloadDelay(requestBody); overlayDelay > 0 {
+			streamEventDelay = overlayDelay
+		}
 		stop := "stop"
 		events := []openAIStreamEvent{
 			{ID: "chatcmpl-kind", Object: "chat.completion.chunk", Model: model,
