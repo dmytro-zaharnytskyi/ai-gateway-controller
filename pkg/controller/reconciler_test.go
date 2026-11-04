@@ -84,7 +84,11 @@ func TestEnableExternalModelRoutesKeepsPostAuthForCompiledChecks(t *testing.T) {
 				return nil
 			}
 			routes := []resolver.Route{{Model: "demo-model", ClientName: "demo", Provider: "provider-a"}}
-			if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes); err != nil {
+			testTenant := attachmentTenant{
+				namespace: "tenant-a", tenantID: "tenant-a",
+				gateway: v1alpha1.NamespacedObjectReference{Name: "test-gateway", Namespace: "gateway-system"},
+			}
+			if _, err := r.enableExternalModelRoutes(context.Background(), testTenant, routes); err != nil {
 				t.Fatal(err)
 			}
 			patches := nestedSlice(t, applied.Object, "spec", "configPatches")
@@ -127,7 +131,19 @@ func controllerTestClient(t *testing.T, objects ...client.Object) *Reconciler {
 		WithStatusSubresource(&v1alpha1.ExternalModel{}, &v1alpha1.ExternalProvider{}).
 		WithObjects(withTenantExtProcs(objects)...).Build()
 	accepting := interceptor.NewClient(fakeClient, interceptor.Funcs{Get: acceptHomeRoute})
-	return &Reconciler{Client: accepting, APIReader: accepting}
+	r := &Reconciler{Client: accepting, APIReader: accepting}
+	r.readPodLogs = func(ctx context.Context, namespace, _, container string) (string, error) {
+		if container != externalModelExtProcContainer {
+			return "", fmt.Errorf("unexpected ExtProc container %q", container)
+		}
+		env, err := r.readPublishedEnvelope(ctx, namespace)
+		if err != nil || env == nil {
+			return "", err
+		}
+		revision := env.Revision.Value
+		return `accepted_revision="` + revision + `" serving_revision="` + revision + `"`, nil
+	}
+	return r
 }
 
 // acceptHomeRoute reads a home HTTPRoute that has no parent status as
@@ -253,7 +269,9 @@ func TestEnableExternalModelRoutesScopesHeaderPhaseFilterToGeneratedRoutes(t *te
 		expectedRoutes[name] = false
 		expectedResponseModeByRoute[name] = expectedResponseModes[index]
 	}
-	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes); err != nil {
+	testTenant := attachmentTenant{namespace: "tenant-a", tenantID: "tenant-a",
+		gateway: v1alpha1.NamespacedObjectReference{Name: "test-gateway", Namespace: "gateway-system"}}
+	if _, err := r.enableExternalModelRoutes(context.Background(), testTenant, routes); err != nil {
 		t.Fatal(err)
 	}
 	if applied.GetName() != tenant.PayloadProcessingExternalModelEnvoyFilterName("tenant-a") {
@@ -268,13 +286,13 @@ func TestEnableExternalModelRoutesScopesHeaderPhaseFilterToGeneratedRoutes(t *te
 	}
 	patches := nestedSlice(t, applied.Object, "spec", "configPatches")
 	assertExternalModelRoutePatches(t, patches, expectedRoutes, expectedResponseModeByRoute, len(renderedRules))
-	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes[:1]); err != nil {
+	if _, err := r.enableExternalModelRoutes(context.Background(), testTenant, routes[:1]); err != nil {
 		t.Fatal(err)
 	}
 	// stream_usage_inject needs the complete body with translation off too.
 	assertOpenAIOnlyRouteModes(t, nestedSlice(t, applied.Object, "spec", "configPatches"), "BUFFERED")
 	routes[0].APITranslationEnabled = true
-	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes[:1]); err != nil {
+	if _, err := r.enableExternalModelRoutes(context.Background(), testTenant, routes[:1]); err != nil {
 		t.Fatal(err)
 	}
 	assertOpenAIOnlyRouteModes(t, nestedSlice(t, applied.Object, "spec", "configPatches"), "BUFFERED")
@@ -394,7 +412,9 @@ func TestEnableExternalModelRoutesDeletesOnlyOwnedRouteFilterWhenEmpty(t *testin
 	neighbor.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "ai-gateway-controller", externalTenantLabel: "tenant-b"})
 	r := controllerTestClient(t, owned, foreign, neighbor)
 
-	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", nil); err != nil {
+	testTenant := attachmentTenant{namespace: "tenant-a", tenantID: "tenant-a",
+		gateway: v1alpha1.NamespacedObjectReference{Name: "test-gateway", Namespace: "gateway-system"}}
+	if _, err := r.enableExternalModelRoutes(context.Background(), testTenant, nil); err != nil {
 		t.Fatal(err)
 	}
 	var got unstructured.Unstructured
@@ -2054,11 +2074,46 @@ func TestExternalModelDeletionRepublishesRemainingRoutes(t *testing.T) {
 	if err := r.Delete(context.Background(), model); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if result.RequeueAfter <= 0 {
+		t.Fatalf("deleted model withdrawal requeue = %s, want old route drain", result.RequeueAfter)
 	}
 	deletedRoute := &unstructured.Unstructured{}
 	deletedRoute.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"})
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: modelRouteName(model.Name)}, deletedRoute); err != nil {
+		t.Fatalf("deleted model route should remain until the old ExtProc drains: %v", err)
+	}
+	seedSafeExternalModelRuntime(t, r, "tenant", model.Namespace, []*v1alpha1.ExternalModel{sibling})
+	result, err = r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequeueAfter != withdrawalDrainDuration {
+		t.Fatalf("deleted model drain requeue = %s, want %s", result.RequeueAfter, withdrawalDrainDuration)
+	}
+	var drainOverlay corev1.ConfigMap
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &drainOverlay); err != nil {
+		t.Fatal(err)
+	}
+	var drainState withdrawalDrainState
+	if err := json.Unmarshal([]byte(drainOverlay.Annotations[withdrawalDrainAnnotation]), &drainState); err != nil {
+		t.Fatalf("decode drain state: %v", err)
+	}
+	drainState.StartedAt = time.Now().Add(-withdrawalDrainDuration - time.Second)
+	drainStateRaw, err := json.Marshal(drainState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainOverlay.Annotations[withdrawalDrainAnnotation] = string(drainStateRaw)
+	if err := r.Update(context.Background(), &drainOverlay); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: modelRouteName(model.Name)}, deletedRoute); !apierrors.IsNotFound(err) {
 		t.Fatalf("deleted model route = %v, want NotFound", err)
 	}
@@ -2483,11 +2538,12 @@ func TestAllZeroModelWithdrawsWithoutAffectingHealthySibling(t *testing.T) {
 	if err := r.Update(ctx, &current); err != nil {
 		t.Fatalf("set model weight to zero: %v", err)
 	}
-	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+	result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil || result.RequeueAfter <= 0 {
 		t.Fatalf("reconcile all-zero model beside healthy sibling: %v", err)
 	}
-	if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); !apierrors.IsNotFound(err) {
-		t.Fatalf("disabled model HTTPRoute = %v, want NotFound", err)
+	if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); err != nil {
+		t.Fatalf("disabled model HTTPRoute should remain during the serving-revision drain: %v", err)
 	}
 	if _, err := getUnstructured(r, httpRouteGVK, sibling.Namespace, modelRouteName(sibling.Name)); err != nil {
 		t.Fatalf("healthy sibling HTTPRoute was removed: %v", err)
@@ -2512,6 +2568,18 @@ func TestAllZeroModelWithdrawsWithoutAffectingHealthySibling(t *testing.T) {
 	if current.Status.Phase != "Failed" || current.Status.ObservedGeneration != current.Generation ||
 		!hasConditionReason(current.Status.Conditions, conditionReady, reasonNoRoutes) {
 		t.Fatalf("disabled model status = %#v, want current-generation Failed/NoRoutes", current.Status)
+	}
+	seedSafeExternalModelRuntime(t, r, "tenant", model.Namespace, []*v1alpha1.ExternalModel{&current, sibling})
+	result, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+	if err != nil || result.RequeueAfter != withdrawalDrainDuration {
+		t.Fatalf("start all-zero model drain: result=%#v err=%v", result, err)
+	}
+	markWithdrawalDrainElapsed(t, r, model.Namespace)
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+		t.Fatalf("finish all-zero model drain: %v", err)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); !apierrors.IsNotFound(err) {
+		t.Fatalf("disabled model HTTPRoute after serving revision drained = %v, want NotFound", err)
 	}
 }
 
@@ -2635,8 +2703,18 @@ func TestUnequalWeightModelStaysReadyBesideHealthySibling(t *testing.T) {
 	if err := r.Delete(ctx, healthy); err != nil {
 		t.Fatal(err)
 	}
+	result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthy)})
+	if err != nil || result.RequeueAfter <= 0 {
+		t.Fatalf("stage healthy model deletion: result=%#v err=%v", result, err)
+	}
+	seedSafeExternalModelRuntime(t, r, "tenant", healthy.Namespace, []*v1alpha1.ExternalModel{weighted})
+	result, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthy)})
+	if err != nil || result.RequeueAfter != withdrawalDrainDuration {
+		t.Fatalf("start healthy model deletion drain: result=%#v err=%v", result, err)
+	}
+	markWithdrawalDrainElapsed(t, r, healthy.Namespace)
 	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(healthy)}); err != nil {
-		t.Fatalf("healthy sibling deletion blocked: %v", err)
+		t.Fatalf("finish healthy model deletion: %v", err)
 	}
 	if err := r.Get(ctx, client.ObjectKeyFromObject(healthy), &v1alpha1.ExternalModel{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("deleted healthy model still exists: %v", err)
@@ -4518,5 +4596,38 @@ func TestExcludedScopedCandidateIDsSupportHashedIdentitiesAndFailOnUnreadableMod
 	excluded[model.Namespace+"/missing"] = true
 	if _, err := r.excludedScopedCandidateIDs(ctx, model.Namespace, excluded); !apierrors.IsNotFound(err) {
 		t.Fatalf("unreadable excluded model must fail closed: %v", err)
+	}
+}
+
+func TestHomeModelPublicationReportsOneStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		publication homeModelPublication
+		wantReason  string
+	}{
+		{name: "weight disabled takes precedence", publication: homeModelPublication{weightDisabled: true, denied: "denied", unserved: "unready", unroutedReason: reasonNoRoutes}, wantReason: reasonNoRoutes},
+		{name: "denied reference", publication: homeModelPublication{denied: "denied", unserved: "unready", unroutedReason: reasonNoRoutes}, wantReason: reasonRefNotPermitted},
+		{name: "unready credential", publication: homeModelPublication{unserved: "unready", unroutedReason: reasonNoRoutes}, wantReason: reasonProviderNotReady},
+		{name: "unrouted", publication: homeModelPublication{unroutedReason: reasonNoRoutes, servingReason: reasonExtProcNotReady}, wantReason: reasonNoRoutes},
+		{name: "not serving yet", publication: homeModelPublication{servingReason: reasonExtProcNotReady}, wantReason: reasonExtProcNotReady},
+		{name: "ready", wantReason: reasonReconciled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, reportErr := range []error{nil, errors.New("status write failed")} {
+				calls := 0
+				publication := tc.publication
+				publication.report = func(ready bool, reason, _ string, _ *envelope.Envelope) error {
+					calls++
+					if reason != tc.wantReason || ready != (reason == reasonReconciled) {
+						t.Errorf("status ready=%v reason=%s; want %s", ready, reason, tc.wantReason)
+					}
+					return reportErr
+				}
+				_, err := (&Reconciler{}).finishHomeModelPublication(context.Background(), publication)
+				if calls != 1 || !errors.Is(err, reportErr) {
+					t.Fatalf("status calls=%d err=%v; want one call and %v", calls, err, reportErr)
+				}
+			}
+		})
 	}
 }
