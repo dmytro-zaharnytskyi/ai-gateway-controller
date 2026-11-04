@@ -280,7 +280,7 @@ func (r *Reconciler) collectProviderTransport(ctx context.Context, namespace str
 		transport = append(transport, list.Items...)
 	}
 	if len(transport) == 0 {
-		return nil
+		return r.releaseUnusedAttachmentProviders(ctx, namespace)
 	}
 	routes := &unstructured.UnstructuredList{}
 	routes.SetGroupVersionKind(httpRouteGVK.GroupVersion().WithKind("HTTPRouteList"))
@@ -306,6 +306,23 @@ func (r *Reconciler) collectProviderTransport(ctx context.Context, namespace str
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, &transport[i])); err != nil {
 			return fmt.Errorf("delete provider transport %s/%s: %w", namespace, transport[i].GetName(), err)
+		}
+	}
+	return r.releaseUnusedAttachmentProviders(ctx, namespace)
+}
+
+// releaseUnusedAttachmentProviders drops protection after the last route is gone.
+func (r *Reconciler) releaseUnusedAttachmentProviders(ctx context.Context, namespace string) error {
+	var providers v1alpha1.ExternalProviderList
+	if err := r.List(ctx, &providers, client.InNamespace(namespace)); err != nil {
+		return err
+	}
+	for i := range providers.Items {
+		if !providers.Items[i].DeletionTimestamp.IsZero() {
+			continue
+		}
+		if err := r.releaseUnusedAttachmentProvider(ctx, &providers.Items[i]); err != nil {
+			return err
 		}
 	}
 	return nil
