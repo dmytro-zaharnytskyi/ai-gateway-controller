@@ -720,6 +720,8 @@ type modelStatusReporter func(ready bool, reason, message string, env *envelope.
 // whose MaasTenantConfig is in the model namespace. This is the existing
 // tenant-local path; it publishes every model the tenant serves from its own
 // namespace.
+//
+//nolint:gocyclo // The home path orders every resolution, publication and serving gate; each early return reports a distinct model status.
 func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Request, model *v1alpha1.ExternalModel, report modelStatusReporter) (reconcile.Result, error) {
 	modelTenant, proceed, err := r.prepareModelTenant(ctx, model, req.Namespace, report)
 	if err != nil {
@@ -761,6 +763,12 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		if revoked, servesErr := r.servesDeniedReference(ctx, req.Namespace, modelPtrs, foreign); servesErr != nil {
 			return reconcile.Result{}, servesErr
 		} else if revoked {
+			err = nil
+		}
+		// An explicit all-zero weight update is an administrative withdrawal,
+		// not a provider-readiness failure. Let the no-route cleanup below
+		// remove the previous selection instead of preserving it as LKG.
+		if errors.Is(err, resolver.ErrNoRoutes) && allRoutesExplicitlyWeightDisabled(set) {
 			err = nil
 		}
 	}
@@ -852,6 +860,11 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		// keep serving.
 		return reconcile.Result{}, report(false, reasonProviderNotReady, message, nil)
 	}
+	if explicitlyWeightDisabledModels(set)[req.Namespace+"/"+req.Name] {
+		// A healthy sibling can keep the tenant overlay alive, but this model
+		// itself has no eligible providers and must not remain Ready.
+		return reconcile.Result{}, report(false, reasonNoRoutes, "all ExternalModel provider references are explicitly disabled by weight", nil)
+	}
 	if reason, message, unrouted := unroutedStatus(set, req.String()); unrouted {
 		// Other models of the namespace are served, but none of this model's
 		// references resolved: it has no route or overlay candidate.
@@ -905,8 +918,17 @@ func (r *Reconciler) handleHomeRouteResolutionError(
 		if unroutedReason, unroutedMessage, ok := unroutedStatus(set, namespace+"/"+modelName); ok {
 			reason, message = unroutedReason, unroutedMessage
 		}
-		policyExcluded := translationPolicyExcludedModels(set)
-		if len(policyExcluded) > 0 {
+		excluded := translationPolicyExcludedModels(set)
+		disabledByWeight := explicitlyWeightDisabledModels(set)
+		for modelRef := range disabledByWeight {
+			excluded[modelRef] = true
+		}
+		if len(excluded) > 0 {
+			if disabledByWeight[namespace+"/"+modelName] {
+				reason = reasonNoRoutes
+			} else if excluded[namespace+"/"+modelName] {
+				reason = reasonTranslationDisabled
+			}
 			valid, err := r.livePraxisBeforeWrite(ctx, namespace, modelTenant)
 			if err != nil {
 				return reconcile.Result{}, err
@@ -922,7 +944,7 @@ func (r *Reconciler) handleHomeRouteResolutionError(
 			home := attachmentTenant{namespace: namespace, tenantID: tenant.ID(modelTenant.aitenant.GetName()),
 				gateway:               v1alpha1.NamespacedObjectReference{Name: modelTenant.gatewayName, Namespace: modelTenant.gatewayNamespace},
 				apiTranslationEnabled: modelTenant.apiTranslationEnabled}
-			if err := r.cleanupPolicyExcludedHomeModels(ctx, home, set, policyExcluded, sourceUID); err != nil {
+			if err := r.cleanupExcludedHomeModels(ctx, home, set, excluded, sourceUID); err != nil {
 				return reconcile.Result{}, err
 			}
 			return reconcile.Result{}, routeErr
@@ -1403,10 +1425,11 @@ func translationPolicyExcludedModels(set *resolver.ResolvedRouteSet) map[string]
 	return excluded
 }
 
-// cleanupPolicyExcludedHomeModels removes only routes made ineligible by the
-// tenant's API-translation policy. Other models with provider/readiness errors
-// keep their last-known route patches and overlay candidates.
-func (r *Reconciler) cleanupPolicyExcludedHomeModels(
+// cleanupExcludedHomeModels removes only candidates made ineligible by an
+// explicit model-local policy, such as disabled API translation or an
+// all-zero provider weight. Other models with provider/readiness errors keep
+// their last-known route patches and overlay candidates.
+func (r *Reconciler) cleanupExcludedHomeModels(
 	ctx context.Context,
 	home attachmentTenant,
 	set *resolver.ResolvedRouteSet,
@@ -1417,9 +1440,13 @@ func (r *Reconciler) cleanupPolicyExcludedHomeModels(
 	if err != nil {
 		return fmt.Errorf("read current overlay candidates before translation-policy cleanup: %w", err)
 	}
+	excludedScopedIDs, err := r.excludedScopedCandidateIDs(ctx, home.namespace, excluded)
+	if err != nil {
+		return err
+	}
 	keptCandidates := make([]envelope.Candidate, 0, len(candidates))
 	for _, candidate := range candidates {
-		policyExcluded := false
+		policyExcluded := excludedScopedIDs[candidate.StableID]
 		for modelRef := range excluded {
 			modelNamespace, modelName, found := strings.Cut(modelRef, "/")
 			if found && modelNamespace == home.namespace && strings.HasPrefix(candidate.StableID, modelName+"/provider-") {
@@ -1942,13 +1969,12 @@ func (r *Reconciler) validateResolvedRouteSet(ctx context.Context, set *resolver
 
 // excludeUnsupportedModelSelection excludes every model contributing to a
 // conflicting client-visible capability. The overlay selects candidates by
-// client name, so unequal weights or repeated providers across model objects
-// must not affect unrelated models in the namespace.
+// client name, so repeated providers across model objects must not affect
+// unrelated models in the namespace. Unequal positive weights are valid and
+// render as Praxis weightedRandom.
 func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver.ResolvedRouteSet, map[string]error) {
 	valid := &resolver.ResolvedRouteSet{Models: make([]resolver.ModelRoutes, 0, len(set.Models))}
 	rejected := make(map[string]error)
-	weights := make(map[string]int)
-	weightConflicts := make(map[string]bool)
 	bindings := make(map[string]bool)
 	duplicateProviders := make(map[string]bool)
 	for _, model := range set.Models {
@@ -1961,11 +1987,6 @@ func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver
 			rejected[model.ModelRef] = fmt.Errorf("%d HTTPRoute rules exceed the Gateway API limit of %d", count, maxHTTPRouteRules)
 		}
 		for _, route := range model.Routes {
-			if weight, seen := weights[route.ClientName]; seen && weight != route.Weight {
-				weightConflicts[route.ClientName] = true
-			} else {
-				weights[route.ClientName] = route.Weight
-			}
 			binding := route.ClientName + "\x00" + route.ProviderNamespace + "/" + route.Provider
 			if bindings[binding] {
 				duplicateProviders[route.ClientName] = true
@@ -1975,10 +1996,6 @@ func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver
 	}
 	for _, model := range set.Models {
 		for _, route := range model.Routes {
-			if weightConflicts[route.ClientName] {
-				rejected[model.ModelRef] = fmt.Errorf("%w: client model %s has unequal weights", envelope.ErrWeightUnsupported, route.ClientName)
-				break
-			}
 			if duplicateProviders[route.ClientName] {
 				rejected[model.ModelRef] = fmt.Errorf("%w: client model %s repeats a provider", envelope.ErrDuplicateProvider, route.ClientName)
 				break
@@ -2010,6 +2027,34 @@ func rejectionReason(err error) string {
 		return reasonInvalidName
 	}
 	return reasonReconcileFailed
+}
+
+func allRoutesExplicitlyWeightDisabled(set *resolver.ResolvedRouteSet) bool {
+	disabled := explicitlyWeightDisabledModels(set)
+	return set != nil && len(set.Models) > 0 && len(disabled) == len(set.Models)
+}
+
+func explicitlyWeightDisabledModels(set *resolver.ResolvedRouteSet) map[string]bool {
+	disabled := make(map[string]bool)
+	if set == nil {
+		return disabled
+	}
+	for _, model := range set.Models {
+		if len(model.Routes) != 0 || len(model.Skips) == 0 {
+			continue
+		}
+		allDisabled := true
+		for _, skip := range model.Skips {
+			if skip.Reason != resolver.SkipWeightDisabled {
+				allDisabled = false
+				break
+			}
+		}
+		if allDisabled {
+			disabled[model.ModelRef] = true
+		}
+	}
+	return disabled
 }
 
 func (r *Reconciler) validateModelRouteSet(ctx context.Context, set *resolver.ResolvedRouteSet,
@@ -2809,3 +2854,25 @@ func providerSelectionSink(route resolver.Route, namespace string) unstructured.
 
 var _ client.Object = (*v1alpha1.ExternalModel)(nil)
 var _ client.Object = (*v1alpha1.ExternalProvider)(nil)
+
+// excludedScopedCandidateIDs derives scoped identities from provider references,
+// including hashed identities, without conflating shared client-visible names.
+func (r *Reconciler) excludedScopedCandidateIDs(ctx context.Context, namespace string, excluded map[string]bool) (map[string]bool, error) {
+	ids := make(map[string]bool)
+	for modelRef := range excluded {
+		modelNamespace, modelName, found := strings.Cut(modelRef, "/")
+		if !found || modelNamespace != namespace {
+			continue
+		}
+		var model v1alpha1.ExternalModel
+		if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: modelNamespace, Name: modelName}, &model); err != nil {
+			return nil, fmt.Errorf("read excluded model %s to identify scoped candidates: %w", modelRef, err)
+		}
+		for _, ref := range model.Spec.ExternalProviderRefs {
+			if ref.Ref.Namespace != "" && ref.Ref.Namespace != modelNamespace {
+				ids[envelope.ScopedStableID(modelNamespace, modelName, ref.Ref.Namespace, ref.Ref.Name)] = true
+			}
+		}
+	}
+	return ids, nil
+}

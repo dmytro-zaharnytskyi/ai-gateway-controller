@@ -131,4 +131,75 @@ JSON
   exit 1
 }
 
-echo "Kind run harness contracts passed (digest/tag handling, terminating pod exclusion, and exact MaaS runtime image identity)."
+provider_manifest="$ROOT/test/kind-env/manifests/provider-selection-proof.yaml"
+provider_source="$ROOT/test/kind-env/provider-recorder/main.go"
+for suffix in a b c; do
+  deployment="provider-selection-proof-${suffix}"
+  yq -e "select(.kind == \"Deployment\" and .metadata.name == \"${deployment}\") | .spec.template.spec.securityContext.fsGroup == 65532" "$provider_manifest" >/dev/null || {
+    echo "${deployment} recorder receipt volume lacks its unprivileged writable fsGroup" >&2
+    exit 1
+  }
+  yq -e "select(.kind == \"Deployment\" and .metadata.name == \"${deployment}\") | .spec.template.spec.volumes[] | select(.name == \"observations\") | has(\"emptyDir\")" "$provider_manifest" >/dev/null || {
+    echo "${deployment} recorder receipt storage is not ephemeral" >&2
+    exit 1
+  }
+  yq -e "select(.kind == \"Deployment\" and .metadata.name == \"${deployment}\") | .spec.template.spec.containers[] | select(.name == \"recorder\") | .env[] | select(.name == \"ENABLE_TEST_OBSERVATIONS\") | .value == \"true\"" "$provider_manifest" >/dev/null || {
+    echo "${deployment} recorder does not enable its test-only receipt endpoint" >&2
+    exit 1
+  }
+done
+rg -q '"proof-c":        "proof-c"' "$provider_source" || {
+  echo "provider recorder does not recognize the third static-weight fixture" >&2
+  exit 1
+}
+rg -q -- '--known-cluster=provider-provider-proof-c' <<<"$run_source" || {
+  echo "Kind controller allowlist omits provider C" >&2
+  exit 1
+}
+rg -q 'make_katan_tls provider-proof-c-tls provider-proof-c-ext' <<<"$run_source" || {
+  echo "Kind provisioner does not issue the verified TLS certificate for provider C" >&2
+  exit 1
+}
+
+
+(
+  handoff_poll=$(sed -n '/^    handoff_ready=false$/,/^    if \[\[ "$handoff_ready" != true \]\]; then$/p' \
+    "$ROOT/test/kind-env/run.sh" | sed '$d')
+  [[ -n "$handoff_poll" ]] || { echo 'could not extract the bootstrap Deployment handoff poll' >&2; exit 1; }
+  KCTL=(mock_kubectl)
+  deployment_name=payload-processing
+  seq() { printf '%s\n' 1 2 3; }
+  sleep() { :; }
+  mock_kubectl() {
+    [[ "$*" == '-n maas-system get deployment payload-processing --ignore-not-found -o json' ]] || return 1
+    case "$scenario" in
+      absent) return 0 ;;
+      owned) printf '%s\n' '{"metadata":{"labels":{"app.kubernetes.io/managed-by":"ai-gateway-controller"}}}' ;;
+      unowned) printf '%s\n' '{"metadata":{"labels":{}}}' ;;
+      denied) return 1 ;;
+      timeout) return 124 ;;
+      partial) printf '%s\n' '{"metadata":{"labels":{"app.kubernetes.io/managed-by":"ai-gateway-controller"}}}'; return 1 ;;
+      recovering)
+        if [[ ! -e "$handoff_tmp/retried" ]]; then
+          touch "$handoff_tmp/retried"
+          return 124
+        fi
+        printf '%s\n' '{"metadata":{"labels":{"app.kubernetes.io/managed-by":"ai-gateway-controller"}}}'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  handoff_tmp=$(mktemp -d)
+  trap 'rm -rf "$handoff_tmp"' EXIT
+  for scenario in denied timeout partial unowned; do
+    eval "$handoff_poll"
+    [[ "$handoff_ready" == false ]] || { echo "handoff must not succeed for $scenario Deployment reads" >&2; exit 1; }
+  done
+  for scenario in absent owned recovering; do
+    eval "$handoff_poll"
+    [[ "$handoff_ready" == true ]] || { echo "handoff must accept a confirmed $scenario Deployment" >&2; exit 1; }
+  done
+)
+
+
+echo "Kind run harness contracts passed (image identity, handoff read errors, and static-weight receipt fixtures)."
