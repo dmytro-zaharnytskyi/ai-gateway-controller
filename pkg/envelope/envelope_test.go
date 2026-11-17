@@ -537,9 +537,9 @@ func TestRender_ResolvedOmittedAndExplicitWeightsSelectTogether(t *testing.T) {
 	model := &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "ns1", Name: "m1"},
 		Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{
-			{Ref: v1alpha1.ExternalProviderReference{Name: "p1"}, TargetModel: "target", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
-			{Ref: v1alpha1.ExternalProviderReference{Name: "p2"}, TargetModel: "target", APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: &weightOne},
-			{Ref: v1alpha1.ExternalProviderReference{Name: "disabled"}, TargetModel: "target", APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: &weightZero},
+			{Ref: v1alpha1.ExternalProviderReference{Name: "p1"}, TargetModel: "m1", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+			{Ref: v1alpha1.ExternalProviderReference{Name: "p2"}, TargetModel: "m1", APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: &weightOne},
+			{Ref: v1alpha1.ExternalProviderReference{Name: "disabled"}, TargetModel: "m1", APIFormat: "openai-chat", Path: "/v1/chat/completions", Weight: &weightZero},
 		}},
 	}
 	providers := make([]*v1alpha1.ExternalProvider, 0, 3)

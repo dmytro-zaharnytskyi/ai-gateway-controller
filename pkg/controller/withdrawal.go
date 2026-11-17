@@ -472,7 +472,10 @@ func (r *Reconciler) providerTransportStillInUse(ctx context.Context, namespace,
 	cluster := providerServicePrefix + providerName
 	if env != nil {
 		for _, candidate := range env.Overlay.Candidates {
-			if candidate.Cluster == cluster {
+			// The cluster names the provider Service in the model namespace, so
+			// an attachment whose same-named provider lives with it carries this
+			// provider's cluster name without using it (RHOAIENG-103311).
+			if candidate.Cluster == cluster && !namesProviderOutside(candidate.StableID, namespace) {
 				return true, nil
 			}
 		}
@@ -482,7 +485,9 @@ func (r *Reconciler) providerTransportStillInUse(ctx context.Context, namespace,
 		return false, err
 	}
 	for _, route := range routes {
-		if route.Provider == providerName {
+		// A route to a same-named provider of another namespace uses that
+		// provider's hashed transport, not this provider's.
+		if route.Provider == providerName && (route.ProviderNamespace == "" || route.ProviderNamespace == namespace) {
 			return true, nil
 		}
 	}
@@ -501,6 +506,16 @@ func (r *Reconciler) providerTransportStillInUse(ctx context.Context, namespace,
 		}
 	}
 	return false, nil
+}
+
+// namesProviderOutside reports a scoped stable ID that names a provider
+// outside namespace. The hashed form names no namespace, so it never does.
+func namesProviderOutside(stableID, namespace string) bool {
+	if !envelope.IsScopedStableID(stableID) {
+		return false
+	}
+	parts := strings.Split(stableID, "/")
+	return len(parts) == 4 && parts[2] != namespace
 }
 
 // providerWithdrawalWaitMessage makes the safe provider-deletion contract
@@ -718,7 +733,7 @@ func (r *Reconciler) externalModelDeploymentSafe(ctx context.Context, namespace,
 		}
 		return nil, 0, false, fmt.Errorf("read ExternalModel ExtProc Deployment %s/%s: %w", namespace, deploymentName, err)
 	}
-	if deployment.Labels["app.kubernetes.io/managed-by"] != "ai-gateway-controller" || deployment.Labels["app"] != tenant.PayloadProcessingExternalModelName {
+	if !managedExtProcDeployment(deployment) {
 		return nil, 0, false, nil
 	}
 	templateHash := deployment.Spec.Template.Annotations[extprocConfigHashAnnotation]
@@ -757,25 +772,65 @@ func (r *Reconciler) externalModelDeploymentSafe(ctx context.Context, namespace,
 	if deployment.Status.TerminatingReplicas != nil && *deployment.Status.TerminatingReplicas != 0 {
 		return nil, 0, false, nil
 	}
-	if deployment.Spec.Selector == nil || len(deployment.Spec.Selector.MatchLabels) == 0 {
-		return nil, 0, false, nil
-	}
 	return deployment, replicas, true, nil
 }
 
-func (r *Reconciler) externalModelPodsSafe(ctx context.Context, namespace string, deployment *appsv1.Deployment, replicas int32, expectedConfigHash, expectedOverlayRevision string) (map[types.UID]bool, bool, error) {
-	reader := r.APIReader
-	selector := client.MatchingLabels(deployment.Spec.Selector.MatchLabels)
-	var replicaSets appsv1.ReplicaSetList
-	if err := reader.List(ctx, &replicaSets, client.InNamespace(namespace), selector); err != nil {
-		return nil, false, fmt.Errorf("list ExternalModel ExtProc ReplicaSets: %w", err)
+// managedExtProcDeployment reports whether deployment is the tenant's ExtProc
+// Deployment as the controller renders it. Only its pods' logs are read, as
+// pods/log is granted cluster-wide.
+func managedExtProcDeployment(deployment *appsv1.Deployment) bool {
+	return deployment.Labels["app.kubernetes.io/managed-by"] == "ai-gateway-controller" && deployment.Labels["app"] == tenant.PayloadProcessingExternalModelName &&
+		deployment.Spec.Selector != nil && len(deployment.Spec.Selector.MatchLabels) > 0
+}
+
+// extProcReplicaSets lists the ReplicaSets that a managed ExtProc Deployment
+// controls.
+func (r *Reconciler) extProcReplicaSets(ctx context.Context, namespace string, deployment *appsv1.Deployment) ([]*appsv1.ReplicaSet, error) {
+	var list appsv1.ReplicaSetList
+	if err := r.APIReader.List(ctx, &list, client.InNamespace(namespace), client.MatchingLabels(deployment.Spec.Selector.MatchLabels)); err != nil {
+		return nil, fmt.Errorf("list ExternalModel ExtProc ReplicaSets: %w", err)
 	}
-	ownedReplicaSets := make([]*appsv1.ReplicaSet, 0, len(replicaSets.Items))
-	for i := range replicaSets.Items {
-		rs := &replicaSets.Items[i]
-		if metav1.GetControllerOf(rs) != nil && metav1.GetControllerOf(rs).UID == deployment.UID {
-			ownedReplicaSets = append(ownedReplicaSets, rs)
+	owned := make([]*appsv1.ReplicaSet, 0, len(list.Items))
+	for i := range list.Items {
+		if owner := metav1.GetControllerOf(&list.Items[i]); owner != nil && owner.UID == deployment.UID {
+			owned = append(owned, &list.Items[i])
 		}
+	}
+	return owned, nil
+}
+
+// extProcPod is a pod that the selector of a managed ExtProc Deployment
+// matches, with the ReplicaSet of extProcReplicaSets that controls it, or nil
+// when none does.
+type extProcPod struct {
+	*corev1.Pod
+	replicaSet *appsv1.ReplicaSet
+}
+
+// extProcPods lists the pods of a managed ExtProc Deployment, given the
+// ReplicaSets it controls.
+func (r *Reconciler) extProcPods(ctx context.Context, namespace string, deployment *appsv1.Deployment, replicaSets []*appsv1.ReplicaSet) ([]extProcPod, error) {
+	var list corev1.PodList
+	if err := r.APIReader.List(ctx, &list, client.InNamespace(namespace), client.MatchingLabels(deployment.Spec.Selector.MatchLabels)); err != nil {
+		return nil, fmt.Errorf("list ExternalModel ExtProc pods: %w", err)
+	}
+	pods := make([]extProcPod, len(list.Items))
+	for i := range list.Items {
+		pods[i].Pod = &list.Items[i]
+		owner := metav1.GetControllerOf(pods[i].Pod)
+		for _, rs := range replicaSets {
+			if owner != nil && owner.UID == rs.UID {
+				pods[i].replicaSet = rs
+			}
+		}
+	}
+	return pods, nil
+}
+
+func (r *Reconciler) externalModelPodsSafe(ctx context.Context, namespace string, deployment *appsv1.Deployment, replicas int32, expectedConfigHash, expectedOverlayRevision string) (map[types.UID]bool, bool, error) {
+	ownedReplicaSets, err := r.extProcReplicaSets(ctx, namespace, deployment)
+	if err != nil {
+		return nil, false, err
 	}
 	var currentRS *appsv1.ReplicaSet
 	var currentRevision int64 = -1
@@ -798,41 +853,26 @@ func (r *Reconciler) externalModelPodsSafe(ctx context.Context, namespace string
 		}
 	}
 
-	var pods corev1.PodList
-	if err := reader.List(ctx, &pods, client.InNamespace(namespace), selector); err != nil {
-		return nil, false, fmt.Errorf("list ExternalModel ExtProc pods: %w", err)
+	pods, err := r.extProcPods(ctx, namespace, deployment, ownedReplicaSets)
+	if err != nil {
+		return nil, false, err
 	}
 	currentPods := map[types.UID]bool{}
-	for i := range pods.Items {
-		pod := &pods.Items[i]
+	for _, pod := range pods {
 		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
 			continue
 		}
-		owner := metav1.GetControllerOf(pod)
-		if owner == nil {
+		if pod.replicaSet == nil || pod.replicaSet.UID != currentRS.UID || !pod.DeletionTimestamp.IsZero() || !podReady(pod.Pod) {
 			return nil, false, nil
 		}
-		belongsToDeployment := false
-		for _, rs := range ownedReplicaSets {
-			if owner.UID == rs.UID {
-				belongsToDeployment = true
-				if rs.UID != currentRS.UID || !pod.DeletionTimestamp.IsZero() || !podReady(pod) {
-					return nil, false, nil
-				}
-				servesExpectedRevision, err := r.podServesOverlayRevision(ctx, pod, expectedOverlayRevision)
-				if err != nil {
-					return nil, false, err
-				}
-				if !servesExpectedRevision {
-					return nil, false, nil
-				}
-				currentPods[pod.UID] = true
-				break
-			}
+		servesExpectedRevision, err := r.podServesOverlayRevision(ctx, pod.Pod, expectedOverlayRevision)
+		if err != nil {
+			return nil, false, err
 		}
-		if !belongsToDeployment {
+		if !servesExpectedRevision {
 			return nil, false, nil
 		}
+		currentPods[pod.UID] = true
 	}
 	if len(currentPods) != int(replicas) {
 		return nil, false, nil

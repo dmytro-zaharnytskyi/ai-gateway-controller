@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -629,5 +631,46 @@ func TestOverrideSecretEventsReconcileTenantLocalModels(t *testing.T) {
 	reconcileOnSecretEvent()
 	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
 		t.Fatalf("status after restoring the override Secret = %q/%q %q, want Ready", got.Status.Phase, readyReason(got), readyMessage(got))
+	}
+}
+
+// A provider referenced from another namespace gets a hashed transport name
+// there, so a name too long for provider-<name> serves other namespaces. A
+// dot never fits the Service name, so the model reports why instead of
+// failing on the API server's rejection (RHOAIENG-103284).
+func TestForeignProviderNameIsValidatedForItsHashedTransport(t *testing.T) {
+	for _, tc := range []struct {
+		provider string
+		served   bool
+	}{
+		{provider: strings.Repeat("p", validation.LabelValueMaxLength), served: true},
+		{provider: "openai.prod"},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			sharedProvider, sharedSecret := attachmentProvider("shared")
+			sharedProvider.Name = tc.provider
+			model := referenceProvider(attachmentModel("chat", "tenant-b", "chat-model", time.Unix(100, 0)), "shared")
+			model.Spec.ExternalProviderRefs[0].Ref.Name = tc.provider
+			objects := append([]client.Object{sharedProvider, sharedSecret, model, referenceGrant("shared", "tenant-b", tc.provider)},
+				attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+			r := attachmentReconciler(t, objects...)
+			r.ApplyResource = apiServerApply
+			service := resolver.Route{Namespace: "tenant-b", ProviderNamespace: "shared", Provider: tc.provider}.ServiceName()
+			_, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+			got := getModel(t, r, model)
+			if tc.served {
+				if err != nil || got.Status.Phase != resolver.PhaseReady {
+					t.Fatalf("reconcile = %v, status = %#v, want served", err, got.Status)
+				}
+				if _, err := getUnstructured(r, serviceGVK, "tenant-b", service); err != nil {
+					t.Fatalf("hashed provider Service: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, resolver.ErrNoRoutes) || got.Status.Phase != modelPhaseFailed || readyReason(got) != reasonProviderNotReady ||
+				!strings.Contains(readyMessage(got), fmt.Sprintf("cannot name its transport Service %q in other namespaces", service)) {
+				t.Fatalf("reconcile = %v, status = %#v, want ProviderNotReady explaining the provider name", err, got.Status)
+			}
+		})
 	}
 }

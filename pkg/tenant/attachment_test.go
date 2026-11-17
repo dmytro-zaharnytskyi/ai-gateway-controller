@@ -196,7 +196,7 @@ func TestCleanupRemovesTenantAttachmentState(t *testing.T) {
 
 func TestTenantProvidersExcludeModelsBoundToOtherGateways(t *testing.T) {
 	ref := func(name string) []v1alpha1.ExternalProviderRef {
-		return []v1alpha1.ExternalProviderRef{{Ref: v1alpha1.ExternalProviderReference{Name: name}}}
+		return []v1alpha1.ExternalProviderRef{{Ref: v1alpha1.ExternalProviderReference{Name: name}, TargetModel: name}}
 	}
 	local := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: ref("local")}}
 	own := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "own", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalModelSpec{

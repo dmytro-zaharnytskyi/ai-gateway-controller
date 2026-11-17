@@ -116,21 +116,18 @@ func (r *Reconciler) foreignProviders(ctx context.Context, modelNamespace, gatew
 		if !provider.DeletionTimestamp.IsZero() {
 			continue
 		}
-		provider.Status.Phase = resolver.PhaseReady
-		if r.validateProvider(ctx, &provider) != nil {
-			provider.Status.Phase = providerPhaseFailed
-		} else if err := r.validateProviderCACredential(ctx, &provider, gatewayNamespace); transientReadError(err) {
+		checked, err := r.checkedProvider(ctx, &provider, gatewayNamespace)
+		if err != nil {
 			return nil, nil, err
-		} else if err != nil {
-			provider.Status.Phase = providerPhaseFailed
-		} else if inherited {
-			if err := r.validateProviderCredential(ctx, &provider); transientReadError(err) {
+		}
+		if checked.Status.Phase == resolver.PhaseReady && inherited {
+			if err := r.validateProviderCredential(ctx, checked); transientReadError(err) {
 				return nil, nil, err
 			} else if err != nil {
 				unready[key] = fmt.Sprintf("the credential of ExternalProvider %s is not ready for references that inherit its auth", key)
 			}
 		}
-		providers = append(providers, &provider)
+		providers = append(providers, checked)
 	}
 	return providers, unready, nil
 }

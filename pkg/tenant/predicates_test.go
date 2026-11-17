@@ -208,6 +208,12 @@ func TestTenantSecretPredicate(t *testing.T) {
 	if !preds.Create(event.CreateEvent{Object: foreign}) {
 		t.Error("create of foreign secret excluded; want admitted")
 	}
+	// RHOAIENG-103279: a re-created copy is the only event of a re-attachment.
+	copied := owned.DeepCopy()
+	copied.Labels[LabelCredentialCopy] = "true"
+	if !preds.Create(event.CreateEvent{Object: copied}) {
+		t.Error("create of a credential copy excluded; want admitted")
+	}
 	if preds.Update(updateFor(owned, owned)) {
 		t.Error("update of controller-owned secret admitted; want excluded")
 	}

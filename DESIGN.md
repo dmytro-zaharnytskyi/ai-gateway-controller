@@ -65,6 +65,12 @@ overlay candidates and reports `Ready=False/NoRoutes`, even when a referenced
 provider is missing or unready. Unrelated models retain their serving state.
 Readiness-driven final-provider withdrawal remains tracked in issue #106.
 
+A model whose own provider references cannot be resolved as written (two
+active references to one provider, an unresolved path placeholder, an invalid
+`targetModel` or a `tls.*` override of the provider's shared transport) reports
+`Ready=False/InvalidProviderRef` and is left out of the routes, the overlay and
+the ExtProc runtime; the other models of its namespace are still published.
+
 The controller stages provider withdrawal for tenant-local and Gateway-attached
 models: the reduced overlay must be observed by the serving ExtProc revision,
 then the request-drain interval must elapse before old routes, credentials, and
@@ -121,6 +127,14 @@ since there is no tenant transport to clean up. Once a claim arrives (an
 `AITenant` is created for the namespace), the next reconcile moves it to the
 tenant path and the `Pending` gate above.
 
+A provider's name also names its transport, so it is checked before anything
+is applied. A name no namespace can use (over 63 characters, or whose hashed
+Service name would contain a dot) is reported `Failed`/`InvalidName`, and its
+models report `ProviderNotReady`. Its own namespace needs the Service
+`provider-<name>`, so at most 54 characters: a longer provider is `Ready`
+without transport there and serves only other namespaces, and a model of its
+own namespace that references it reports `InvalidProviderRef`.
+
 A tenant resolution failure (an unreadable `AITenant`, or one whose ownership is
 inconsistent with the tenant configuration) claims the provider and reports
 `Pending`/`TenantNotReady` before returning the error. Returning a bare error
@@ -162,6 +176,16 @@ the OpenAI-compatible API. There is no separate target-model rewrite setting.
 This keeps translation-specific fields and their ExtProc compatibility
 requirement opt-in while retaining the route and provider selection supported
 by `origin/main` when translation is disabled.
+
+A provider reference that only works with the provider profile therefore
+requires the setting (`resolver.APITranslationRequirement`): an Anthropic
+Messages reference, a `targetModel` that differs from the model name clients
+send (`spec.modelName`, else `metadata.name`), and a reference to an `azure` or
+`azure-openai` provider, whose deployment path and `api-key` header come from
+the profile. Without the setting such a reference is excluded as
+`APITranslationDisabled`; a model whose every reference is excluded reports
+`Ready=False/APITranslationDisabled` instead of `Ready` while its requests
+fail, and its previously served route is withdrawn.
 
 If a deleting ExternalModel has no resolvable `MaasTenantConfig`/`AITenant` and
 there are sibling models, deletion is conservative: it will not rebuild shared

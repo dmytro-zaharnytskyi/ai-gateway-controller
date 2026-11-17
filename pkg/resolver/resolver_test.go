@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 )
@@ -44,11 +45,22 @@ func ref(name, target, path string) v1alpha1.ExternalProviderRef {
 
 func intptr(v int) *int { return &v }
 
+// Most fixtures target a provider model other than the model name, which only
+// API translation applies (see APITranslationRequirement). Tests that are not
+// about that gate resolve as a tenant that enabled it.
+func resolveTranslated(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider) (*ResolvedRouteSet, error) {
+	return ResolveWithAPITranslation(models, providers, true)
+}
+
+func resolveAllTranslated(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider) (*ResolvedRouteSet, error) {
+	return ResolveAllWithAPITranslation(models, providers, true)
+}
+
 func TestResolve_SingleHappyPath(t *testing.T) {
 	m := model("ns1", "my-model", ref("prov-a", "gpt-4o", "/v1/chat/completions"))
 	p := provider("ns1", "prov-a", PhaseReady, "api.openai.com", nil)
 
-	set, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+	set, err := resolveTranslated([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -82,7 +94,7 @@ func TestResolve_UsesAnnotatedProviderPort(t *testing.T) {
 	p := provider("ns1", "prov-a", PhaseReady, "provider.example.com", nil)
 	p.Annotations = map[string]string{ProviderPortAnnotation: "8000"}
 
-	set, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+	set, err := resolveTranslated([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -103,16 +115,47 @@ func TestProviderPortDefaultsAndRejectsInvalidAnnotation(t *testing.T) {
 }
 
 func TestResolveRejectsDuplicateActiveProviderBindings(t *testing.T) {
-	m := model("ns1", "my-model",
-		ref("prov-a", "gpt-4o-mini", "/v1/chat/completions"),
-		ref("prov-a", "gpt-4o", "/v1/responses"),
+	m := model("ns1", "m",
+		ref("prov-a", "m", "/v1/chat/completions"),
+		ref("prov-a", "m", "/v1/responses"),
 	)
 	p := provider("ns1", "prov-a", PhaseReady, "api.openai.com", nil)
 
-	_, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
-	if err == nil || !strings.Contains(err.Error(), "multiple active references") {
-		t.Fatalf("Resolve() error = %v, want duplicate active provider rejection", err)
+	err := resolveRejected(t, m, p)
+	if !strings.Contains(err.Error(), "multiple active references to ExternalProvider ns1/prov-a") {
+		t.Fatalf("rejection = %v, want the duplicate provider named", err)
 	}
+	set, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+	if !errors.Is(err, ErrNoRoutes) || set.Models[0].Rejected == nil {
+		t.Fatalf("Resolve() of the rejected model alone = (%+v, %v), want ErrNoRoutes with the rejection", set, err)
+	}
+}
+
+// resolveRejected resolves bad, ns1/m, ahead of a valid sibling model, for
+// serving and for preload, and returns bad's rejection. Only bad is excluded:
+// its sibling still resolves and the call reports no error.
+func resolveRejected(t *testing.T, bad *v1alpha1.ExternalModel, providers ...*v1alpha1.ExternalProvider) error {
+	t.Helper()
+	sibling := model("ns1", "sibling", ref("sibling-provider", "sibling", "/v1/chat/completions"))
+	providers = append(providers, provider("ns1", "sibling-provider", PhaseReady, "sibling.example.com", nil))
+	var rejected error
+	for name, resolve := range map[string]func([]*v1alpha1.ExternalModel, []*v1alpha1.ExternalProvider) (*ResolvedRouteSet, error){
+		"serving": Resolve, "preload": ResolveAll,
+	} {
+		set, err := resolve([]*v1alpha1.ExternalModel{bad, sibling}, providers)
+		if err != nil || len(set.Models) != 2 {
+			t.Fatalf("%s: (%+v, %v), want both models without an error", name, set, err)
+		}
+		if got := set.Models[1]; got.Rejected != nil || len(got.Routes) != 1 {
+			t.Fatalf("%s: sibling = %+v, want it resolved", name, got)
+		}
+		got := set.Models[0]
+		if got.ModelRef != "ns1/m" || !errors.Is(got.Rejected, ErrInvalidProviderRef) || len(got.Routes) != 0 || len(got.Skips) != 0 {
+			t.Fatalf("%s: model = %+v, want it rejected alone", name, got)
+		}
+		rejected = got.Rejected
+	}
+	return rejected
 }
 
 func TestResolveGatesAnthropicMessagesOnTenantPermission(t *testing.T) {
@@ -134,7 +177,7 @@ func TestResolveGatesAnthropicMessagesOnTenantPermission(t *testing.T) {
 }
 
 func TestAPITranslationPermissionPreservesOpenAIAndGatesAnthropicSelection(t *testing.T) {
-	openAIRef := ref("openai", "gpt-mock", "/v1/chat/completions")
+	openAIRef := ref("openai", "model", "/v1/chat/completions")
 	messageRef := ref("anthropic", "claude-mock", "/v1/messages")
 	messageRef.APIFormat = "messages"
 	model := model("ns1", "model", openAIRef, messageRef)
@@ -197,7 +240,8 @@ func TestResolveBedrockMantleOpenAIChat(t *testing.T) {
 	provider := provider("ns1", "bedrock", PhaseReady, "bedrock-mantle.us-east-2.api.aws", nil)
 	provider.Spec.Provider = "bedrock-openai"
 
-	set, err := ResolveWithAPITranslation([]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider}, false)
+	// Mantle receives the targetModel only through API translation.
+	set, err := ResolveWithAPITranslation([]*v1alpha1.ExternalModel{model}, []*v1alpha1.ExternalProvider{provider}, true)
 	if err != nil {
 		t.Fatalf("ResolveWithAPITranslation(): %v", err)
 	}
@@ -330,7 +374,7 @@ func TestResolveAllIncludesUnselectedProviderBindings(t *testing.T) {
 		provider("ns1", "prov-a", PhaseReady, "a.example.com", nil),
 		provider("ns1", "prov-b", PhaseReady, "b.example.com", nil),
 	}
-	set, err := ResolveAll([]*v1alpha1.ExternalModel{m}, provs)
+	set, err := resolveAllTranslated([]*v1alpha1.ExternalModel{m}, provs)
 	if err != nil {
 		t.Fatalf("ResolveAll: %v", err)
 	}
@@ -341,7 +385,7 @@ func TestResolveAllIncludesUnselectedProviderBindings(t *testing.T) {
 		t.Fatalf("ResolveAll did not preserve the unselected binding: %+v", set.Routes()[1])
 	}
 
-	selected, err := Resolve([]*v1alpha1.ExternalModel{m}, provs)
+	selected, err := resolveTranslated([]*v1alpha1.ExternalModel{m}, provs)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -355,7 +399,7 @@ func TestResolve_ModelNameAlias(t *testing.T) {
 	m.Spec.ModelName = "gpt-4o.prod"
 	p := provider("ns1", "prov-a", PhaseReady, "api.openai.com", nil)
 
-	set, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+	set, err := resolveTranslated([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -406,7 +450,7 @@ func TestResolve_SkipReasons(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			set, err := Resolve(
+			set, err := resolveTranslated(
 				[]*v1alpha1.ExternalModel{model("ns1", "m", tc.ref)}, tc.provs)
 			if !errors.Is(err, ErrNoRoutes) {
 				t.Fatalf("all-skipped must return ErrNoRoutes, got %v", err)
@@ -435,7 +479,7 @@ func TestResolve_SkipAggregationKeepsGoodRefs(t *testing.T) {
 		provider("ns1", "good", PhaseReady, "g.example.com", nil),
 		provider("ns1", "good2", PhaseReady, "g2.example.com", nil),
 	}
-	set, err := Resolve([]*v1alpha1.ExternalModel{m}, provs)
+	set, err := resolveTranslated([]*v1alpha1.ExternalModel{m}, provs)
 	if err != nil {
 		t.Fatalf("partial resolution must not error: %v", err)
 	}
@@ -497,7 +541,7 @@ func withWeight(r v1alpha1.ExternalProviderRef, w int) v1alpha1.ExternalProvider
 
 func TestResolve_ProviderNamespace(t *testing.T) {
 	for name, resolve := range map[string]func([]*v1alpha1.ExternalModel, []*v1alpha1.ExternalProvider) (*ResolvedRouteSet, error){
-		"serving": Resolve, "preload": ResolveAll,
+		"serving": resolveTranslated, "preload": resolveAllTranslated,
 	} {
 		t.Run(name, func(t *testing.T) {
 			for _, namespace := range []string{"", "models", "shared"} {
@@ -537,7 +581,7 @@ func TestResolve_UnpermittedNamespaceKeepsLocalRefs(t *testing.T) {
 	foreign.Ref.Namespace = "shared"
 	m := model("models", "model", foreign, ref("provider", "local-target", "/v1/chat/completions"))
 	p := provider("models", "provider", PhaseReady, "local.example.com", nil)
-	for _, resolve := range []func([]*v1alpha1.ExternalModel, []*v1alpha1.ExternalProvider) (*ResolvedRouteSet, error){Resolve, ResolveAll} {
+	for _, resolve := range []func([]*v1alpha1.ExternalModel, []*v1alpha1.ExternalProvider) (*ResolvedRouteSet, error){resolveTranslated, resolveAllTranslated} {
 		set, err := resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
 		if err != nil || len(set.Routes()) != 1 || set.Routes()[0].TargetModel != "local-target" {
 			t.Fatalf("mixed references: set=%#v err=%v", set, err)
@@ -554,7 +598,7 @@ func TestResolve_SameNamedProvidersFromTwoNamespaces(t *testing.T) {
 	a.Ref.Namespace, b.Ref.Namespace = "ns-a", "ns-b"
 	overridden := v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "model-key"}}
 	b.Auth = &overridden
-	set, err := Resolve([]*v1alpha1.ExternalModel{model("models", "model", a, b)}, []*v1alpha1.ExternalProvider{
+	set, err := resolveTranslated([]*v1alpha1.ExternalModel{model("models", "model", a, b)}, []*v1alpha1.ExternalProvider{
 		provider("ns-a", "openai", PhaseReady, "a.example.com", nil),
 		provider("ns-b", "openai", PhaseReady, "b.example.com", nil),
 	})
@@ -576,7 +620,7 @@ func TestResolve_SimpleAuthIsAPIKey(t *testing.T) {
 	overridden.Auth = &v1alpha1.AuthConfig{Type: "simple", SecretRef: v1alpha1.NameReference{Name: "model-key"}}
 	providerA := provider("ns1", "prov-a", PhaseReady, "a.example.com", nil)
 	providerA.Spec.Auth.Type = "simple"
-	set, err := Resolve([]*v1alpha1.ExternalModel{model("ns1", "my-model", inherited, overridden)},
+	set, err := resolveTranslated([]*v1alpha1.ExternalModel{model("ns1", "my-model", inherited, overridden)},
 		[]*v1alpha1.ExternalProvider{providerA, provider("ns1", "prov-b", PhaseReady, "b.example.com", nil)})
 	if err != nil || len(set.Routes()) != 2 {
 		t.Fatalf("set=%#v err=%v", set, err)
@@ -604,7 +648,7 @@ func TestResolve_NamespaceIsolation(t *testing.T) {
 	m := model("ns1", "m", ref("prov-a", "t", "/v1"))
 	foreign := provider("ns2", "prov-a", PhaseReady, "x.example.com", nil)
 
-	set, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{foreign})
+	set, err := resolveTranslated([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{foreign})
 	if !errors.Is(err, ErrNoRoutes) {
 		t.Fatalf("cross-namespace ref must skip, got err=%v", err)
 	}
@@ -622,7 +666,7 @@ func TestResolve_MergedConfigAndPathTemplates(t *testing.T) {
 	// ref config overrides provider config (IPP merged-config precedence)
 	m.Spec.ExternalProviderRefs[0].Config = map[string]string{"project": "ref-project"}
 
-	set, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+	set, err := resolveTranslated([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -640,7 +684,7 @@ func TestResolve_MergedConfigCarriesMountedTLSCAPath(t *testing.T) {
 	p := provider("ns1", "p", PhaseReady, "provider.example.com", map[string]string{
 		"tls.caCertificates": "/etc/istio/provider-ca/ca.crt",
 	})
-	set, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+	set, err := resolveTranslated([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -650,7 +694,7 @@ func TestResolve_MergedConfigCarriesMountedTLSCAPath(t *testing.T) {
 }
 
 func TestResolve_RejectsModelSpecificTLSCAOverride(t *testing.T) {
-	m := model("ns1", "m", ref("p", "target", "/v1"))
+	m := model("ns1", "m", ref("p", "m", "/v1"))
 	m.Spec.ExternalProviderRefs[0].Config = map[string]string{
 		"tls.caCertificates": "/etc/istio/model-ca/ca.crt",
 	}
@@ -658,14 +702,13 @@ func TestResolve_RejectsModelSpecificTLSCAOverride(t *testing.T) {
 		"tls.caCertificates": "/etc/istio/provider-ca/ca.crt",
 	})
 
-	_, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
-	if err == nil || !strings.Contains(err.Error(), "tls.caCertificates cannot override ExternalProvider p") {
-		t.Fatalf("Resolve error = %v, want explicit shared-transport CA override error", err)
+	if err := resolveRejected(t, m, p); !strings.Contains(err.Error(), "tls.caCertificates cannot override ExternalProvider p") {
+		t.Fatalf("rejection = %v, want explicit shared-transport CA override error", err)
 	}
 }
 
 func TestResolve_RejectsUnsafeTLSCAPath(t *testing.T) {
-	m := model("ns1", "m", ref("p", "target", "/v1"))
+	m := model("ns1", "m", ref("p", "m", "/v1"))
 	p := provider("ns1", "p", PhaseReady, "provider.example.com", map[string]string{"tls.caCertificates": "../ca.crt"})
 	if _, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p}); err == nil {
 		t.Fatal("unsafe TLS CA path must be rejected")
@@ -675,7 +718,7 @@ func TestResolve_RejectsUnsafeTLSCAPath(t *testing.T) {
 func TestResolve_CarriesProviderTLSCredentialName(t *testing.T) {
 	m := model("ns1", "m", ref("p", "target", "/v1"))
 	p := provider("ns1", "p", PhaseReady, "provider.example.com", map[string]string{"tls.credentialName": "provider-ca"})
-	set, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+	set, err := resolveTranslated([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -685,13 +728,19 @@ func TestResolve_CarriesProviderTLSCredentialName(t *testing.T) {
 }
 
 func TestResolve_RejectsModelSpecificTLSCredentialNameOverride(t *testing.T) {
-	m := model("ns1", "m", ref("p", "target", "/v1"))
+	m := model("ns1", "m", ref("p", "m", "/v1"))
 	m.Spec.ExternalProviderRefs[0].Config = map[string]string{"tls.credentialName": "model-ca"}
 	p := provider("ns1", "p", PhaseReady, "provider.example.com", nil)
 
-	_, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
-	if err == nil || !strings.Contains(err.Error(), "tls.credentialName cannot override ExternalProvider p") {
-		t.Fatalf("Resolve error = %v, want explicit shared-transport credential override error", err)
+	if err := resolveRejected(t, m, p); !strings.Contains(err.Error(), "tls.credentialName cannot override ExternalProvider p") {
+		t.Fatalf("rejection = %v, want explicit shared-transport credential override error", err)
+	}
+	// Resolve never serves a disabled ref, so preload skips it rather than
+	// rejecting the model: both resolve the same models.
+	m.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{ref("q", "m", "/v1"), withWeight(m.Spec.ExternalProviderRefs[0], 0)}
+	set, err := ResolveAll([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p, provider("ns1", "q", PhaseReady, "q.example.com", nil)})
+	if err != nil || set.Models[0].Rejected != nil || len(set.Routes()) != 1 || len(set.Models[0].Skips) != 1 || set.Models[0].Skips[0].Reason != SkipWeightDisabled {
+		t.Fatalf("ResolveAll() with the override on a disabled ref = (%+v, %v), want that ref skipped", set, err)
 	}
 }
 
@@ -736,11 +785,11 @@ func TestResolve_PathErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := model("ns1", "m", ref("p", "target", tc.path))
+			m := model("ns1", "m", ref("p", "m", tc.path))
 			p := provider("ns1", "p", PhaseReady, "e.example.com", tc.cfg)
-			_, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
-			if err == nil {
-				t.Fatal("path errors must hard-fail the reconcile (IPP #368), got nil")
+			// A reconcile-time error (IPP #368) that fails only this model.
+			if err := resolveRejected(t, m, p); !strings.Contains(err.Error(), "unresolved placeholders") {
+				t.Fatalf("rejection = %v, want the unresolved placeholders", err)
 			}
 		})
 	}
@@ -756,7 +805,7 @@ func TestResolve_Ordering(t *testing.T) {
 		provider("ns1", "p1", PhaseReady, "p1.example.com", nil),
 		provider("ns1", "p2", PhaseReady, "p2.example.com", nil),
 	}
-	set, err := Resolve([]*v1alpha1.ExternalModel{m1, m2}, provs)
+	set, err := resolveTranslated([]*v1alpha1.ExternalModel{m1, m2}, provs)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -777,7 +826,7 @@ func TestResolve_AuthOverridePerRef(t *testing.T) {
 	}
 	p := provider("ns1", "p", PhaseReady, "e.example.com", nil)
 
-	set, err := Resolve([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
+	set, err := resolveTranslated([]*v1alpha1.ExternalModel{m}, []*v1alpha1.ExternalProvider{p})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -793,7 +842,7 @@ func TestResolve_NilAndEmptyInputs(t *testing.T) {
 		t.Fatalf("nil inputs: want ErrNoRoutes + non-nil set, got %v / %v", set, err)
 	}
 	// nil entries are tolerated, not panicked on
-	set, err = Resolve(
+	set, err = resolveTranslated(
 		[]*v1alpha1.ExternalModel{nil, model("ns", "m", ref("p", "t", "/v1"))},
 		[]*v1alpha1.ExternalProvider{nil, provider("ns", "p", PhaseReady, "e.example.com", nil)})
 	if err != nil || len(set.Routes()) != 1 {
@@ -866,7 +915,7 @@ func TestResolveTwoModelsOneProvider(t *testing.T) {
 	modelA := model("ns1", "model-a", ref("shared-prov", "gpt-4o", "/v1/chat/completions"))
 	modelB := model("ns1", "model-b", ref("shared-prov", "gpt-4o-mini", "/v1/chat/completions"))
 
-	set, err := Resolve([]*v1alpha1.ExternalModel{modelA, modelB}, []*v1alpha1.ExternalProvider{shared})
+	set, err := resolveTranslated([]*v1alpha1.ExternalModel{modelA, modelB}, []*v1alpha1.ExternalProvider{shared})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -907,12 +956,97 @@ func TestValidateProviderTLSRejectsPlaintext(t *testing.T) {
 func TestResolve_NotReadySkipCarriesProviderReason(t *testing.T) {
 	p := provider("ns1", "p", "Failed", "p.example.com", nil)
 	p.Status.Conditions = []metav1.Condition{{Type: "Ready", Status: metav1.ConditionFalse, Reason: "ReconcileFailed", Message: "endpoint is invalid"}}
-	set, err := Resolve([]*v1alpha1.ExternalModel{model("ns1", "m", ref("p", "t", "/v1"))}, []*v1alpha1.ExternalProvider{p})
+	set, err := resolveTranslated([]*v1alpha1.ExternalModel{model("ns1", "m", ref("p", "t", "/v1"))}, []*v1alpha1.ExternalProvider{p})
 	if !errors.Is(err, ErrNoRoutes) {
 		t.Fatalf("Resolve error = %v, want ErrNoRoutes", err)
 	}
 	if skips := set.Models[0].Skips; len(skips) != 1 || skips[0].Reason != SkipProviderNotReady ||
 		skips[0].Message != `provider phase "Failed" is not Ready: endpoint is invalid` {
 		t.Fatalf("skips = %#v", skips)
+	}
+}
+
+// ValidateProviderName accepts a name that some namespace can use, and
+// ValidateLocalProviderName one that the provider's own namespace can use.
+func TestValidateProviderName(t *testing.T) {
+	for _, tc := range []struct {
+		provider          string
+		valid, validLocal bool
+	}{
+		{provider: "openai", valid: true, validLocal: true},
+		{provider: strings.Repeat("p", MaxLocalProviderNameLength), valid: true, validLocal: true},
+		{provider: strings.Repeat("p", MaxLocalProviderNameLength+1), valid: true},
+		{provider: strings.Repeat("p", validation.LabelValueMaxLength), valid: true},
+		{provider: strings.Repeat("p", validation.LabelValueMaxLength+1)},
+		{provider: "openai.prod"},
+	} {
+		err, localErr := ValidateProviderName("shared", tc.provider), ValidateLocalProviderName(tc.provider)
+		if (err == nil) != tc.valid || (localErr == nil) != tc.validLocal ||
+			err != nil && !errors.Is(err, ErrInvalidProviderName) || localErr != nil && !errors.Is(localErr, ErrInvalidProviderName) {
+			t.Errorf("%q: ValidateProviderName() = %v, ValidateLocalProviderName() = %v; want valid %t, locally %t", tc.provider, err, localErr, tc.valid, tc.validLocal)
+		}
+	}
+}
+
+// A provider of the model's own namespace is reached through provider-<name>,
+// which a name that fits only the hashed transport of other namespaces cannot
+// name: the model is rejected alone, while a model in another namespace uses
+// the provider (RHOAIENG-103284).
+func TestOwnNamespaceRefToLongProviderNameRejectsModel(t *testing.T) {
+	name := strings.Repeat("p", MaxLocalProviderNameLength+1)
+	p := provider("ns1", name, PhaseReady, "p.example.com", nil)
+	err := resolveRejected(t, model("ns1", "m", ref(name, "m", "/v1/chat/completions")), p)
+	if !errors.Is(err, ErrInvalidProviderName) || !strings.Contains(err.Error(), "only models in other namespaces can use it") {
+		t.Fatalf("rejection = %v, want the provider name explained", err)
+	}
+	cross := ref(name, "m", "/v1/chat/completions")
+	cross.Ref.Namespace = "ns1"
+	set, err := Resolve([]*v1alpha1.ExternalModel{model("ns2", "m", cross)}, []*v1alpha1.ExternalProvider{p})
+	if err != nil || len(set.Routes()) != 1 || set.Routes()[0].Cluster != hashedServiceName("ns1", name) {
+		t.Fatalf("model in another namespace = (%+v, %v), want it served through the hashed transport", set, err)
+	}
+}
+
+// Without API translation the provider receives the client's body model and
+// path and no provider credential header, so a ref that needs them is
+// excluded like an Anthropic Messages ref (RHOAIENG-103276).
+func TestTranslationRequiredRefsAreGatedOnTenantPermission(t *testing.T) {
+	for _, tc := range []struct {
+		name, modelName, providerType, apiFormat, target string
+		why                                              string // "" when the ref serves without translation
+	}{
+		{name: "renamed target", providerType: "openai", target: "gpt-4o", why: `targetModel "gpt-4o" differs from the model name "chat"`},
+		{name: "renamed target of a client alias", modelName: "alias", providerType: "openai", target: "chat", why: `differs from the model name "alias"`},
+		{name: "azure", providerType: "azure", target: "chat", why: "type azure needs its deployment path and api-key header"},
+		{name: "azure-openai", providerType: "azure-openai", target: "chat", why: "type azure-openai"},
+		{name: "messages to an unknown provider", apiFormat: "messages", target: "claude", why: "Anthropic Messages"},
+		{name: "client name target", providerType: "openai", target: "chat"},
+		{name: "client alias target", modelName: "gpt-4o", providerType: "openai", target: "gpt-4o"},
+		// Capability validation reports a provider that cannot serve the ref.
+		{name: "messages to azure", providerType: "azure", apiFormat: "messages", target: "claude"},
+	} {
+		r := ref("p", tc.target, "/v1/chat/completions")
+		if tc.apiFormat != "" {
+			r.APIFormat = tc.apiFormat
+		}
+		m := model("ns1", "chat", r)
+		m.Spec.ModelName = tc.modelName
+		if got := APITranslationRequirement(m, r, tc.providerType); (got == "") != (tc.why == "") || !strings.Contains(got, tc.why) {
+			t.Errorf("%s: APITranslationRequirement() = %q, want %q", tc.name, got, tc.why)
+		}
+	}
+	m := model("ns1", "chat", ref("p", "gpt-4o", "/v1/chat/completions"))
+	providers := []*v1alpha1.ExternalProvider{provider("ns1", "p", PhaseReady, "p.example.com", nil)}
+	for name, resolve := range map[string]func([]*v1alpha1.ExternalModel, []*v1alpha1.ExternalProvider, bool) (*ResolvedRouteSet, error){
+		"serving": ResolveWithAPITranslation, "preload": ResolveAllWithAPITranslation,
+	} {
+		if set, err := resolve([]*v1alpha1.ExternalModel{m}, providers, true); err != nil || len(set.Routes()) != 1 {
+			t.Fatalf("%s with translation: (%+v, %v), want the ref served", name, set, err)
+		}
+		set, err := resolve([]*v1alpha1.ExternalModel{m}, providers, false)
+		if skips := set.Models[0].Skips; !errors.Is(err, ErrNoRoutes) || len(skips) != 1 || skips[0].Reason != SkipTranslationDisabled ||
+			!strings.Contains(skips[0].Message, "MaasTenantConfig.spec.apiTranslation.enabled must be true: targetModel") {
+			t.Fatalf("%s without translation: (%+v, %v), want the ref skipped as %s", name, set, err, SkipTranslationDisabled)
+		}
 	}
 }

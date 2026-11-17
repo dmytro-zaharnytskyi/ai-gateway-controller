@@ -5,7 +5,8 @@
 // (opendatahub-io/ai-gateway-payload-processing): model-ref config overrides
 // provider config except for tls.caCertificates and tls.credentialName, which
 // configure shared provider transport. Missing, unready, disabled, or
-// policy-excluded refs are skipped; an active binding with no qualified
+// policy-excluded refs are skipped; a model whose own refs are invalid is
+// rejected alone (ModelRoutes.Rejected); an active binding with no qualified
 // provider/API/credential profile is a hard error so reconciliation cannot
 // publish a silently reduced route.
 package resolver
@@ -60,8 +61,9 @@ const (
 	// SkipWeightDisabled: weight <= 0 disables the ref (IPP semantics:
 	// weight 0 means "no traffic", default 1 when unset).
 	SkipWeightDisabled SkipReason = "WeightDisabled"
-	// SkipTranslationDisabled prevents Anthropic Messages requests when the
-	// tenant has not enabled API translation.
+	// SkipTranslationDisabled excludes a ref that serves only through API
+	// translation (see APITranslationRequirement) when the tenant has not
+	// enabled it.
 	SkipTranslationDisabled SkipReason = "APITranslationDisabled"
 	// SkipAPIFormatUnsupported records an unsupported disabled/preloaded
 	// provider/API binding. An active binding returns
@@ -202,16 +204,69 @@ func (r Route) CrossNamespace() bool {
 // 63 characters for a provider in another namespace, so it never collides
 // with a same-named local provider.
 func (r Route) ServiceName() string {
-	name := "provider-" + r.Provider
 	if !r.CrossNamespace() {
-		return name
+		return localServiceName(r.Provider)
 	}
-	sum := sha256.Sum256([]byte(r.ProviderNamespace + "/" + r.Provider))
+	return hashedServiceName(r.ProviderNamespace, r.Provider)
+}
+
+func localServiceName(provider string) string {
+	return "provider-" + provider
+}
+
+// hashedServiceName depends only on the provider, so it is the same in every
+// model namespace that references it.
+func hashedServiceName(providerNamespace, provider string) string {
+	name := localServiceName(provider)
+	sum := sha256.Sum256([]byte(providerNamespace + "/" + provider))
 	hash := hex.EncodeToString(sum[:])[:12]
 	if limit := 63 - len(hash) - 1; len(name) > limit {
 		name = strings.TrimRight(name[:limit], "-.")
 	}
 	return name + "-" + hash
+}
+
+// MaxLocalProviderNameLength is the longest ExternalProvider name whose
+// provider-<name> transport Service name fits the 63 characters of a DNS-1035
+// label.
+const MaxLocalProviderNameLength = 63 - len("provider-")
+
+// ErrInvalidProviderName marks an ExternalProvider name that cannot name the
+// provider's transport. A Kubernetes object name may be longer and contain
+// dots, which the API server rejects only when that transport is applied.
+var ErrInvalidProviderName = errors.New("ExternalProvider name cannot be rendered")
+
+// ValidateProviderName checks that an ExternalProvider can be used from some
+// namespace: a model in another namespace reaches it through the hashed
+// Service and ServiceEntry of hashedServiceName, a DNS-1035 label truncated to
+// fit, and its name is the provider label value on that transport's Gateway
+// DestinationRule. Its own namespace needs a shorter name
+// (ValidateLocalProviderName).
+func ValidateProviderName(namespace, name string) error {
+	service := hashedServiceName(namespace, name)
+	problems := append(validation.IsDNS1035Label(service), validation.IsValidLabelValue(name)...)
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %q cannot name its transport Service %q in other namespaces or its label (%s); recreate the ExternalProvider "+
+		"with a metadata.name of at most %d lowercase letters, digits and '-', without '.' (at most %d for models in its own namespace), "+
+		"and update the externalProviderRefs that name it",
+		ErrInvalidProviderName, name, service, strings.Join(problems, "; "), validation.LabelValueMaxLength, MaxLocalProviderNameLength)
+}
+
+// ValidateLocalProviderName checks that a model in the ExternalProvider's own
+// namespace can use it: its transport there is the Service and ServiceEntry
+// provider-<name>, a DNS-1035 label. A name that passes also passes
+// ValidateProviderName.
+func ValidateLocalProviderName(name string) error {
+	service := localServiceName(name)
+	problems := validation.IsDNS1035Label(service)
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %q cannot name its transport Service %q in its own namespace (%s), so only models in other namespaces can use it; "+
+		"to use it here, recreate the ExternalProvider with a metadata.name of at most %d lowercase letters, digits and '-', without '.', and update the externalProviderRefs that name it",
+		ErrInvalidProviderName, name, service, strings.Join(problems, "; "), MaxLocalProviderNameLength)
 }
 
 // SecretRefNamespace returns SecretName's namespace.
@@ -229,7 +284,18 @@ type ModelRoutes struct {
 	ModelRef string // "namespace/name"
 	Routes   []Route
 	Skips    []Skip
+	// Rejected is the model's own invalid provider reference (see
+	// ErrInvalidProviderRef). A rejected model has no routes or skips; callers
+	// exclude and report it alone, so the other models are still served.
+	Rejected error
 }
+
+// ErrInvalidProviderRef marks a model whose provider references cannot be
+// resolved as written: two active references to one provider, a reference
+// with an invalid path, targetModel or transport override, or one to a
+// provider of its own namespace whose name fits only the transport of other
+// namespaces. It fails only that model, never the models resolved with it.
+var ErrInvalidProviderRef = errors.New("invalid ExternalModel provider reference")
 
 // ResolvedRouteSet is the single input both render planes consume in one
 // reconcile (port plan §4.4: one source, two planes, no divergence window).
@@ -258,10 +324,11 @@ var ErrProviderCapabilityUnsupported = errors.New("resolver: provider capability
 
 // Resolve merges model/provider pairs into a route set. Ordering guarantees:
 // models keep input order, routes keep ref order. A model whose refs all
-// skip is not an error by itself — its skips are reported and only a wholly
-// empty set returns ErrNoRoutes. A ref to another namespace resolves only to
-// a provider of that namespace in providers, so callers pass only the
-// providers in other namespaces that the model namespace may reference.
+// skip, or which is Rejected, is not an error by itself — it is reported and
+// only a wholly empty set returns ErrNoRoutes. A ref to another namespace
+// resolves only to a provider of that namespace in providers, so callers pass
+// only the providers in other namespaces that the model namespace may
+// reference.
 func Resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalProvider) (*ResolvedRouteSet, error) {
 	return resolve(models, providers, false, false)
 }
@@ -345,10 +412,7 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 		mref := m.Namespace + "/" + m.Name
 		mr := ModelRoutes{ModelRef: mref}
 		activeProviders := map[provKey]bool{}
-		clientName := m.Name
-		if m.Spec.ModelName != "" {
-			clientName = m.Spec.ModelName
-		}
+		clientName := ClientModelName(m)
 		for _, ref := range m.Spec.ExternalProviderRefs {
 			base := Skip{ModelRef: mref, ProviderRef: ref.Ref.Name}
 			weight := 1
@@ -375,14 +439,19 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 					fmt.Sprintf("ExternalProvider %s/%s is not found or not permitted by a ReferenceGrant in namespace %s", key.ns, key.name, key.ns)))
 				continue
 			}
-			// A Messages route cannot serve while translation is disabled, even
-			// when its previously serving Anthropic provider has disappeared or
-			// become unready. Classify that policy exclusion before availability
-			// so reconciliation withdraws the old route and candidate. A known
-			// non-Anthropic provider still reaches capability validation below.
-			if ref.APIFormat == "messages" && !translationEnabled && (!ok || prov.Spec.Provider == "anthropic") {
+			// A ref that needs translation cannot serve while it is disabled,
+			// even when its previously serving provider has disappeared or become
+			// unready. Classify that policy exclusion before availability so
+			// reconciliation withdraws the old route and candidate. A known
+			// provider without the API format still reaches capability
+			// validation below.
+			providerType := ""
+			if ok {
+				providerType = prov.Spec.Provider
+			}
+			if why := APITranslationRequirement(m, ref, providerType); !translationEnabled && why != "" {
 				mr.Skips = append(mr.Skips, newSkip(base, SkipTranslationDisabled,
-					"MaasTenantConfig.spec.apiTranslation.enabled must be true for an Anthropic Messages provider"))
+					"MaasTenantConfig.spec.apiTranslation.enabled must be true: "+why))
 				continue
 			}
 			if !ok {
@@ -412,16 +481,34 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 				set.Models = append(set.Models, mr)
 				return set, fmt.Errorf("%w: %s: model %s provider ref %s: %s", ErrProviderCapabilityUnsupported, SkipAPIFormatUnsupported, mref, ref.Ref.Name, message)
 			}
+			// The model's own invalid reference rejects only this model: the
+			// others resolved with it are still served.
 			if weight > 0 && activeProviders[key] {
-				return nil, fmt.Errorf("resolver: model %s has multiple active references to provider %s/%s", mref, prov.Namespace, prov.Name)
+				mr.Rejected = fmt.Errorf("%w: multiple active references to ExternalProvider %s/%s; keep one, or set weight 0 on the others",
+					ErrInvalidProviderRef, prov.Namespace, prov.Name)
+				break
 			}
 			if weight > 0 {
 				activeProviders[key] = true
 			}
 
 			path, caCertificates, credentialName, port, err := resolveRefTransport(prov, ref)
+			if err == nil && prov.Namespace == m.Namespace {
+				// A provider whose name fits only the hashed transport of other
+				// namespaces is Ready for them, but cannot name its transport here.
+				err = ValidateLocalProviderName(prov.Name)
+			}
+			if err != nil && weight <= 0 {
+				// Only ResolveAll reaches a disabled ref. It cannot be preloaded,
+				// and as Resolve never serves it, the model is not rejected for
+				// it: both resolve the same models.
+				mr.Skips = append(mr.Skips, newSkip(base, SkipWeightDisabled,
+					fmt.Sprintf("weight %d disables this ref, which cannot be preloaded: %v", weight, err)))
+				continue
+			}
 			if err != nil {
-				return nil, fmt.Errorf("resolver: model %s ref %s: %w", mref, ref.Ref.Name, err)
+				mr.Rejected = fmt.Errorf("%w: ExternalProvider %s: %w", ErrInvalidProviderRef, ref.Ref.Name, err)
+				break
 			}
 
 			// Inherited auth uses the provider-local Secret; a model override
@@ -455,8 +542,11 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 			}
 			route.Cluster = route.ServiceName()
 			mr.Routes = append(mr.Routes, route)
-			resolved++
 		}
+		if mr.Rejected != nil {
+			mr.Routes, mr.Skips = nil, nil
+		}
+		resolved += len(mr.Routes)
 		set.Models = append(set.Models, mr)
 	}
 	if resolved == 0 {
@@ -485,6 +575,41 @@ func ValidateProviderTrust(config map[string]string) error {
 		return errors.New("tls.caCertificates and tls.credentialName are mutually exclusive; set only one")
 	}
 	return nil
+}
+
+// APITranslationRequirement explains why a provider ref serves only with
+// MaasTenantConfig.spec.apiTranslation.enabled, or returns "" when it serves
+// without it. Without translation the overlay carries no provider profile, so
+// a request keeps the client's path, body model and credential header:
+// Anthropic Messages, an Azure deployment path and api-key header, and a
+// targetModel other than the name clients send all need the profile.
+// providerType is the referenced ExternalProvider's spec.provider, or "" when
+// the provider is unknown. A provider type that cannot serve the API format at
+// all needs no translation: capability validation reports it instead.
+func APITranslationRequirement(model *v1alpha1.ExternalModel, ref v1alpha1.ExternalProviderRef, providerType string) string {
+	if providerType != "" && !supportedProviderFormat(providerType, ref.APIFormat) {
+		return ""
+	}
+	switch {
+	case ref.APIFormat == "messages":
+		return "an Anthropic Messages provider is called through API translation"
+	case providerType == "azure" || providerType == "azure-openai":
+		return fmt.Sprintf("an ExternalProvider of type %s needs its deployment path and api-key header, which API translation applies", providerType)
+	case ref.TargetModel != ClientModelName(model):
+		return fmt.Sprintf("targetModel %q differs from the model name %q that clients send, and only API translation rewrites it",
+			ref.TargetModel, ClientModelName(model))
+	default:
+		return ""
+	}
+}
+
+// ClientModelName is the body model clients send: spec.modelName, defaulting
+// to the ExternalModel name.
+func ClientModelName(model *v1alpha1.ExternalModel) string {
+	if model.Spec.ModelName != "" {
+		return model.Spec.ModelName
+	}
+	return model.Name
 }
 
 func supportedProviderFormat(providerType, apiFormat string) bool {

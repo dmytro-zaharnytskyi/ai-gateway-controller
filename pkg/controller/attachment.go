@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -53,6 +54,7 @@ const (
 	reasonModelNameConflict       = "ModelNameConflict"
 	reasonTooManyProviders        = "TooManyProviders"
 	reasonInvalidName             = "InvalidName"
+	reasonInvalidProviderRef      = "InvalidProviderRef"
 	reasonTranslationDisabled     = "APITranslationDisabled"
 	reasonOverlayCapacityExceeded = "OverlayCapacityExceeded"
 	reasonAttachmentPending       = "AttachmentPending"
@@ -272,13 +274,6 @@ func (r *Reconciler) modelGateways(ctx context.Context, model *v1alpha1.External
 	return []v1alpha1.NamespacedObjectReference{gateway}, nil
 }
 
-func clientModelName(model *v1alpha1.ExternalModel) string {
-	if model.Spec.ModelName != "" {
-		return model.Spec.ModelName
-	}
-	return model.Name
-}
-
 func shortHash(parts ...string) string {
 	sum := sha256.Sum256([]byte(strings.Join(parts, "/")))
 	return hex.EncodeToString(sum[:])[:12]
@@ -396,7 +391,7 @@ func (r *Reconciler) sameNameModels(ctx context.Context, obj client.Object) []re
 	var requests []reconcile.Request
 	for i := range models.Items {
 		m := &models.Items[i]
-		if r.namespaceAllowed(m.Namespace) && clientModelName(m) == clientModelName(changed) &&
+		if r.namespaceAllowed(m.Namespace) && resolver.ClientModelName(m) == resolver.ClientModelName(changed) &&
 			(len(m.Spec.GatewayRefs) > 0 || r.mayAttachImplicitly(ctx, m)) {
 			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(m)})
 		}
@@ -935,7 +930,7 @@ func (r *Reconciler) reconcileEligibleAttachment(ctx context.Context, model *v1a
 		// The model's permitted references are served; the others are reported.
 		result.reason, result.message = reasonRefNotPermitted, self.denied
 	default:
-		if available, message := r.extProcAvailable(ctx, t.namespace, t.tenantID); !available {
+		if serving, message := r.extProcServes(ctx, model, t); !serving {
 			result.pending, result.reason, result.message = true, reasonExtProcNotReady, message
 			break
 		}
@@ -950,39 +945,46 @@ func waitingReason(reason string) bool {
 	return reason == reasonExtProcNotReady || reason == reasonAttachmentPending
 }
 
-// extProcAvailable reports whether the tenant's ExternalModel ExtProc
-// Deployment is available. Requests to the tenant's models fail until it is,
-// for example while the tenant's first model starts it. It is read live, as
-// Deployments are not cached; a failed read is waited for and rechecked, never
-// reported as the model's failure.
-func (r *Reconciler) extProcAvailable(ctx context.Context, namespace, tenantID string) (bool, string) {
-	name := tenant.PayloadProcessingExternalModelDeploymentName(tenantID)
+// extProcServes reports whether the tenant's ExternalModel ExtProc serves the
+// model: its Deployment is available and, for a model not Ready yet, its pods
+// serve the published overlay (overlayRevisionPending). Requests to the
+// tenant's models fail until it is available, for example while the tenant's
+// first model starts it. It is read live, as Deployments are not cached; a
+// failed read is waited for and rechecked, never reported as the model's
+// failure.
+func (r *Reconciler) extProcServes(ctx context.Context, model *v1alpha1.ExternalModel, t attachmentTenant) (bool, string) {
+	name := tenant.PayloadProcessingExternalModelDeploymentName(t.tenantID)
 	var reader client.Reader = r.Client
 	if r.APIReader != nil {
 		reader = r.APIReader
 	}
 	deployment := &unstructured.Unstructured{}
 	deployment.SetGroupVersionKind(deploymentGVK)
-	if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, deployment); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: t.namespace, Name: name}, deployment); err != nil {
 		if apierrors.IsNotFound(err) {
-			return false, fmt.Sprintf("waiting for the tenant ExtProc Deployment %s/%s", namespace, name)
+			return false, fmt.Sprintf("waiting for the tenant ExtProc Deployment %s/%s", t.namespace, name)
 		}
-		r.Log.Error(err, "read tenant ExtProc Deployment", "namespace", namespace, "name", name)
-		return false, fmt.Sprintf("cannot read the tenant ExtProc Deployment %s/%s yet: %v", namespace, name, err)
+		r.Log.Error(err, "read tenant ExtProc Deployment", "namespace", t.namespace, "name", name)
+		return false, fmt.Sprintf("cannot read the tenant ExtProc Deployment %s/%s yet: %v", t.namespace, name, err)
 	}
 	conditions, _, _ := unstructured.NestedSlice(deployment.Object, "status", "conditions")
-	for _, raw := range conditions {
-		if condition, ok := raw.(map[string]any); ok && condition["type"] == "Available" && condition["status"] == string(corev1.ConditionTrue) {
-			return true, ""
-		}
+	if !slices.ContainsFunc(conditions, func(raw any) bool {
+		condition, ok := raw.(map[string]any)
+		return ok && condition["type"] == "Available" && condition["status"] == string(corev1.ConditionTrue)
+	}) {
+		return false, fmt.Sprintf("waiting for the tenant ExtProc Deployment %s/%s to become available", t.namespace, name)
 	}
-	return false, fmt.Sprintf("waiting for the tenant ExtProc Deployment %s/%s to become available", namespace, name)
+	if waiting, message := r.overlayRevisionPending(ctx, model, t, deployment); waiting {
+		return false, message
+	}
+	return true, ""
 }
 
 // homeServingState explains why a model whose overlay its own tenant
 // published does not serve: the Gateway has not accepted the current
 // generation of its HTTPRoute yet or rejected it, or the tenant's ExtProc is
-// not available yet. An empty reason means it serves. The route is read live,
+// not available yet or, for a model not Ready yet, does not serve the
+// published overlay yet. An empty reason means it serves. The route is read live,
 // as after an update the cache can still hold the earlier generation and the
 // Gateway's acceptance of it. A route the Gateway has not decided on is waited
 // for; the route's events reconcile the model again.
@@ -1006,7 +1008,7 @@ func (r *Reconciler) homeServingState(ctx context.Context, model *v1alpha1.Exter
 		}
 		return reason, fmt.Sprintf("Gateway %s did not accept HTTPRoute %s: %s", gatewayKey(home.gateway), routeName, message)
 	}
-	if available, message := r.extProcAvailable(ctx, home.namespace, home.tenantID); !available {
+	if serving, message := r.extProcServes(ctx, model, home); !serving {
 		return reasonExtProcNotReady, message
 	}
 	return "", ""
@@ -1138,8 +1140,16 @@ func (r *Reconciler) withdrawnAttachmentCandidates(ctx context.Context, a attach
 		if !strings.HasPrefix(service, providerServicePrefix) || strings.HasPrefix(service, providerSelectionSinkPrefix) {
 			continue
 		}
+		if len(validation.IsDNS1035Label(service)) > 0 {
+			// A name that cannot be a Service was never created: an earlier
+			// release applied the route before its provider's transport failed
+			// on the name (RHOAIENG-103284). The rule never served, so it has
+			// nothing to drain, whether or not its candidate was published, and
+			// failing here would fail every model of the tenant with it.
+			continue
+		}
 		candidate, ok := byID[stableID]
-		if !ok || candidate.Cluster != service || candidate.Name != clientModelName(a.model) {
+		if !ok || candidate.Cluster != service || candidate.Name != resolver.ClientModelName(a.model) {
 			return nil, fmt.Errorf("cannot prove prior candidate %q belongs to attachment %s/%s and route Service %q", stableID, a.model.Namespace, a.model.Name, service)
 		}
 		withdrawn = append(withdrawn, cloneCandidate(candidate))
@@ -1257,7 +1267,7 @@ func (r *Reconciler) attachmentCandidates(ctx context.Context, t attachmentTenan
 	for _, m := range own {
 		if m.DeletionTimestamp.IsZero() {
 			// The tenant's own models always keep their model name.
-			winners[clientModelName(m)] = holder{m.Namespace, m.Namespace + "/" + m.Name}
+			winners[resolver.ClientModelName(m)] = holder{m.Namespace, m.Namespace + "/" + m.Name}
 		}
 	}
 	var models v1alpha1.ExternalModelList
@@ -1287,7 +1297,7 @@ func (r *Reconciler) attachmentCandidates(ctx context.Context, t attachmentTenan
 	candidates := make([]attachedModel, 0, len(attached))
 	for _, m := range attached {
 		candidate := attachedModel{model: m, routeName: attachmentRouteName(m, t.gateway)}
-		name := clientModelName(m)
+		name := resolver.ClientModelName(m)
 		if winner, taken := winners[name]; taken && winner.namespace != m.Namespace {
 			candidate.reason = reasonModelNameConflict
 			candidate.message = fmt.Sprintf("model name %q is served on this Gateway by ExternalModel %s", name, winner.model)
@@ -1334,21 +1344,9 @@ func (r *Reconciler) resolveAttachedModel(ctx context.Context, t attachmentTenan
 		if !providers.Items[i].DeletionTimestamp.IsZero() {
 			continue
 		}
-		// The provider's own configuration decides, not the status another
-		// writer may have left. An invalid provider is kept as Failed, so the
-		// model reports why it cannot be used rather than that it is missing.
-		// Its CA Secret is checked where this tenant's Gateway reads it.
-		checked := providers.Items[i].DeepCopy()
-		checked.Status.Phase, checked.Status.Conditions = resolver.PhaseReady, nil
-		err := r.validateProvider(ctx, checked)
-		if err == nil {
-			if err = r.validateProviderCACredential(ctx, checked, t.gateway.Namespace); transientReadError(err) {
-				return err
-			}
-		}
+		checked, err := r.checkedProvider(ctx, &providers.Items[i], t.gateway.Namespace)
 		if err != nil {
-			checked.Status.Phase = providerPhaseFailed
-			setCondition(&checked.Status.Conditions, conditionReady, metav1.ConditionFalse, reasonReconcileFailed, err.Error())
+			return err
 		}
 		providerPtrs = append(providerPtrs, checked)
 	}

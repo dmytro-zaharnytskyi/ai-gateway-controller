@@ -614,13 +614,23 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 	}
 	if validationErr != nil {
 		cleanupErr := r.cleanupProviderTransport(ctx, provider.Namespace, provider.Name)
-		if statusErr := r.updateProviderStatus(ctx, &provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error()); statusErr != nil {
+		if statusErr := r.updateProviderStatus(ctx, &provider, providerPhaseFailed, rejectionReason(validationErr), validationErr.Error()); statusErr != nil {
 			return reconcile.Result{}, statusErr
 		}
 		if cleanupErr != nil {
 			return reconcile.Result{}, cleanupErr
 		}
 		return reconcile.Result{}, nil
+	}
+	if resolver.ValidateLocalProviderName(provider.Name) != nil {
+		// The name cannot name provider-<name>, so the provider has no transport
+		// here: models in other namespaces reach it through their own hashed
+		// transport, and the models of this namespace report why they cannot.
+		// Unlike Validated, Reconciled keeps it among the tenant's provider
+		// inputs, so those models get that reason rather than a missing
+		// provider.
+		return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, resolver.PhaseReady, reasonReconciled,
+			"provider Secret reference is ready; its name is too long for transport in its own namespace, so only models in other namespaces can use it")
 	}
 
 	valid, err := r.livePraxisBeforeWrite(ctx, provider.Namespace, want)
@@ -698,7 +708,7 @@ func (r *Reconciler) reconcileAttachmentOnlyProvider(ctx context.Context, provid
 		result.RequeueAfter = 30 * time.Second
 	}
 	if validationErr != nil {
-		return result, r.updateProviderStatus(ctx, provider, providerPhaseFailed, reasonReconcileFailed, validationErr.Error())
+		return result, r.updateProviderStatus(ctx, provider, providerPhaseFailed, rejectionReason(validationErr), validationErr.Error())
 	}
 	return result, r.updateProviderStatus(ctx, provider, resolver.PhaseReady, reasonValidated, "provider Secret reference is ready; Gateway attachments apply its transport")
 }
@@ -1088,14 +1098,17 @@ func (r *Reconciler) handleHomeRouteResolutionError(
 	return reconcile.Result{}, routeErr
 }
 
-// unroutedStatus explains a model the route set leaves with no route: every
-// skipped provider reference with the resolver's message. ok is false when
-// the model has a route, or when no reference was skipped.
+// unroutedStatus explains a model the route set leaves with no route: its
+// rejection, or every skipped provider reference with the resolver's message.
+// ok is false when the model has a route, or when no reference was skipped.
 func unroutedStatus(set *resolver.ResolvedRouteSet, modelRef string) (reason, message string, ok bool) {
 	if set == nil {
 		return "", "", false
 	}
 	i := slices.IndexFunc(set.Models, func(m resolver.ModelRoutes) bool { return m.ModelRef == modelRef })
+	if i >= 0 && set.Models[i].Rejected != nil {
+		return rejectionReason(set.Models[i].Rejected), set.Models[i].Rejected.Error(), true
+	}
 	if i < 0 || len(set.Models[i].Routes) > 0 || len(set.Models[i].Skips) == 0 {
 		return "", "", false
 	}
@@ -1558,8 +1571,15 @@ func (r *Reconciler) applyRemainingHomeModels(
 	return r.gcTenantState(ctx, deleted.Namespace, excludedRoutes(attached), stateAnnotations(home.gateway, state))
 }
 
+// allRoutesExcludedByPolicy reports a set whose every model is excluded on
+// purpose: by disabled API translation, or rejected for its own provider
+// references. Neither can serve, so no last-known serving state is kept.
 func allRoutesExcludedByPolicy(set *resolver.ResolvedRouteSet) bool {
-	return set != nil && len(set.Models) > 0 && len(translationPolicyExcludedModels(set)) == len(set.Models)
+	if set == nil || len(set.Models) == 0 {
+		return false
+	}
+	excluded := translationPolicyExcludedModels(set)
+	return !slices.ContainsFunc(set.Models, func(m resolver.ModelRoutes) bool { return !excluded[m.ModelRef] && m.Rejected == nil })
 }
 
 func translationPolicyExcludedModels(set *resolver.ResolvedRouteSet) map[string]bool {
@@ -1777,6 +1797,12 @@ func (r *Reconciler) cleanupProviderTransport(ctx context.Context, namespace, pr
 // cleanupProviderTransportExcept keeps the provider Service and ServiceEntry
 // named in used.
 func (r *Reconciler) cleanupProviderTransportExcept(ctx context.Context, namespace, providerName string, used map[string]bool) error {
+	if len(validation.IsValidLabelValue(providerName)) > 0 {
+		// No object can carry this name as a label value, so there is no
+		// transport to clean up, and the API server refuses a selector on it:
+		// listing would fail the provider's reconcile on every retry.
+		return nil
+	}
 	for _, resource := range []struct {
 		group, version, kind string
 	}{
@@ -2044,7 +2070,13 @@ func (r *Reconciler) praxisTenantForNamespace(ctx context.Context, namespace str
 	return resolution.aitenant, resolution.selected, nil
 }
 
+// validateProvider validates the provider's name and spec. A name that fits
+// only the transport of other namespaces is valid: the models of its own
+// namespace that reference it report why they cannot use it.
 func (r *Reconciler) validateProvider(_ context.Context, p *v1alpha1.ExternalProvider) error {
+	if err := resolver.ValidateProviderName(p.Namespace, p.Name); err != nil {
+		return err
+	}
 	if err := validateProviderEndpoint(p.Spec.Endpoint); err != nil {
 		return err
 	}
@@ -2068,6 +2100,29 @@ func (r *Reconciler) validateProvider(_ context.Context, p *v1alpha1.ExternalPro
 		return fmt.Errorf("config %w", err)
 	}
 	return nil
+}
+
+// checkedProvider returns a copy of a provider used through a Gateway
+// attachment or from another namespace, whose status is its own validation,
+// with its CA Secret read where the Gateway in gatewayNamespace reads it, not
+// the status another writer may have left. An invalid provider is kept as
+// Failed with the reason as its Ready message, which the resolver reports on
+// the models that reference it, so they say why they cannot use it rather
+// than that it is missing. A failed Secret read is returned for retry.
+func (r *Reconciler) checkedProvider(ctx context.Context, provider *v1alpha1.ExternalProvider, gatewayNamespace string) (*v1alpha1.ExternalProvider, error) {
+	checked := provider.DeepCopy()
+	checked.Status.Phase, checked.Status.Conditions = resolver.PhaseReady, nil
+	err := r.validateProvider(ctx, checked)
+	if err == nil {
+		if err = r.validateProviderCACredential(ctx, checked, gatewayNamespace); transientReadError(err) {
+			return nil, err
+		}
+	}
+	if err != nil {
+		checked.Status.Phase = providerPhaseFailed
+		setCondition(&checked.Status.Conditions, conditionReady, metav1.ConditionFalse, reasonReconcileFailed, err.Error())
+	}
+	return checked, nil
 }
 
 // validateProviderCACredential checks the tls.credentialName Secret in the
@@ -2164,7 +2219,8 @@ func (r *Reconciler) validateResolvedRouteSet(ctx context.Context, set *resolver
 }
 
 // excludeUnsupportedModelSelection excludes every model contributing to a
-// conflicting client-visible capability. The overlay selects candidates by
+// conflicting client-visible capability, and every model the resolver
+// rejected for its own provider references. The overlay selects candidates by
 // client name, so repeated providers across model objects must not affect
 // unrelated models in the namespace. Unequal positive weights are valid and
 // render as Praxis weightedRandom.
@@ -2174,6 +2230,10 @@ func excludeUnsupportedModelSelection(set *resolver.ResolvedRouteSet) (*resolver
 	bindings := make(map[string]bool)
 	duplicateProviders := make(map[string]bool)
 	for _, model := range set.Models {
+		if model.Rejected != nil {
+			rejected[model.ModelRef] = model.Rejected
+			continue
+		}
 		if len(model.Routes) > 0 {
 			if err := validateModelName(model.Routes[0].Model); err != nil {
 				rejected[model.ModelRef] = err
@@ -2217,12 +2277,19 @@ func validateModelName(name string) error {
 	return nil
 }
 
-// rejectionReason is the status reason for a model excludeUnsupportedModelSelection rejects.
+// rejectionReason is the status reason for a model excludeUnsupportedModelSelection rejects,
+// or for a provider that fails validation. A model's reference to a provider
+// it cannot use is the model's reference error, whatever the provider's
+// cause.
 func rejectionReason(err error) string {
-	if errors.Is(err, errInvalidModelName) {
+	switch {
+	case errors.Is(err, resolver.ErrInvalidProviderRef):
+		return reasonInvalidProviderRef
+	case errors.Is(err, errInvalidModelName), errors.Is(err, resolver.ErrInvalidProviderName):
 		return reasonInvalidName
+	default:
+		return reasonReconcileFailed
 	}
-	return reasonReconcileFailed
 }
 
 func allRoutesExplicitlyWeightDisabled(set *resolver.ResolvedRouteSet) bool {

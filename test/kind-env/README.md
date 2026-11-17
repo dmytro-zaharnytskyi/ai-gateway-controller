@@ -418,7 +418,10 @@ selected-provider profile can rewrite the OpenAI Chat Completions request
 body's `model` to that provider's `ExternalProviderRef.targetModel`, even when
 the selected provider is OpenAI-compatible. The setting therefore opts into
 both API conversion and this provider-specific target-model mapping; there is
-not currently a separate switch for target-model rewriting.
+not currently a separate switch for target-model rewriting. With the setting
+omitted or false, a binding that needs the profile (such a `targetModel`, an
+`azure`/`azure-openai` provider, or Anthropic Messages) reports
+`APITranslationDisabled` (see DESIGN.md).
 
 For Anthropic candidates, the translator chooses `max_completion_tokens`
 before `max_tokens` and defaults to 4096 when both are omitted. It accepts and

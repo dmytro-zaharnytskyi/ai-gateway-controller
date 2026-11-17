@@ -245,9 +245,19 @@ func notControllerOwnedSecret(obj client.Object) bool {
 // dropping the candidate (and its Secret mount) from the rendered stack.
 // Dropping it would leave the ExtProc mounting a deleted Secret — blocking
 // new pods — until the resync interval.
+//
+// Creates of copies are admitted for the same reason in reverse: when the
+// delete above removed an attachment-only tenant's ExtProc, re-attaching the
+// model republishes a byte-identical overlay (its inert entry was never
+// dropped), so no ConfigMap event fires and the copy create is the only event
+// that renders the ExtProc again (RHOAIENG-103279). Only the ExternalModel
+// reconciler creates copies, so this never self-triggers; their updates stay
+// filtered, as they cannot change the rendered stack.
 func tenantSecretPredicate() predicate.Funcs {
 	return predicate.Funcs{
-		CreateFunc:  func(e event.CreateEvent) bool { return notControllerOwnedSecret(e.Object) },
+		CreateFunc: func(e event.CreateEvent) bool {
+			return notControllerOwnedSecret(e.Object) || e.Object.GetLabels()[LabelCredentialCopy] == "true"
+		},
 		UpdateFunc:  func(e event.UpdateEvent) bool { return notControllerOwnedSecret(e.ObjectNew) },
 		GenericFunc: func(e event.GenericEvent) bool { return notControllerOwnedSecret(e.Object) },
 		DeleteFunc:  func(event.DeleteEvent) bool { return true },
@@ -956,28 +966,46 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 		return nil, nil, fmt.Errorf("list tenant ExternalProviders: %w", err)
 	}
 	providerTypes := make(map[string]string, len(providers.Items))
+	providerPtrs := make([]*v1alpha1.ExternalProvider, 0, len(providers.Items))
 	for i := range providers.Items {
 		providerTypes[providers.Items[i].Name] = providers.Items[i].Spec.Provider
+		if providers.Items[i].DeletionTimestamp.IsZero() {
+			providerPtrs = append(providerPtrs, &providers.Items[i])
+		}
 	}
 	models, err := r.ownExternalModels(ctx, namespace, gatewayName, gatewayNamespace)
 	if err != nil {
 		return nil, nil, err
 	}
+	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models))
+	for i := range models {
+		if models[i].DeletionTimestamp.IsZero() {
+			modelPtrs = append(modelPtrs, &models[i])
+		}
+	}
+	// The model controller publishes neither a model the resolver rejects for
+	// its own provider references, nor a ref that needs disabled translation,
+	// nor a provider whose name cannot name its transport, so the overlay never
+	// contains their providers.
+	rejected := map[string]bool{}
+	if set, _ := resolver.ResolveWithAPITranslation(modelPtrs, providerPtrs, apiTranslationEnabled); set != nil {
+		for _, model := range set.Models {
+			rejected[model.ModelRef] = model.Rejected != nil
+		}
+	}
 	referenced := map[string]bool{}
 	required := map[string]bool{}
-	for i := range models {
-		if !models[i].DeletionTimestamp.IsZero() {
-			continue
-		}
-		for _, ref := range models[i].Spec.ExternalProviderRefs {
+	for _, model := range modelPtrs {
+		for _, ref := range model.Spec.ExternalProviderRefs {
 			name := ref.Ref.Name
 			// A provider in another namespace is never a same-named local one.
 			if name == "" || ref.Ref.Namespace != "" && ref.Ref.Namespace != namespace {
 				continue
 			}
 			referenced[name] = true
-			translationDisabled := !apiTranslationEnabled && ref.APIFormat == "messages" && providerTypes[name] == "anthropic"
-			if (ref.Weight == nil || *ref.Weight > 0) && !translationDisabled {
+			translationDisabled := !apiTranslationEnabled && resolver.APITranslationRequirement(model, ref, providerTypes[name]) != ""
+			if (ref.Weight == nil || *ref.Weight > 0) && !translationDisabled && !rejected[model.Namespace+"/"+model.Name] &&
+				resolver.ValidateLocalProviderName(name) == nil {
 				required[name] = true
 			}
 		}

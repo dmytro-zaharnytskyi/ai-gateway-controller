@@ -14,6 +14,11 @@ token at the provider hop. Configure the provider endpoint with HTTPS; the
 controller uses the endpoint host for TLS verification, SNI, and HTTP
 authority.
 
+Mantle receives `targetModel` only through API translation
+(`MaasTenantConfig.spec.apiTranslation.enabled: true`); without it, a binding
+whose `targetModel` differs from the client model name reports
+`APITranslationDisabled`.
+
 The OpenAI-compatible request and response bodies pass through the existing
 Praxis `openai-chat` path. JSON and SSE use the same provider binding. This
 support does not cover Bedrock Runtime's SigV4 API, `/openai/v1/chat/completions`,

@@ -92,7 +92,7 @@ func TestStagedProviderWithdrawalPublishesBeforePruningAndSurvivesRetry(t *testi
 	}
 	model = getModel(t, r, model)
 	model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, v1alpha1.ExternalProviderRef{
-		Ref: v1alpha1.ExternalProviderReference{Name: providerB.Name}, TargetModel: "gpt-b", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		Ref: v1alpha1.ExternalProviderReference{Name: providerB.Name}, TargetModel: resolver.ClientModelName(model), APIFormat: "openai-chat", Path: "/v1/chat/completions",
 	})
 	if err := r.Update(context.Background(), model); err != nil {
 		t.Fatal(err)
@@ -233,7 +233,7 @@ func TestWithdrawalKeepsSharedProviderForAnotherModel(t *testing.T) {
 	second.Finalizers = nil
 	second.Status = v1alpha1.ExternalModelStatus{}
 	second.Spec.ModelName = "second-client-model"
-	second.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{withdrawalProviderRef(providerB.Name, "gpt-b")}
+	second.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{withdrawalProviderRef(providerB.Name, resolver.ClientModelName(second))}
 	if err := r.Create(ctx, second); err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +242,7 @@ func TestWithdrawalKeepsSharedProviderForAnotherModel(t *testing.T) {
 	}
 
 	first = getModel(t, r, first)
-	first.Spec.ExternalProviderRefs = append(first.Spec.ExternalProviderRefs, withdrawalProviderRef(providerB.Name, "gpt-b"))
+	first.Spec.ExternalProviderRefs = append(first.Spec.ExternalProviderRefs, withdrawalProviderRef(providerB.Name, resolver.ClientModelName(first)))
 	if err := r.Update(ctx, first); err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +306,7 @@ func TestWithdrawalPreservesServedAttachment(t *testing.T) {
 	reconcileModel(t, r, remote)
 
 	home = getModel(t, r, home)
-	home.Spec.ExternalProviderRefs = append(home.Spec.ExternalProviderRefs, withdrawalProviderRef(providerB.Name, "gpt-b"))
+	home.Spec.ExternalProviderRefs = append(home.Spec.ExternalProviderRefs, withdrawalProviderRef(providerB.Name, resolver.ClientModelName(home)))
 	if err := r.Update(ctx, home); err != nil {
 		t.Fatal(err)
 	}
@@ -456,7 +456,7 @@ func TestRapidProviderWithdrawalAndReadditionKeepsRouteReachable(t *testing.T) {
 	r, model := reconcilerFixture(t)
 	providerB := createWithdrawalProvider(t, r, model.Namespace, "provider-b")
 	model = getModel(t, r, model)
-	model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, withdrawalProviderRef(providerB.Name, "gpt-b"))
+	model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, withdrawalProviderRef(providerB.Name, resolver.ClientModelName(model)))
 	if err := r.Update(ctx, model); err != nil {
 		t.Fatal(err)
 	}
@@ -494,7 +494,7 @@ func TestRapidProviderWithdrawalAndReadditionKeepsRouteReachable(t *testing.T) {
 	// The provider returns before the drain expires. The reconciler must publish
 	// A+B again and cancel the obsolete cleanup timer without dropping B's route.
 	model = getModel(t, r, model)
-	model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, withdrawalProviderRef(providerB.Name, "gpt-b"))
+	model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, withdrawalProviderRef(providerB.Name, resolver.ClientModelName(model)))
 	if err := r.Update(ctx, model); err != nil {
 		t.Fatal(err)
 	}
@@ -519,7 +519,7 @@ func TestDeletingModelStagesItsProviderWithdrawalUntilSiblingRuntimeDrains(t *te
 	r, deleting := reconcilerFixture(t)
 	providerB := createWithdrawalProvider(t, r, deleting.Namespace, "provider-b")
 	deleting = getModel(t, r, deleting)
-	deleting.Spec.ExternalProviderRefs = append(deleting.Spec.ExternalProviderRefs, withdrawalProviderRef(providerB.Name, "gpt-b"))
+	deleting.Spec.ExternalProviderRefs = append(deleting.Spec.ExternalProviderRefs, withdrawalProviderRef(providerB.Name, resolver.ClientModelName(deleting)))
 	if err := r.Update(ctx, deleting); err != nil {
 		t.Fatal(err)
 	}
@@ -532,6 +532,7 @@ func TestDeletingModelStagesItsProviderWithdrawalUntilSiblingRuntimeDrains(t *te
 	sibling.Status = v1alpha1.ExternalModelStatus{}
 	sibling.Spec.ModelName = "sibling-client-model"
 	sibling.Spec.ExternalProviderRefs = sibling.Spec.ExternalProviderRefs[:1]
+	sibling.Spec.ExternalProviderRefs[0].TargetModel = sibling.Spec.ModelName
 	if err := r.Create(ctx, sibling); err != nil {
 		t.Fatal(err)
 	}
@@ -729,7 +730,7 @@ func TestGatewayRebindStagesProviderWithdrawalUntilHomeRuntimeDrains(t *testing.
 	reconcileModel(t, r, sibling)
 
 	model = getModel(t, r, model)
-	model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, withdrawalProviderRef(providerB.Name, "gpt-b"))
+	model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, withdrawalProviderRef(providerB.Name, resolver.ClientModelName(model)))
 	if err := r.Update(ctx, model); err != nil {
 		t.Fatal(err)
 	}
@@ -1009,7 +1010,7 @@ func TestWithdrawalReconciliationErrorKeepsRouteAndRetryResumes(t *testing.T) {
 	}
 	model = getModel(t, r, model)
 	model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, v1alpha1.ExternalProviderRef{
-		Ref: v1alpha1.ExternalProviderReference{Name: providerB.Name}, TargetModel: "gpt-b", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		Ref: v1alpha1.ExternalProviderReference{Name: providerB.Name}, TargetModel: resolver.ClientModelName(model), APIFormat: "openai-chat", Path: "/v1/chat/completions",
 	})
 	if err := r.Update(context.Background(), model); err != nil {
 		t.Fatal(err)
@@ -1051,7 +1052,7 @@ func TestProviderDeletionWaitsForTenantOwnedWithdrawalRoute(t *testing.T) {
 	r, model := reconcilerFixture(t)
 	provider := createWithdrawalProvider(t, r, model.Namespace, "provider-b")
 	model = getModel(t, r, model)
-	model.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{withdrawalProviderRef(provider.Name, "gpt-b")}
+	model.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{withdrawalProviderRef(provider.Name, resolver.ClientModelName(model))}
 	if err := r.Update(context.Background(), model); err != nil {
 		t.Fatal(err)
 	}
@@ -1096,7 +1097,7 @@ func TestProviderDeletionWaitsForTenantOwnedWithdrawalRoute(t *testing.T) {
 	// starts safe staged withdrawal; the provider finalizer remains until the
 	// serving revision and request drain have completed.
 	model = getModel(t, r, model)
-	model.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{withdrawalProviderRef("provider", "gpt-a")}
+	model.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{withdrawalProviderRef("provider", resolver.ClientModelName(model))}
 	if err := r.Update(context.Background(), model); err != nil {
 		t.Fatal(err)
 	}
@@ -1565,7 +1566,7 @@ func TestDeletingHomeBindingRetainsRuntimeProfileThroughDrain(t *testing.T) {
 			r, model := reconcilerFixture(t)
 			providerB := createWithdrawalProvider(t, r, model.Namespace, "provider-b")
 			sibling := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "sibling", Namespace: model.Namespace, UID: "sibling-uid"},
-				Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{withdrawalProviderRef(providerB.Name, "sibling-target")}}}
+				Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{withdrawalProviderRef(providerB.Name, "sibling")}}}
 			if err := r.Create(ctx, sibling); err != nil {
 				t.Fatal(err)
 			}

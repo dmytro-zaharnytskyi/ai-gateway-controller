@@ -18,6 +18,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -50,13 +52,18 @@ func attachmentProvider(namespace string) (*v1alpha1.ExternalProvider, *corev1.S
 	return provider, secret
 }
 
+// attachmentModel targets the client model name, which needs no API translation.
 func attachmentModel(name, namespace, modelName string, created time.Time, gateways ...v1alpha1.NamespacedObjectReference) *v1alpha1.ExternalModel {
+	target := modelName
+	if target == "" {
+		target = name
+	}
 	return &v1alpha1.ExternalModel{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, UID: types.UID("uid-" + namespace + "-" + name), CreationTimestamp: metav1.NewTime(created)},
 		Spec: v1alpha1.ExternalModelSpec{
 			ModelName: modelName,
 			ExternalProviderRefs: []v1alpha1.ExternalProviderRef{{
-				Ref: v1alpha1.ExternalProviderReference{Name: "openai"}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+				Ref: v1alpha1.ExternalProviderReference{Name: "openai"}, TargetModel: target, APIFormat: "openai-chat", Path: "/v1/chat/completions",
 			}},
 			GatewayRefs: gateways,
 		},
@@ -1103,7 +1110,7 @@ func TestTooManyProvidersExcludesOnlyThatModel(t *testing.T) {
 			objects = append(objects, secret)
 		}
 		model.Spec.ExternalProviderRefs = append(model.Spec.ExternalProviderRefs, v1alpha1.ExternalProviderRef{
-			Ref: v1alpha1.ExternalProviderReference{Name: name}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+			Ref: v1alpha1.ExternalProviderReference{Name: name}, TargetModel: "wide-model", APIFormat: "openai-chat", Path: "/v1/chat/completions",
 		})
 	}
 	r := attachmentReconciler(t, append(objects, model)...)
@@ -2300,6 +2307,8 @@ func TestServedAzureAttachmentStampsCredentialHeaderAnnotation(t *testing.T) {
 	}
 	objects := append([]client.Object{provider, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
 	r := attachmentReconciler(t, objects...)
+	// An Azure provider is served only through API translation.
+	setControllerTranslationEnabled(t, r, "tenant-b", true)
 	reconcileModel(t, r, model)
 	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
 	reconcileModel(t, r, model)
@@ -2349,6 +2358,8 @@ func TestSharedSecretWithDivergentHeadersGetsDistinctCopies(t *testing.T) {
 	}
 	objects := append([]client.Object{azure, openai, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
 	r := attachmentReconciler(t, objects...)
+	// An Azure provider is served only through API translation.
+	setControllerTranslationEnabled(t, r, "tenant-b", true)
 	reconcileModel(t, r, model)
 	setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
 	reconcileModel(t, r, model)
@@ -2403,6 +2414,8 @@ func TestCrossNamespaceAzureOverrideSecretGetsHeaderedCopy(t *testing.T) {
 	objects := append([]client.Object{azure, modelSecret, model, referenceGrant("shared", "tenant-b", "azure")},
 		attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
 	r := attachmentReconciler(t, objects...)
+	// An Azure provider is served only through API translation.
+	setControllerTranslationEnabled(t, r, "tenant-b", true)
 	reconcileModel(t, r, model)
 
 	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
@@ -2633,7 +2646,7 @@ func TestAttachmentKeepsTenantSelectionPolicy(t *testing.T) {
 	// The tenant's own model spreads traffic over two equal-weight providers.
 	ownModel := attachmentModel("own", "tenant-b", "own-model", time.Unix(300, 0))
 	ownModel.Spec.ExternalProviderRefs = append(ownModel.Spec.ExternalProviderRefs, v1alpha1.ExternalProviderRef{
-		Ref: v1alpha1.ExternalProviderReference{Name: tenantAlt.Name}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions",
+		Ref: v1alpha1.ExternalProviderReference{Name: tenantAlt.Name}, TargetModel: "own-model", APIFormat: "openai-chat", Path: "/v1/chat/completions",
 	})
 	provider, secret := attachmentProvider("team")
 	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
@@ -2848,8 +2861,8 @@ func TestAttachedModelReportsWhyNoProviderResolved(t *testing.T) {
 	}
 	got := getModel(t, r, model)
 	got.Spec.ExternalProviderRefs = []v1alpha1.ExternalProviderRef{
-		{Ref: v1alpha1.ExternalProviderReference{Name: "ghost"}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
-		{Ref: v1alpha1.ExternalProviderReference{Name: "plain"}, TargetModel: "gpt-4o", APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+		{Ref: v1alpha1.ExternalProviderReference{Name: "ghost"}, TargetModel: resolver.ClientModelName(got), APIFormat: "openai-chat", Path: "/v1/chat/completions"},
+		{Ref: v1alpha1.ExternalProviderReference{Name: "plain"}, TargetModel: resolver.ClientModelName(got), APIFormat: "openai-chat", Path: "/v1/chat/completions"},
 	}
 	if err := r.Update(context.Background(), got); err != nil {
 		t.Fatal(err)
@@ -3492,5 +3505,140 @@ func TestStandaloneProviderProtectionIncludesForeignAttachmentRoutes(t *testing.
 	}
 	if !controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
 		t.Fatal("active foreign attachment lost protection")
+	}
+}
+
+// apiServerApply applies a resource as the API server admits it: the fake
+// client stores a name or label the API server rejects.
+func apiServerApply(ctx context.Context, c client.Client, obj unstructured.Unstructured) error {
+	problems := validation.IsDNS1123Subdomain(obj.GetName())
+	if obj.GetKind() == "Service" {
+		problems = validation.IsDNS1035Label(obj.GetName())
+	}
+	for _, value := range obj.GetLabels() {
+		problems = append(problems, validation.IsValidLabelValue(value)...)
+	}
+	if len(problems) > 0 {
+		return apierrors.NewInvalid(obj.GroupVersionKind().GroupKind(), obj.GetName(),
+			field.ErrorList{field.Invalid(field.NewPath("metadata"), obj.GetName(), strings.Join(problems, "; "))})
+	}
+	return render.Apply(ctx, c, []unstructured.Unstructured{obj})
+}
+
+// Through a Gateway attachment, the model and provider reconciles of a
+// provider name that cannot name its transport used to fail on the API
+// server's rejection while each changed what the other watches; both settle
+// (RHOAIENG-103284).
+func TestUnrenderableProviderNameSettlesAttachment(t *testing.T) {
+	ctx := context.Background()
+	provider, secret := attachmentProvider("team")
+	provider.Name = strings.Repeat("p", 250)
+	model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+	model.Spec.ExternalProviderRefs[0].Ref.Name = provider.Name
+	objects := append([]client.Object{provider, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)
+	r := controllerTestClient(t, objects...)
+	r.Network, r.ApplyResource = "external-model", apiServerApply
+
+	var versions []string
+	for range 3 {
+		if _, err := r.ReconcileProvider(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(provider)}); err != nil {
+			t.Fatalf("provider reconcile: %v", err)
+		}
+		if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}); err != nil {
+			t.Fatalf("model reconcile: %v", err)
+		}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(provider), provider); err != nil {
+			t.Fatal(err)
+		}
+		versions = append(versions, provider.ResourceVersion+"/"+getModel(t, r, model).ResourceVersion)
+	}
+	if versions[1] != versions[0] || versions[2] != versions[0] {
+		t.Fatalf("provider/model resource versions per round = %v; each reconcile changes what the other watches", versions)
+	}
+	if controllerutil.ContainsFinalizer(provider, externalProviderFinalizer) {
+		t.Fatal("an unusable provider was claimed for an attachment")
+	}
+	if ready := apiMeta.FindStatusCondition(provider.Status.Conditions, conditionReady); provider.Status.Phase != providerPhaseFailed ||
+		ready == nil || ready.Reason != reasonInvalidName || !strings.Contains(ready.Message, "at most 63 lowercase letters") {
+		t.Fatalf("provider status = %#v, want Failed with InvalidName and what to change", provider.Status)
+	}
+	got := getModel(t, r, model)
+	result := gatewayResult(t, got, gatewayB)
+	if got.Status.Phase != modelPhaseFailed || readyReason(got) != reasonProviderNotReady ||
+		!strings.Contains(result.Conditions[0].Message, "cannot name its transport Service") {
+		t.Fatalf("model status = %#v, want ProviderNotReady explaining the provider name", got.Status)
+	}
+	if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB)); !apierrors.IsNotFound(err) {
+		t.Fatalf("attachment HTTPRoute for the unusable provider: %v", err)
+	}
+}
+
+// Through a Gateway attachment, a model reports on that Gateway why it is
+// excluded: its own invalid provider references (RHOAIENG-103278), or a ref
+// that needs API translation the tenant does not enable (RHOAIENG-103276).
+func TestAttachedModelReportsItsExclusion(t *testing.T) {
+	for name, tc := range map[string]struct {
+		configure       func(*v1alpha1.ExternalModel)
+		reason, message string
+	}{
+		"invalid provider refs": {func(m *v1alpha1.ExternalModel) {
+			m.Spec.ExternalProviderRefs = append(m.Spec.ExternalProviderRefs, m.Spec.ExternalProviderRefs[0])
+		}, reasonInvalidProviderRef, "multiple active references to ExternalProvider team/openai"},
+		"renamed target": {func(m *v1alpha1.ExternalModel) { m.Spec.ExternalProviderRefs[0].TargetModel = "gpt-4o" },
+			reasonTranslationDisabled, `MaasTenantConfig.spec.apiTranslation.enabled must be true: targetModel "gpt-4o"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			provider, secret := attachmentProvider("team")
+			model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+			tc.configure(model)
+			r := attachmentReconciler(t, append([]client.Object{provider, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)...)
+			reconcileModel(t, r, model)
+			got := getModel(t, r, model)
+			result := apiMeta.FindStatusCondition(gatewayResult(t, got, gatewayB).Conditions, conditionReady)
+			if got.Status.Phase != modelPhaseFailed || readyReason(got) != tc.reason || result == nil || result.Reason != tc.reason || !strings.Contains(result.Message, tc.message) {
+				t.Fatalf("status = %#v, want %s on the attachment", got.Status, tc.reason)
+			}
+			if _, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB)); !apierrors.IsNotFound(err) {
+				t.Fatalf("attachment HTTPRoute: %v", err)
+			}
+		})
+	}
+}
+
+// An earlier release applied an attachment's HTTPRoute before its provider
+// Service, so a provider name the API server rejects left an accepted rule
+// naming a Service that never existed. That rule has nothing to drain, so it
+// must not fail the withdrawal check that every model of the tenant runs
+// (RHOAIENG-103284); a rule whose Service could exist still cannot be
+// withdrawn unproven.
+func TestNeverServedAttachmentRuleDoesNotBlockTenant(t *testing.T) {
+	for service, wantErr := range map[string]string{"provider-p.dot": "", "provider-p-valid": "cannot prove prior candidate"} {
+		t.Run(service, func(t *testing.T) {
+			provider, secret := attachmentProvider("team")
+			model := attachmentModel("chat", "team", "chat-model", time.Unix(100, 0), gatewayB)
+			r := attachmentReconciler(t, append([]client.Object{provider, secret, model}, attachmentTenantObjects("tenant-b", "tenant-b", gatewayB, "praxis")...)...)
+			reconcileModel(t, r, model)
+			setRouteParentStatus(t, r, model, gatewayB, metav1.ConditionTrue, "Accepted")
+			route, err := getUnstructured(r, httpRouteGVK, "team", attachmentRouteName(model, gatewayB))
+			if err != nil {
+				t.Fatal(err)
+			}
+			rules, _, _ := unstructured.NestedSlice(route.Object, "spec", "rules")
+			leftover := map[string]any{
+				"matches": []any{map[string]any{"headers": []any{map[string]any{
+					"name": selectedProviderHeader, "type": "Exact", "value": "team/chat/team/" + strings.TrimPrefix(service, "provider-")}}}},
+				"backendRefs": []any{map[string]any{"name": service, "port": int64(443)}},
+			}
+			if err := unstructured.SetNestedSlice(route.Object, append(rules, leftover), "spec", "rules"); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Update(context.Background(), route); err != nil {
+				t.Fatal(err)
+			}
+			_, err = r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)})
+			if wantErr == "" && err != nil || wantErr != "" && (err == nil || !strings.Contains(err.Error(), wantErr)) {
+				t.Fatalf("reconcile beside a leftover rule for %s = %v, want %q", service, err, wantErr)
+			}
+		})
 	}
 }

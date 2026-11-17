@@ -37,7 +37,7 @@ func TestControlPlane(t *testing.T) {
 		// When a user adds a model using that provider.
 		model := externalModel("model", namespace,
 			withModelName("chat"),
-			withProviderModel(provider.Name, "provider-model"),
+			withProviderModel(provider.Name, "chat"),
 		)
 		require.NoError(t, c.Create(t.Context(), model))
 
@@ -59,7 +59,7 @@ func TestControlPlane(t *testing.T) {
 		provider := createProvider(t, c, namespace)
 		model := externalModel("model", namespace,
 			withModelName("chat"),
-			withProviderModel(provider.Name, "provider-model"),
+			withProviderModel(provider.Name, "chat"),
 		)
 		require.NoError(t, c.Create(t.Context(), model))
 		awaitModelPublished(t, c, model, provider)
@@ -76,7 +76,7 @@ func TestControlPlane(t *testing.T) {
 		provider := createProvider(t, c, namespace)
 		model := externalModel("model", namespace,
 			withModelName("chat"),
-			withProviderModel(provider.Name, "provider-model"),
+			withProviderModel(provider.Name, "chat"),
 		)
 		require.NoError(t, c.Create(t.Context(), model))
 		routeName := awaitModelPublished(t, c, model, provider)
@@ -105,7 +105,7 @@ func TestModelNamesAreRenderedPerModel(t *testing.T) {
 	// one whose name has a dot, so it is not a valid Service name.
 	long := externalModel(strings.Repeat("m", 64), namespace,
 		withModelName("long"),
-		withProviderModel(provider.Name, "provider-model"),
+		withProviderModel(provider.Name, "long"),
 	)
 	require.NoError(t, c.Create(t.Context(), long))
 	model := externalModel("gpt-4.1", namespace,
