@@ -5056,21 +5056,98 @@ func TestInvalidProviderRefsExcludeOnlyThatModel(t *testing.T) {
 	assertRejected("alone")
 }
 
+// A Ready model edited to reject its own provider references stops serving.
+// Alone in its namespace, its route and candidate are withdrawn at once, as
+// for disabled translation; beside a sibling, the overlay is republished
+// without it and its route is withdrawn once the ExtProc has drained, while
+// the sibling stays published (RHOAIENG-103278).
+func TestRejectedHomeModelWithdrawsItsServingState(t *testing.T) {
+	for _, withSibling := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sibling=%t", withSibling), func(t *testing.T) {
+			ctx := context.Background()
+			r, model := reconcilerFixture(t)
+			request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(model)}
+			sibling := homeSibling(model, "sibling")
+			if withSibling {
+				if err := r.Create(ctx, sibling); err != nil {
+					t.Fatal(err)
+				}
+				reconcileModel(t, r, sibling)
+			}
+			reconcileModel(t, r, model)
+			if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+				t.Fatalf("model before the edit = %#v, want Ready", got.Status)
+			}
+			edited := getModel(t, r, model)
+			edited.Spec.ExternalProviderRefs = append(edited.Spec.ExternalProviderRefs, edited.Spec.ExternalProviderRefs[0])
+			if err := r.Update(ctx, edited); err != nil {
+				t.Fatal(err)
+			}
+
+			if withSibling {
+				result, err := r.Reconcile(ctx, request)
+				if err != nil || result.RequeueAfter <= 0 {
+					t.Fatalf("stage the rejected model's withdrawal: result=%#v err=%v", result, err)
+				}
+				if got := overlayEnvelope(t, r, model.Namespace).Overlay.Candidates; len(got) != 1 || got[0].StableID != envelope.CandidateStableID(sibling.Name, "provider") {
+					t.Fatalf("overlay candidates = %#v, want the sibling only", got)
+				}
+				seedSafeExternalModelRuntime(t, r, "tenant", model.Namespace, []*v1alpha1.ExternalModel{getModel(t, r, sibling)})
+				if result, err := r.Reconcile(ctx, request); err != nil || result.RequeueAfter != withdrawalDrainDuration {
+					t.Fatalf("start the request drain: result=%#v err=%v", result, err)
+				}
+				markWithdrawalDrainElapsed(t, r, model.Namespace)
+				if _, err := r.Reconcile(ctx, request); !errors.Is(err, resolver.ErrInvalidProviderRef) {
+					t.Fatalf("finish the withdrawal = %v, want %v", err, resolver.ErrInvalidProviderRef)
+				}
+				if got := getModel(t, r, sibling); got.Status.Phase != resolver.PhaseReady {
+					t.Fatalf("sibling = %#v, want Ready", got.Status)
+				}
+				if _, err := getUnstructured(r, httpRouteGVK, sibling.Namespace, modelRouteName(sibling.Name)); err != nil {
+					t.Fatalf("sibling HTTPRoute: %v", err)
+				}
+			} else {
+				if _, err := r.Reconcile(ctx, request); !errors.Is(err, resolver.ErrNoRoutes) {
+					t.Fatalf("reconcile of the lone rejected model = %v, want %v", err, resolver.ErrNoRoutes)
+				}
+				if err := r.Get(ctx, client.ObjectKey{Namespace: model.Namespace, Name: "routing-overlay"}, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+					t.Fatalf("routing overlay of the lone rejected model = %v, want NotFound", err)
+				}
+			}
+			if got := getModel(t, r, model); got.Status.Phase != modelPhaseFailed || readyReason(got) != reasonInvalidProviderRef {
+				t.Fatalf("rejected model = %#v, want Failed with %s", got.Status, reasonInvalidProviderRef)
+			}
+			if _, err := getUnstructured(r, httpRouteGVK, model.Namespace, modelRouteName(model.Name)); !apierrors.IsNotFound(err) {
+				t.Fatalf("rejected model HTTPRoute = %v, want NotFound", err)
+			}
+		})
+	}
+}
+
 // A provider name that no namespace can use fails the provider before anything
 // is applied. A name too long only for provider-<name> leaves the provider
 // Ready, without transport here, and rejects the models of its own namespace
 // that reference it. Either way the rest of the namespace is served
 // (RHOAIENG-103284).
 func TestUnrenderableProviderNameFailsOnlyItsModels(t *testing.T) {
+	long := strings.Repeat("p", resolver.MaxLocalProviderNameLength+1)
+	// The hashed Service name of other namespaces truncates this dot away.
+	dottedLate := strings.Repeat("p", 45) + ".prod"
 	for _, tc := range []struct {
 		provider                      string
 		providerPhase, providerReason string
+		providerMessage               string
 		modelReason, modelMessage     string
 	}{
 		{provider: "openai.prod", providerPhase: providerPhaseFailed, providerReason: reasonInvalidName,
-			modelReason: reasonProviderNotReady, modelMessage: "cannot name its transport Service"},
-		{provider: strings.Repeat("p", resolver.MaxLocalProviderNameLength+1), providerPhase: resolver.PhaseReady, providerReason: reasonReconciled,
-			modelReason: reasonInvalidProviderRef, modelMessage: "only models in other namespaces can use it"},
+			providerMessage: "cannot name its transport Service",
+			modelReason:     reasonProviderNotReady, modelMessage: "cannot name its transport Service"},
+		{provider: long, providerPhase: resolver.PhaseReady, providerReason: reasonReconciled,
+			providerMessage: `cannot name its transport Service "provider-` + long + `" in its own namespace (must be no more than 63 characters)`,
+			modelReason:     reasonInvalidProviderRef, modelMessage: "only models in other namespaces can use it"},
+		{provider: dottedLate, providerPhase: resolver.PhaseReady, providerReason: reasonReconciled,
+			providerMessage: `cannot name its transport Service "provider-` + dottedLate + `" in its own namespace (a DNS-1035 label must consist of`,
+			modelReason:     reasonInvalidProviderRef, modelMessage: "only models in other namespaces can use it"},
 	} {
 		t.Run(tc.provider, func(t *testing.T) {
 			ctx := context.Background()
@@ -5094,8 +5171,9 @@ func TestUnrenderableProviderNameFailsOnlyItsModels(t *testing.T) {
 			if err := r.Get(ctx, client.ObjectKeyFromObject(bad), bad); err != nil {
 				t.Fatal(err)
 			}
-			if ready := apiMeta.FindStatusCondition(bad.Status.Conditions, conditionReady); bad.Status.Phase != tc.providerPhase || ready == nil || ready.Reason != tc.providerReason {
-				t.Fatalf("provider status = %#v, want %s with %s", bad.Status, tc.providerPhase, tc.providerReason)
+			if ready := apiMeta.FindStatusCondition(bad.Status.Conditions, conditionReady); bad.Status.Phase != tc.providerPhase || ready == nil ||
+				ready.Reason != tc.providerReason || !strings.Contains(ready.Message, tc.providerMessage) {
+				t.Fatalf("provider status = %#v, want %s with %s saying %q", bad.Status, tc.providerPhase, tc.providerReason, tc.providerMessage)
 			}
 			if _, err := getUnstructured(r, serviceGVK, model.Namespace, "provider-"+tc.provider); !apierrors.IsNotFound(err) {
 				t.Fatalf("transport of the unrenderable provider: %v", err)

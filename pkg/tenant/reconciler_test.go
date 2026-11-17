@@ -1675,3 +1675,48 @@ func TestRequiredProvidersAgreeWithPublishedOverlay(t *testing.T) {
 		}
 	}
 }
+
+// A model rejected for its references to a provider of another namespace,
+// which only the model controller resolves, has its local provider required
+// only until it reports InvalidProviderRef for its current generation, at the
+// tenant's Gateway when it names it (RHOAIENG-103278). Otherwise the tenant
+// would wait for an overlay that never contains that provider.
+func TestRequiredProvidersSkipModelRejectedForForeignProvider(t *testing.T) {
+	const namespace = "tenant-ns"
+	gateway := v1alpha1.NamespacedObjectReference{Name: "gateway", Namespace: "gateway-system"}
+	local := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: namespace},
+		Spec:   v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "provider.example.com", Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "key"}}},
+		Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady}}
+	ref := func(provider, providerNamespace string) v1alpha1.ExternalProviderRef {
+		return v1alpha1.ExternalProviderRef{Ref: v1alpha1.ExternalProviderReference{Name: provider, Namespace: providerNamespace},
+			TargetModel: "chat", APIFormat: "openai-chat", Path: "/v1/chat/completions"}
+	}
+	ready := func(reason string) []metav1.Condition {
+		return []metav1.Condition{{Type: "Ready", Status: metav1.ConditionFalse, Reason: reason, Message: "reported", LastTransitionTime: metav1.Now()}}
+	}
+	for _, tc := range []struct {
+		name     string
+		status   v1alpha1.ExternalModelStatus
+		gateways []v1alpha1.NamespacedObjectReference
+		want     []string
+	}{
+		{name: "rejected at the current generation", status: v1alpha1.ExternalModelStatus{ObservedGeneration: 2, Conditions: ready("InvalidProviderRef")}},
+		{name: "rejected at an earlier generation", status: v1alpha1.ExternalModelStatus{ObservedGeneration: 1, Conditions: ready("InvalidProviderRef")}, want: []string{"local"}},
+		{name: "not Ready for another reason", status: v1alpha1.ExternalModelStatus{ObservedGeneration: 2, Conditions: ready("ProviderNotReady")}, want: []string{"local"}},
+		{name: "rejected at the tenant's Gateway", gateways: []v1alpha1.NamespacedObjectReference{{Name: "other", Namespace: "other-system"}, gateway},
+			status: v1alpha1.ExternalModelStatus{ObservedGeneration: 2, Conditions: ready("TenantNotSteady"), Gateways: []v1alpha1.ExternalModelGatewayStatus{
+				{NamespacedObjectReference: gateway, Conditions: ready("InvalidProviderRef")}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: namespace, Generation: 2},
+				Spec: v1alpha1.ExternalModelSpec{GatewayRefs: tc.gateways,
+					ExternalProviderRefs: []v1alpha1.ExternalProviderRef{ref("local", ""), ref("shared", "providers"), ref("shared", "providers")}},
+				Status: tc.status}
+			r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(local, model).Build()}
+			_, required, err := r.providersForTenant(context.Background(), namespace, gateway.Name, gateway.Namespace, false)
+			if got := slices.Sorted(maps.Keys(required)); err != nil || !slices.Equal(got, tc.want) {
+				t.Fatalf("required providers = %v (%v), want %v", got, err, tc.want)
+			}
+		})
+	}
+}

@@ -622,15 +622,17 @@ func (r *Reconciler) ReconcileProvider(ctx context.Context, req reconcile.Reques
 		}
 		return reconcile.Result{}, nil
 	}
-	if resolver.ValidateLocalProviderName(provider.Name) != nil {
+	if localErr := resolver.ValidateLocalProviderName(provider.Name); localErr != nil {
 		// The name cannot name provider-<name>, so the provider has no transport
 		// here: models in other namespaces reach it through their own hashed
 		// transport, and the models of this namespace report why they cannot.
 		// Unlike Validated, Reconciled keeps it among the tenant's provider
 		// inputs, so those models get that reason rather than a missing
-		// provider.
+		// provider. The error names the cause: the length, or a dot that the
+		// hashed name truncates away. Its "cannot be rendered" prefix is dropped:
+		// the provider is Ready for the other namespaces.
 		return reconcile.Result{}, r.updateProviderStatus(ctx, &provider, resolver.PhaseReady, reasonReconciled,
-			"provider Secret reference is ready; its name is too long for transport in its own namespace, so only models in other namespaces can use it")
+			"provider Secret reference is ready; "+strings.TrimPrefix(localErr.Error(), resolver.ErrInvalidProviderName.Error()+": "))
 	}
 
 	valid, err := r.livePraxisBeforeWrite(ctx, provider.Namespace, want)
@@ -808,6 +810,7 @@ type homeModelPublication struct {
 	result            publisher.Result
 	namespace         string
 	gateway           v1alpha1.NamespacedObjectReference
+	rejection         error
 	denied            string
 	unserved          string
 	weightDisabled    bool
@@ -871,7 +874,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	if err != nil {
 		return r.handleHomeRouteResolutionError(ctx, req.Namespace, modelTenant, set, model.Name, string(model.UID), err, report)
 	}
-	set, err = r.validateModelRouteSet(ctx, set, modelOwners, model, report)
+	set, rejection, err := r.validateModelRouteSet(ctx, set, modelOwners, model, report)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -908,6 +911,9 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 		reason, message := reasonNoRoutes, "no ExternalModel provider references resolved to a Ready provider"
 		if denial := denied[req.String()]; denial != "" {
 			reason, message = reasonRefNotPermitted, denial
+		}
+		if rejection != nil {
+			reason, message = rejectionReason(rejection), rejection.Error()
 		}
 		if statusErr := report(false, reason, message, nil); statusErr != nil {
 			return reconcile.Result{}, statusErr
@@ -970,7 +976,7 @@ func (r *Reconciler) reconcileHomeModel(ctx context.Context, req reconcile.Reque
 	servingReason, servingMessage := r.homeServingState(ctx, model, home)
 	return r.finishHomeModelPublication(ctx, homeModelPublication{
 		result: result, namespace: req.Namespace,
-		gateway: home.gateway, denied: denied[req.String()],
+		gateway: home.gateway, rejection: rejection, denied: denied[req.String()],
 		unserved:       unserved[req.String()],
 		weightDisabled: explicitlyWeightDisabledModels(set)[req.String()],
 		unroutedReason: unroutedReason, unroutedMessage: unroutedMessage,
@@ -1003,6 +1009,8 @@ func (r *Reconciler) finishHomeModelPublication(ctx context.Context, publication
 	var statusErr error
 	var waiting time.Duration
 	switch {
+	case publication.rejection != nil:
+		statusErr = publication.report(false, rejectionReason(publication.rejection), publication.rejection.Error(), nil)
 	case publication.weightDisabled:
 		statusErr = publication.report(false, reasonNoRoutes, "all ExternalModel provider references are explicitly disabled by weight", nil)
 	case publication.denied != "":
@@ -1040,6 +1048,11 @@ func (r *Reconciler) finishHomeModelPublication(ctx context.Context, publication
 	if statusErr != nil {
 		return reconcile.Result{}, statusErr
 	}
+	if publication.rejection != nil {
+		// Once its withdrawal has drained, a rejected model returns its
+		// rejection, as before; until then the drain sets the requeue above.
+		return reconcile.Result{}, publication.rejection
+	}
 	return reconcile.Result{RequeueAfter: waiting}, nil
 }
 
@@ -1062,15 +1075,20 @@ func (r *Reconciler) handleHomeRouteResolutionError(
 		}
 		excluded := translationPolicyExcludedModels(set)
 		disabledByWeight := explicitlyWeightDisabledModels(set)
+		if disabledByWeight[namespace+"/"+modelName] {
+			reason = reasonNoRoutes
+		} else if excluded[namespace+"/"+modelName] {
+			reason = reasonTranslationDisabled
+		}
 		for modelRef := range disabledByWeight {
 			excluded[modelRef] = true
 		}
+		// A model rejected for its own provider references cannot serve either,
+		// so its earlier route and candidate are withdrawn too.
+		for modelRef := range rejectedModels(set) {
+			excluded[modelRef] = true
+		}
 		if len(excluded) > 0 {
-			if disabledByWeight[namespace+"/"+modelName] {
-				reason = reasonNoRoutes
-			} else if excluded[namespace+"/"+modelName] {
-				reason = reasonTranslationDisabled
-			}
 			valid, err := r.livePraxisBeforeWrite(ctx, namespace, modelTenant)
 			if err != nil {
 				return reconcile.Result{}, err
@@ -1605,10 +1623,26 @@ func translationPolicyExcludedModels(set *resolver.ResolvedRouteSet) map[string]
 	return excluded
 }
 
+// rejectedModels returns the models the resolver rejected for their own
+// provider references.
+func rejectedModels(set *resolver.ResolvedRouteSet) map[string]bool {
+	rejected := make(map[string]bool)
+	if set == nil {
+		return rejected
+	}
+	for _, model := range set.Models {
+		if model.Rejected != nil {
+			rejected[model.ModelRef] = true
+		}
+	}
+	return rejected
+}
+
 // cleanupExcludedHomeModels removes only candidates made ineligible by an
 // explicit model-local policy, such as disabled API translation or an
-// all-zero provider weight. Other models with provider/readiness errors keep
-// their last-known route patches and overlay candidates.
+// all-zero provider weight, or by the model's own invalid provider
+// references. Other models with provider/readiness errors keep their
+// last-known route patches and overlay candidates.
 func (r *Reconciler) cleanupExcludedHomeModels(
 	ctx context.Context,
 	home attachmentTenant,
@@ -2320,8 +2354,13 @@ func explicitlyWeightDisabledModels(set *resolver.ResolvedRouteSet) map[string]b
 	return disabled
 }
 
+// validateModelRouteSet reports the models excludeUnsupportedModelSelection
+// rejects and returns the set without them, with the current model's own
+// rejection. The caller publishes that set even when the current model is
+// rejected, so its earlier route and candidate are withdrawn as for any other
+// rejected model.
 func (r *Reconciler) validateModelRouteSet(ctx context.Context, set *resolver.ResolvedRouteSet,
-	owners map[string]*v1alpha1.ExternalModel, current *v1alpha1.ExternalModel, report modelStatusReporter) (*resolver.ResolvedRouteSet, error) {
+	owners map[string]*v1alpha1.ExternalModel, current *v1alpha1.ExternalModel, report modelStatusReporter) (*resolver.ResolvedRouteSet, error, error) {
 	valid, rejected := excludeUnsupportedModelSelection(set)
 	for name, rejection := range rejected {
 		if owner := owners[name[strings.LastIndexByte(name, '/')+1:]]; owner != nil {
@@ -2329,27 +2368,31 @@ func (r *Reconciler) validateModelRouteSet(ctx context.Context, set *resolver.Re
 				continue
 			}
 			if err := r.updateModelStatus(ctx, owner, false, rejectionReason(rejection), rejection.Error(), nil); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 	}
-	if err := rejected[current.Namespace+"/"+current.Name]; err != nil {
-		if statusErr := report(false, rejectionReason(err), err.Error(), nil); statusErr != nil {
-			return nil, statusErr
+	rejection := rejected[current.Namespace+"/"+current.Name]
+	if rejection != nil {
+		// Reported before publishing, so a failed publication cannot leave a
+		// previously Ready status in place.
+		if statusErr := report(false, rejectionReason(rejection), rejection.Error(), nil); statusErr != nil {
+			return nil, nil, statusErr
 		}
-		return nil, err
 	}
 	if err := r.validateResolvedRouteSet(ctx, valid); err != nil {
 		reason := reasonReconcileFailed
 		if errors.Is(err, errCredentialNotReady) {
 			reason = reasonProviderNotReady
 		}
-		if statusErr := report(false, reason, err.Error(), nil); statusErr != nil {
-			return nil, statusErr
+		if rejection == nil {
+			if statusErr := report(false, reason, err.Error(), nil); statusErr != nil {
+				return nil, nil, statusErr
+			}
 		}
-		return nil, err
+		return nil, nil, err
 	}
-	return valid, nil
+	return valid, rejection, nil
 }
 
 func (r *Reconciler) namespaceAllowed(namespace string) bool {

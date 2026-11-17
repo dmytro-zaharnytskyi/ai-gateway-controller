@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -14,6 +15,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/publisher"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
 )
@@ -113,13 +116,17 @@ func TestUndeterminedServingRevisionKeepsReadinessAsBefore(t *testing.T) {
 	}
 }
 
-// Only a model not Ready at the gateway for less than overlayRevisionWaitLimit
-// waits, so the wait never withdraws Ready and is bounded. A model reports
-// Ready per gateway: a gateway that gatewayRefs gained has no result yet, so a
-// model Ready elsewhere waits there, while a model that names no gateway, as
-// its own tenant alone serves it, stands for it with its Ready condition.
+// Only a model not Ready at the gateway waits, and only while the published
+// overlay was rendered less than overlayRevisionWaitLimit ago, so the wait
+// never withdraws Ready and is bounded, however long the model was not Ready
+// before. A model reports Ready per gateway: a gateway that gatewayRefs gained
+// has no result yet, so a model Ready elsewhere waits there, while a model
+// that names no gateway, as its own tenant alone serves it, stands for it with
+// its Ready condition.
 func TestAwaitsOverlayRevisionPerGateway(t *testing.T) {
 	now := time.Now()
+	renderedAgo := func(age time.Duration) string { return now.Add(-age).UTC().Format(time.RFC3339) }
+	fresh, lapsed := renderedAgo(time.Minute), renderedAgo(overlayRevisionWaitLimit+time.Second)
 	condition := func(status metav1.ConditionStatus, since time.Duration) []metav1.Condition {
 		return []metav1.Condition{{Type: conditionReady, Status: status, LastTransitionTime: metav1.NewTime(now.Add(-since))}}
 	}
@@ -134,26 +141,85 @@ func TestAwaitsOverlayRevisionPerGateway(t *testing.T) {
 		model.Status.Gateways = []v1alpha1.ExternalModelGatewayStatus{{NamespacedObjectReference: gatewayB, Conditions: condition(metav1.ConditionTrue, time.Minute)}}
 		return model
 	}
-	lapsed := readyOnB(gatewayB, gatewayC)
-	lapsed.Status.Gateways = append(lapsed.Status.Gateways, v1alpha1.ExternalModelGatewayStatus{
-		NamespacedObjectReference: gatewayC, Conditions: condition(metav1.ConditionFalse, overlayRevisionWaitLimit+time.Second)})
+	notReady := home(condition(metav1.ConditionFalse, time.Minute))
+	longNotReady := home(condition(metav1.ConditionFalse, 10*time.Minute))
 	for _, tc := range []struct {
-		name    string
-		model   *v1alpha1.ExternalModel
-		gateway v1alpha1.NamespacedObjectReference
-		want    bool
+		name       string
+		model      *v1alpha1.ExternalModel
+		gateway    v1alpha1.NamespacedObjectReference
+		renderedAt string
+		want       bool
 	}{
-		{name: "new model", model: home(nil), gateway: defaultGateway, want: true},
-		{name: "model not Ready yet", model: home(condition(metav1.ConditionFalse, time.Minute)), gateway: defaultGateway, want: true},
-		{name: "model not Ready past the wait limit", model: home(condition(metav1.ConditionFalse, overlayRevisionWaitLimit+time.Second)), gateway: defaultGateway},
-		{name: "Ready model", model: home(condition(metav1.ConditionTrue, time.Minute)), gateway: defaultGateway},
-		{name: "Ready attachment", model: readyOnB(gatewayB), gateway: gatewayB},
-		{name: "gateway the Ready model gained", model: readyOnB(gatewayB, gatewayC), gateway: gatewayC, want: true},
-		{name: "gained gateway past the wait limit", model: lapsed, gateway: gatewayC},
+		{name: "new model", model: home(nil), gateway: defaultGateway, renderedAt: fresh, want: true},
+		{name: "model not Ready yet", model: notReady, gateway: defaultGateway, renderedAt: fresh, want: true},
+		{name: "model long not Ready, overlay fresh", model: longNotReady, gateway: defaultGateway, renderedAt: fresh, want: true},
+		{name: "overlay rendered past the wait limit", model: notReady, gateway: defaultGateway, renderedAt: lapsed},
+		{name: "overlay rendered past the wait limit ahead of this clock", model: notReady, gateway: defaultGateway, renderedAt: renderedAgo(-overlayRevisionWaitLimit - time.Second)},
+		{name: "overlay without rendered_at", model: notReady, gateway: defaultGateway},
+		{name: "unparseable rendered_at", model: notReady, gateway: defaultGateway, renderedAt: "later"},
+		{name: "Ready model", model: home(condition(metav1.ConditionTrue, time.Minute)), gateway: defaultGateway, renderedAt: fresh},
+		{name: "Ready attachment", model: readyOnB(gatewayB), gateway: gatewayB, renderedAt: fresh},
+		{name: "gateway the Ready model gained", model: readyOnB(gatewayB, gatewayC), gateway: gatewayC, renderedAt: fresh, want: true},
+		{name: "gained gateway past the wait limit", model: readyOnB(gatewayB, gatewayC), gateway: gatewayC, renderedAt: lapsed},
 	} {
-		if got := awaitsOverlayRevision(tc.model, tc.gateway, now); got != tc.want {
+		if got := awaitsOverlayRevision(tc.model, tc.gateway, tc.renderedAt, now); got != tc.want {
 			t.Errorf("%s: awaitsOverlayRevision(%s) = %t, want %t", tc.name, gatewayKey(tc.gateway), got, tc.want)
 		}
+	}
+}
+
+// A model not Ready for a while for another reason, such as a credential
+// Secret created late, still waits for the overlay that finally adds it: the
+// overlay's age bounds the wait, not how long the model was not Ready.
+func TestLongNotReadyModelWaitsForFreshOverlayRevision(t *testing.T) {
+	r, model := pendingHomeModel(t, staleOverlayRevision)
+	setReadySince(t, r, model, 10*time.Minute)
+	result := reconcileForResult(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != modelPhasePending || readyReason(got) != reasonExtProcNotReady || result.RequeueAfter != attachmentRequeueInterval {
+		t.Fatalf("model not Ready for 10 minutes beside a fresh overlay: result %#v, status %#v; want Pending %s", result, got.Status, reasonExtProcNotReady)
+	}
+
+	renderOverlayAt(t, r, model.Namespace, time.Now().Add(-overlayRevisionWaitLimit-time.Second))
+	reconcileModel(t, r, model)
+	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
+		t.Fatalf("model beside an overlay rendered past the wait limit = %#v, want Ready as before", got.Status)
+	}
+}
+
+// setReadySince moves the model's Ready transition into the past.
+func setReadySince(t *testing.T, r *Reconciler, model *v1alpha1.ExternalModel, since time.Duration) {
+	t.Helper()
+	got := getModel(t, r, model)
+	ready := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+	if ready == nil {
+		t.Fatalf("model %s has no Ready condition", model.Name)
+	}
+	ready.LastTransitionTime = metav1.NewTime(time.Now().Add(-since))
+	if err := r.Status().Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// renderOverlayAt rewrites when the published overlay was rendered; the
+// revision digest does not cover provenance.
+func renderOverlayAt(t *testing.T, r *Reconciler, namespace string, at time.Time) {
+	t.Helper()
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: "routing-overlay"}, cm); err != nil {
+		t.Fatal(err)
+	}
+	var env envelope.Envelope
+	if err := json.Unmarshal([]byte(cm.Data[publisher.DefaultDataKey]), &env); err != nil {
+		t.Fatal(err)
+	}
+	env.Provenance.RenderedAt = at.UTC().Format(time.RFC3339)
+	data, err := json.MarshalIndent(env, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm.Data[publisher.DefaultDataKey] = string(data) + "\n"
+	if err := r.Update(context.Background(), cm); err != nil {
+		t.Fatal(err)
 	}
 }
 

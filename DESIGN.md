@@ -69,7 +69,8 @@ A model whose own provider references cannot be resolved as written (two
 active references to one provider, an unresolved path placeholder, an invalid
 `targetModel` or a `tls.*` override of the provider's shared transport) reports
 `Ready=False/InvalidProviderRef` and is left out of the routes, the overlay and
-the ExtProc runtime; the other models of its namespace are still published.
+the ExtProc runtime; a route it served before is withdrawn, and the other
+models of its namespace are still published.
 
 The controller stages provider withdrawal for tenant-local and Gateway-attached
 models: the reduced overlay must be observed by the serving ExtProc revision,
@@ -131,9 +132,9 @@ A provider's name also names its transport, so it is checked before anything
 is applied. A name no namespace can use (over 63 characters, or whose hashed
 Service name would contain a dot) is reported `Failed`/`InvalidName`, and its
 models report `ProviderNotReady`. Its own namespace needs the Service
-`provider-<name>`, so at most 54 characters: a longer provider is `Ready`
-without transport there and serves only other namespaces, and a model of its
-own namespace that references it reports `InvalidProviderRef`.
+`provider-<name>`, so at most 54 characters and no dot: any other provider is
+`Ready` without transport there and serves only other namespaces, and a model
+of its own namespace that references it reports `InvalidProviderRef`.
 
 A tenant resolution failure (an unreadable `AITenant`, or one whose ownership is
 inconsistent with the tenant configuration) claims the provider and reports

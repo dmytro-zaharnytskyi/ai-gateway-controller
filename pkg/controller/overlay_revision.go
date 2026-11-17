@@ -17,10 +17,10 @@ import (
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 )
 
-// overlayRevisionWaitLimit bounds how long a model that is not Ready waits for
-// the tenant's ExtProc pods to serve the published overlay. The kubelet syncs
-// a mounted ConfigMap within about 90 seconds; past the limit something else
-// is wrong and the model is reported as before.
+// overlayRevisionWaitLimit bounds how long after the published overlay was
+// rendered a model that is not Ready waits for the tenant's ExtProc pods to
+// serve it. The kubelet syncs a mounted ConfigMap within about 90 seconds;
+// past the limit something else is wrong and the model is reported as before.
 const overlayRevisionWaitLimit = 2 * time.Minute
 
 // overlayRevisionPending reports whether a model that is not Ready yet must
@@ -32,12 +32,12 @@ const overlayRevisionWaitLimit = 2 * time.Minute
 // all the time. Anything it cannot determine leaves the model as it was
 // before.
 func (r *Reconciler) overlayRevisionPending(ctx context.Context, model *v1alpha1.ExternalModel, t attachmentTenant, extProc *unstructured.Unstructured) (bool, string) {
-	now := time.Now()
-	if !awaitsOverlayRevision(model, t.gateway, now) || r.readPodLogs == nil {
+	if r.readPodLogs == nil || readyAt(model, t.gateway) {
 		return false, ""
 	}
 	env, err := r.readPublishedEnvelope(ctx, t.namespace)
-	if err != nil || env == nil || env.Revision.Value == "" {
+	now := time.Now()
+	if err != nil || env == nil || env.Revision.Value == "" || !awaitsOverlayRevision(model, t.gateway, env.Provenance.RenderedAt, now) {
 		return false, ""
 	}
 	deployment := &appsv1.Deployment{}
@@ -50,25 +50,36 @@ func (r *Reconciler) overlayRevisionPending(ctx context.Context, model *v1alpha1
 	}
 	// The cache can lag a Ready status written moments ago.
 	live := &v1alpha1.ExternalModel{}
-	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(model), live); err != nil || !awaitsOverlayRevision(live, t.gateway, now) {
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(model), live); err != nil || !awaitsOverlayRevision(live, t.gateway, env.Provenance.RenderedAt, now) {
 		return false, ""
 	}
 	return true, fmt.Sprintf("waiting for the tenant ExtProc to serve routing overlay revision %s: pod %s/%s does not serve it yet",
 		env.Revision.Value, t.namespace, pod)
 }
 
-// awaitsOverlayRevision reports whether the model may wait for the overlay
-// revision at the gateway: it is not Ready there, and it turned not Ready less
-// than overlayRevisionWaitLimit ago. The wait never starts before that
-// transition, so the existing condition bounds it without new state. A model
-// without a Ready condition there has not reported one yet, so its wait starts
-// now.
-func awaitsOverlayRevision(model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference, now time.Time) bool {
-	ready := readyConditionFor(model, gateway)
-	if ready == nil {
-		return true
+// awaitsOverlayRevision reports whether the model may wait at the gateway for
+// the published overlay rendered at renderedAt (RFC3339): it is not Ready
+// there, and that overlay was rendered less than overlayRevisionWaitLimit ago.
+// The overlay's age bounds the wait, not the Ready condition's transition
+// time, which stays put while the model remains not Ready for another reason,
+// such as a credential Secret created late, until the overlay that finally
+// adds it. A missing or unparseable time starts no wait.
+func awaitsOverlayRevision(model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference, renderedAt string, now time.Time) bool {
+	rendered, err := time.Parse(time.RFC3339, renderedAt)
+	if err != nil || readyAt(model, gateway) {
+		return false
 	}
-	return ready.Status != metav1.ConditionTrue && now.Sub(ready.LastTransitionTime.Time) < overlayRevisionWaitLimit
+	// A time ahead of this clock cannot extend the wait past the limit either.
+	age := now.Sub(rendered)
+	return age < overlayRevisionWaitLimit && age > -overlayRevisionWaitLimit
+}
+
+// readyAt reports whether the model is Ready at the gateway
+// (readyConditionFor). A model without a Ready condition there has not
+// reported one yet.
+func readyAt(model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference) bool {
+	ready := readyConditionFor(model, gateway)
+	return ready != nil && ready.Status == metav1.ConditionTrue
 }
 
 // readyConditionFor returns the Ready condition the model reports for the

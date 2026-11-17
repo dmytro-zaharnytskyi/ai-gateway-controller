@@ -54,7 +54,7 @@ const (
 	reasonModelNameConflict       = "ModelNameConflict"
 	reasonTooManyProviders        = "TooManyProviders"
 	reasonInvalidName             = "InvalidName"
-	reasonInvalidProviderRef      = "InvalidProviderRef"
+	reasonInvalidProviderRef      = resolver.ReasonInvalidProviderRef
 	reasonTranslationDisabled     = "APITranslationDisabled"
 	reasonOverlayCapacityExceeded = "OverlayCapacityExceeded"
 	reasonAttachmentPending       = "AttachmentPending"

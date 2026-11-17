@@ -996,6 +996,10 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 	referenced := map[string]bool{}
 	required := map[string]bool{}
 	for _, model := range modelPtrs {
+		// The model controller also resolves the providers of other namespaces,
+		// which this resolve does not: a rejection one of them causes is read
+		// from the model's status.
+		modelRejected := rejected[model.Namespace+"/"+model.Name] || reportedInvalidProviderRef(model, gatewayName, gatewayNamespace)
 		for _, ref := range model.Spec.ExternalProviderRefs {
 			name := ref.Ref.Name
 			// A provider in another namespace is never a same-named local one.
@@ -1004,7 +1008,7 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 			}
 			referenced[name] = true
 			translationDisabled := !apiTranslationEnabled && resolver.APITranslationRequirement(model, ref, providerTypes[name]) != ""
-			if (ref.Weight == nil || *ref.Weight > 0) && !translationDisabled && !rejected[model.Namespace+"/"+model.Name] &&
+			if (ref.Weight == nil || *ref.Weight > 0) && !translationDisabled && !modelRejected &&
 				resolver.ValidateLocalProviderName(name) == nil {
 				required[name] = true
 			}
@@ -1023,6 +1027,24 @@ func (r *Reconciler) providersForTenant(ctx context.Context, namespace, gatewayN
 	// A stale reference to a deleted provider cannot appear in the serving
 	// overlay. Do not let it prevent the remaining providers from loading.
 	return result, availableRequired, nil
+}
+
+// reportedInvalidProviderRef reports a model whose current generation the
+// model controller rejected for its own provider references at the tenant's
+// Gateway: its result for that Gateway, otherwise its Ready condition.
+func reportedInvalidProviderRef(model *v1alpha1.ExternalModel, gatewayName, gatewayNamespace string) bool {
+	if model.Status.ObservedGeneration != model.Generation {
+		return false
+	}
+	conditions := model.Status.Conditions
+	gateway := v1alpha1.NamespacedObjectReference{Name: gatewayName, Namespace: gatewayNamespace}
+	if i := slices.IndexFunc(model.Status.Gateways, func(g v1alpha1.ExternalModelGatewayStatus) bool {
+		return g.NamespacedObjectReference == gateway
+	}); i >= 0 {
+		conditions = model.Status.Gateways[i].Conditions
+	}
+	ready := meta.FindStatusCondition(conditions, "Ready")
+	return ready != nil && ready.Status == metav1.ConditionFalse && ready.Reason == resolver.ReasonInvalidProviderRef
 }
 
 func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayName, gatewayNamespace string, apiTranslationEnabled bool) ([]envelope.Candidate, bool, error) {

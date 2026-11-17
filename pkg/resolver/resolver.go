@@ -297,6 +297,10 @@ type ModelRoutes struct {
 // namespaces. It fails only that model, never the models resolved with it.
 var ErrInvalidProviderRef = errors.New("invalid ExternalModel provider reference")
 
+// ReasonInvalidProviderRef is the Ready condition reason of a model rejected
+// with ErrInvalidProviderRef.
+const ReasonInvalidProviderRef = "InvalidProviderRef"
+
 // ResolvedRouteSet is the single input both render planes consume in one
 // reconcile (port plan §4.4: one source, two planes, no divergence window).
 type ResolvedRouteSet struct {
