@@ -511,9 +511,6 @@ func (r *Reconciler) providerTransportStillInUse(ctx context.Context, namespace,
 // namesProviderOutside reports a scoped stable ID that names a provider
 // outside namespace. The hashed form names no namespace, so it never does.
 func namesProviderOutside(stableID, namespace string) bool {
-	if !envelope.IsScopedStableID(stableID) {
-		return false
-	}
 	parts := strings.Split(stableID, "/")
 	return len(parts) == 4 && parts[2] != namespace
 }

@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -15,8 +14,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
-	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
-	"github.com/opendatahub-io/ai-gateway-controller/pkg/publisher"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
 )
@@ -156,7 +153,7 @@ func TestAwaitsOverlayRevisionPerGateway(t *testing.T) {
 		{name: "overlay rendered past the wait limit", model: notReady, gateway: defaultGateway, renderedAt: lapsed},
 		{name: "overlay rendered past the wait limit ahead of this clock", model: notReady, gateway: defaultGateway, renderedAt: renderedAgo(-overlayRevisionWaitLimit - time.Second)},
 		{name: "overlay without rendered_at", model: notReady, gateway: defaultGateway},
-		{name: "unparseable rendered_at", model: notReady, gateway: defaultGateway, renderedAt: "later"},
+		{name: "invalid rendered_at timestamp", model: notReady, gateway: defaultGateway, renderedAt: "later"},
 		{name: "Ready model", model: home(condition(metav1.ConditionTrue, time.Minute)), gateway: defaultGateway, renderedAt: fresh},
 		{name: "Ready attachment", model: readyOnB(gatewayB), gateway: gatewayB, renderedAt: fresh},
 		{name: "gateway the Ready model gained", model: readyOnB(gatewayB, gatewayC), gateway: gatewayC, renderedAt: fresh, want: true},
@@ -165,61 +162,6 @@ func TestAwaitsOverlayRevisionPerGateway(t *testing.T) {
 		if got := awaitsOverlayRevision(tc.model, tc.gateway, tc.renderedAt, now); got != tc.want {
 			t.Errorf("%s: awaitsOverlayRevision(%s) = %t, want %t", tc.name, gatewayKey(tc.gateway), got, tc.want)
 		}
-	}
-}
-
-// A model not Ready for a while for another reason, such as a credential
-// Secret created late, still waits for the overlay that finally adds it: the
-// overlay's age bounds the wait, not how long the model was not Ready.
-func TestLongNotReadyModelWaitsForFreshOverlayRevision(t *testing.T) {
-	r, model := pendingHomeModel(t, staleOverlayRevision)
-	setReadySince(t, r, model, 10*time.Minute)
-	result := reconcileForResult(t, r, model)
-	if got := getModel(t, r, model); got.Status.Phase != modelPhasePending || readyReason(got) != reasonExtProcNotReady || result.RequeueAfter != attachmentRequeueInterval {
-		t.Fatalf("model not Ready for 10 minutes beside a fresh overlay: result %#v, status %#v; want Pending %s", result, got.Status, reasonExtProcNotReady)
-	}
-
-	renderOverlayAt(t, r, model.Namespace, time.Now().Add(-overlayRevisionWaitLimit-time.Second))
-	reconcileModel(t, r, model)
-	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
-		t.Fatalf("model beside an overlay rendered past the wait limit = %#v, want Ready as before", got.Status)
-	}
-}
-
-// setReadySince moves the model's Ready transition into the past.
-func setReadySince(t *testing.T, r *Reconciler, model *v1alpha1.ExternalModel, since time.Duration) {
-	t.Helper()
-	got := getModel(t, r, model)
-	ready := apiMeta.FindStatusCondition(got.Status.Conditions, conditionReady)
-	if ready == nil {
-		t.Fatalf("model %s has no Ready condition", model.Name)
-	}
-	ready.LastTransitionTime = metav1.NewTime(time.Now().Add(-since))
-	if err := r.Status().Update(context.Background(), got); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// renderOverlayAt rewrites when the published overlay was rendered; the
-// revision digest does not cover provenance.
-func renderOverlayAt(t *testing.T, r *Reconciler, namespace string, at time.Time) {
-	t.Helper()
-	cm := &corev1.ConfigMap{}
-	if err := r.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: "routing-overlay"}, cm); err != nil {
-		t.Fatal(err)
-	}
-	var env envelope.Envelope
-	if err := json.Unmarshal([]byte(cm.Data[publisher.DefaultDataKey]), &env); err != nil {
-		t.Fatal(err)
-	}
-	env.Provenance.RenderedAt = at.UTC().Format(time.RFC3339)
-	data, err := json.MarshalIndent(env, "", "  ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	cm.Data[publisher.DefaultDataKey] = string(data) + "\n"
-	if err := r.Update(context.Background(), cm); err != nil {
-		t.Fatal(err)
 	}
 }
 

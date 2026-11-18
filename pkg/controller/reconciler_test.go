@@ -4046,6 +4046,17 @@ func TestAllRoutesExcludedByPolicyOnlyAcceptsTranslationOff(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "translation disabled with a weight-0 standby",
+			set: &resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{{Skips: []resolver.Skip{
+				{Reason: resolver.SkipTranslationDisabled}, {Reason: resolver.SkipWeightDisabled}}}}},
+			want: true,
+		},
+		{
+			name: "only disabled by weight is not translation policy",
+			set:  &resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{{Skips: []resolver.Skip{{Reason: resolver.SkipWeightDisabled}}}}},
+			want: false,
+		},
+		{
 			name: "unsupported format is not policy",
 			set:  &resolver.ResolvedRouteSet{Models: []resolver.ModelRoutes{{Skips: []resolver.Skip{{Reason: resolver.SkipAPIFormatUnsupported}}}}},
 			want: false,
@@ -4071,8 +4082,8 @@ func TestAllRoutesExcludedByPolicyOnlyAcceptsTranslationOff(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := allRoutesExcludedByPolicy(tc.set); got != tc.want {
-				t.Fatalf("allRoutesExcludedByPolicy() = %t, want %t", got, tc.want)
+			if got := tc.set.ExcludedByPolicy(); got != tc.want {
+				t.Fatalf("ExcludedByPolicy() = %t, want %t", got, tc.want)
 			}
 		})
 	}
@@ -5009,58 +5020,12 @@ func homeSibling(model *v1alpha1.ExternalModel, name string) *v1alpha1.ExternalM
 	return sibling
 }
 
-// One model's own invalid provider references exclude only that model
-// (RHOAIENG-103278): the rest of its namespace is published, and deleting the
-// last servable model does not wait for the rejected one.
-func TestInvalidProviderRefsExcludeOnlyThatModel(t *testing.T) {
-	ctx := context.Background()
-	r, served := reconcilerFixture(t)
-	reconcileModel(t, r, served)
-	bad := homeSibling(served, "bad")
-	bad.Spec.ExternalProviderRefs = append(bad.Spec.ExternalProviderRefs, bad.Spec.ExternalProviderRefs[0])
-	if err := r.Create(ctx, bad); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(bad)}); !errors.Is(err, resolver.ErrInvalidProviderRef) {
-		t.Fatalf("reconcile of the rejected model = %v, want %v", err, resolver.ErrInvalidProviderRef)
-	}
-	reconcileModel(t, r, served)
-	if got := getModel(t, r, served); got.Status.Phase != resolver.PhaseReady {
-		t.Fatalf("sibling status = %#v, want Ready", got.Status)
-	}
-	if got := overlayEnvelope(t, r, served.Namespace).Overlay.Candidates; len(got) != 1 || got[0].StableID != "model/provider-provider" {
-		t.Fatalf("overlay candidates = %#v, want the sibling only", got)
-	}
-	assertRejected := func(when string) {
-		t.Helper()
-		got := getModel(t, r, bad)
-		if got.Status.Phase != modelPhaseFailed || readyReason(got) != reasonInvalidProviderRef || !strings.Contains(readyMessage(got), "multiple active references") {
-			t.Fatalf("%s: rejected model status = %#v", when, got.Status)
-		}
-		if _, err := getUnstructured(r, httpRouteGVK, bad.Namespace, modelRouteName(bad.Name)); !apierrors.IsNotFound(err) {
-			t.Fatalf("%s: rejected model HTTPRoute: %v", when, err)
-		}
-	}
-	assertRejected("beside a served sibling")
-
-	if err := r.Delete(ctx, getModel(t, r, served)); err != nil {
-		t.Fatal(err)
-	}
-	reconcileModel(t, r, served)
-	if err := r.Get(ctx, client.ObjectKeyFromObject(served), &v1alpha1.ExternalModel{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("deletion beside only a rejected model did not complete: %v", err)
-	}
-	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(bad)}); !errors.Is(err, resolver.ErrNoRoutes) {
-		t.Fatalf("reconcile of the lone rejected model = %v, want %v", err, resolver.ErrNoRoutes)
-	}
-	assertRejected("alone")
-}
-
 // A Ready model edited to reject its own provider references stops serving.
 // Alone in its namespace, its route and candidate are withdrawn at once, as
 // for disabled translation; beside a sibling, the overlay is republished
 // without it and its route is withdrawn once the ExtProc has drained, while
-// the sibling stays published (RHOAIENG-103278).
+// the sibling stays published, and deleting the sibling does not wait for the
+// rejected model (RHOAIENG-103278).
 func TestRejectedHomeModelWithdrawsItsServingState(t *testing.T) {
 	for _, withSibling := range []bool{false, true} {
 		t.Run(fmt.Sprintf("sibling=%t", withSibling), func(t *testing.T) {
@@ -5105,6 +5070,13 @@ func TestRejectedHomeModelWithdrawsItsServingState(t *testing.T) {
 				}
 				if _, err := getUnstructured(r, httpRouteGVK, sibling.Namespace, modelRouteName(sibling.Name)); err != nil {
 					t.Fatalf("sibling HTTPRoute: %v", err)
+				}
+				if err := r.Delete(ctx, getModel(t, r, sibling)); err != nil {
+					t.Fatal(err)
+				}
+				reconcileModel(t, r, sibling)
+				if err := r.Get(ctx, client.ObjectKeyFromObject(sibling), &v1alpha1.ExternalModel{}); !apierrors.IsNotFound(err) {
+					t.Fatalf("deleting the sibling beside only a rejected model did not complete: %v", err)
 				}
 			} else {
 				if _, err := r.Reconcile(ctx, request); !errors.Is(err, resolver.ErrNoRoutes) {

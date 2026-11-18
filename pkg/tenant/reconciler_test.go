@@ -304,12 +304,36 @@ func TestMissingHomeProviderKeepsRuntimeConfiguration(t *testing.T) {
 			Ref: v1alpha1.ExternalProviderReference{Name: "missing"}, TargetModel: "home", APIFormat: "openai-chat", Path: "/v1/chat/completions",
 		}}},
 	}}, nil, false)
-	if !errors.Is(err, resolver.ErrNoRoutes) || allRuntimeRoutesExcludedByPolicy(set) {
-		t.Fatalf("missing provider: error = %v, policyExcludedOnly = %t", err, allRuntimeRoutesExcludedByPolicy(set))
+	if !errors.Is(err, resolver.ErrNoRoutes) || set.ExcludedByPolicy() {
+		t.Fatalf("missing provider: error = %v, policyExcludedOnly = %t", err, set.ExcludedByPolicy())
 	}
 	attachment := []envelope.Candidate{{StableID: "attached/model/provider"}}
-	if _, err := combineRuntimeCandidates(nil, attachment, err, allRuntimeRoutesExcludedByPolicy(set)); !errors.Is(err, resolver.ErrNoRoutes) {
+	if _, err := combineRuntimeCandidates(nil, attachment, err, set.ExcludedByPolicy()); !errors.Is(err, resolver.ErrNoRoutes) {
 		t.Fatalf("missing home provider with attachment error = %v, want ErrNoRoutes to retain last config", err)
+	}
+}
+
+func TestRejectedHomeModelKeepsAttachedRuntimeCandidates(t *testing.T) {
+	provider := &v1alpha1.ExternalProvider{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider", Namespace: "tenant-ns"},
+		Spec: v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "provider.example.com",
+			Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "provider-key"}}},
+		Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady},
+	}
+	ref := v1alpha1.ExternalProviderRef{Ref: v1alpha1.ExternalProviderReference{Name: provider.Name},
+		TargetModel: "home", APIFormat: "openai-chat", Path: "/v1/chat/completions"}
+	// Two active references to one provider reject the model.
+	set, err := resolver.ResolveAllWithAPITranslation([]*v1alpha1.ExternalModel{{
+		ObjectMeta: metav1.ObjectMeta{Name: "home", Namespace: "tenant-ns"},
+		Spec:       v1alpha1.ExternalModelSpec{ExternalProviderRefs: []v1alpha1.ExternalProviderRef{ref, ref}},
+	}}, []*v1alpha1.ExternalProvider{provider}, false)
+	if !errors.Is(err, resolver.ErrNoRoutes) || set.Models[0].Rejected == nil || !set.ExcludedByPolicy() {
+		t.Fatalf("rejected model: error = %v, policyExcludedOnly = %t", err, set.ExcludedByPolicy())
+	}
+	attachment := []envelope.Candidate{{StableID: "attached/model/provider"}}
+	candidates, err := combineRuntimeCandidates(nil, attachment, err, set.ExcludedByPolicy())
+	if err != nil || len(candidates) != 1 || candidates[0].StableID != attachment[0].StableID {
+		t.Fatalf("rejected home model with attachment = %#v, err=%v; want the attachment only", candidates, err)
 	}
 }
 

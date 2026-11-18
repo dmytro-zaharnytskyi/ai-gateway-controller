@@ -1078,7 +1078,7 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 		}
 	}
 	runtimeSet, err := resolver.ResolveAllWithAPITranslation(modelPtrs, providerPtrs, apiTranslationEnabled)
-	policyExcludedOnly := allRuntimeRoutesExcludedByPolicy(runtimeSet)
+	policyExcludedOnly := runtimeSet.ExcludedByPolicy()
 	if err != nil && !errors.Is(err, resolver.ErrNoRoutes) {
 		return nil, policyExcludedOnly, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
 	}
@@ -1094,28 +1094,6 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 		return nil, policyExcludedOnly, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
 	}
 	return candidates, policyExcludedOnly, nil
-}
-
-// allRuntimeRoutesExcludedByPolicy distinguishes an intentional translation
-// exclusion from a missing or unready provider. The latter must retain the
-// last applied runtime configuration until the provider recovers.
-func allRuntimeRoutesExcludedByPolicy(set *resolver.ResolvedRouteSet) bool {
-	if set == nil || len(set.Models) == 0 {
-		return false
-	}
-	sawExclusion := false
-	for _, model := range set.Models {
-		if len(model.Routes) > 0 || len(model.Skips) == 0 {
-			return false
-		}
-		for _, skip := range model.Skips {
-			if skip.Reason != resolver.SkipTranslationDisabled {
-				return false
-			}
-			sawExclusion = true
-		}
-	}
-	return sawExclusion
 }
 
 // combineRuntimeCandidates allows an intentional policy exclusion to leave

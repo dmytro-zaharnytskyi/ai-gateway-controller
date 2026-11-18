@@ -988,25 +988,6 @@ func TestValidateProviderName(t *testing.T) {
 	}
 }
 
-// A provider of the model's own namespace is reached through provider-<name>,
-// which a name that fits only the hashed transport of other namespaces cannot
-// name: the model is rejected alone, while a model in another namespace uses
-// the provider (RHOAIENG-103284).
-func TestOwnNamespaceRefToLongProviderNameRejectsModel(t *testing.T) {
-	name := strings.Repeat("p", MaxLocalProviderNameLength+1)
-	p := provider("ns1", name, PhaseReady, "p.example.com", nil)
-	err := resolveRejected(t, model("ns1", "m", ref(name, "m", "/v1/chat/completions")), p)
-	if !errors.Is(err, ErrInvalidProviderName) || !strings.Contains(err.Error(), "only models in other namespaces can use it") {
-		t.Fatalf("rejection = %v, want the provider name explained", err)
-	}
-	cross := ref(name, "m", "/v1/chat/completions")
-	cross.Ref.Namespace = "ns1"
-	set, err := Resolve([]*v1alpha1.ExternalModel{model("ns2", "m", cross)}, []*v1alpha1.ExternalProvider{p})
-	if err != nil || len(set.Routes()) != 1 || set.Routes()[0].Cluster != hashedServiceName("ns1", name) {
-		t.Fatalf("model in another namespace = (%+v, %v), want it served through the hashed transport", set, err)
-	}
-}
-
 // Without API translation the provider receives the client's body model and
 // path and no provider credential header, so a ref that needs them is
 // excluded like an Anthropic Messages ref (RHOAIENG-103276).

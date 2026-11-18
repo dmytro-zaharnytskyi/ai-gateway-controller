@@ -9,7 +9,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -63,7 +62,7 @@ func (r *Reconciler) overlayRevisionPending(ctx context.Context, model *v1alpha1
 // The overlay's age bounds the wait, not the Ready condition's transition
 // time, which stays put while the model remains not Ready for another reason,
 // such as a credential Secret created late, until the overlay that finally
-// adds it. A missing or unparseable time starts no wait.
+// adds it. A missing or invalid timestamp starts no wait.
 func awaitsOverlayRevision(model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference, renderedAt string, now time.Time) bool {
 	rendered, err := time.Parse(time.RFC3339, renderedAt)
 	if err != nil || readyAt(model, gateway) {
@@ -74,29 +73,21 @@ func awaitsOverlayRevision(model *v1alpha1.ExternalModel, gateway v1alpha1.Names
 	return age < overlayRevisionWaitLimit && age > -overlayRevisionWaitLimit
 }
 
-// readyAt reports whether the model is Ready at the gateway
-// (readyConditionFor). A model without a Ready condition there has not
-// reported one yet.
+// readyAt reports whether the model is Ready at the gateway: its
+// status.gateways result for it. A model that names no gateway has none, as
+// only its own tenant serves it, so its Ready condition stands for that
+// tenant's gateway. A gateway that gatewayRefs names but that has no result
+// yet was attached since, and has reported nothing.
 func readyAt(model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference) bool {
-	ready := readyConditionFor(model, gateway)
-	return ready != nil && ready.Status == metav1.ConditionTrue
-}
-
-// readyConditionFor returns the Ready condition the model reports for the
-// gateway: its status.gateways result for it. A model that names no gateway
-// has none, as only its own tenant serves it, so its Ready condition stands
-// for that tenant's gateway. A gateway that gatewayRefs names but that has no
-// result yet was attached since, and has reported nothing.
-func readyConditionFor(model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectReference) *metav1.Condition {
-	for i := range model.Status.Gateways {
-		if model.Status.Gateways[i].NamespacedObjectReference == gateway {
-			return apiMeta.FindStatusCondition(model.Status.Gateways[i].Conditions, conditionReady)
-		}
+	conditions := model.Status.Conditions
+	if i := slices.IndexFunc(model.Status.Gateways, func(g v1alpha1.ExternalModelGatewayStatus) bool {
+		return g.NamespacedObjectReference == gateway
+	}); i >= 0 {
+		conditions = model.Status.Gateways[i].Conditions
+	} else if slices.Contains(model.Spec.GatewayRefs, gateway) {
+		return false
 	}
-	if slices.Contains(model.Spec.GatewayRefs, gateway) {
-		return nil
-	}
-	return apiMeta.FindStatusCondition(model.Status.Conditions, conditionReady)
+	return apiMeta.IsStatusConditionTrue(conditions, conditionReady)
 }
 
 // extProcPodOnOtherRevision returns a running, ready pod of the tenant's

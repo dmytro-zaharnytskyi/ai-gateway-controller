@@ -290,11 +290,31 @@ type ModelRoutes struct {
 	Rejected error
 }
 
+// ExcludedByTranslationPolicy reports a model left without a route on purpose:
+// at least one reference needs the disabled API translation, and every other
+// reference is disabled by weight.
+func (m ModelRoutes) ExcludedByTranslationPolicy() bool {
+	if len(m.Routes) > 0 {
+		return false
+	}
+	translation := false
+	for _, skip := range m.Skips {
+		switch skip.Reason {
+		case SkipTranslationDisabled:
+			translation = true
+		case SkipWeightDisabled:
+		default:
+			return false
+		}
+	}
+	return translation
+}
+
 // ErrInvalidProviderRef marks a model whose provider references cannot be
 // resolved as written: two active references to one provider, a reference
 // with an invalid path, targetModel or transport override, or one to a
 // provider of its own namespace whose name fits only the transport of other
-// namespaces. It fails only that model, never the models resolved with it.
+// namespaces.
 var ErrInvalidProviderRef = errors.New("invalid ExternalModel provider reference")
 
 // ReasonInvalidProviderRef is the Ready condition reason of a model rejected
@@ -314,6 +334,21 @@ func (s *ResolvedRouteSet) Routes() []Route {
 		out = append(out, m.Routes...)
 	}
 	return out
+}
+
+// ExcludedByPolicy reports a set whose every model is excluded on purpose:
+// rejected for its own provider references, or by disabled API translation.
+// Unlike a missing or unready provider, neither keeps last-known serving state.
+func (s *ResolvedRouteSet) ExcludedByPolicy() bool {
+	if s == nil || len(s.Models) == 0 {
+		return false
+	}
+	for _, m := range s.Models {
+		if m.Rejected == nil && !m.ExcludedByTranslationPolicy() {
+			return false
+		}
+	}
+	return true
 }
 
 // ErrNoRoutes means no model resolved a single route; the caller must mark
@@ -485,8 +520,6 @@ func resolve(models []*v1alpha1.ExternalModel, providers []*v1alpha1.ExternalPro
 				set.Models = append(set.Models, mr)
 				return set, fmt.Errorf("%w: %s: model %s provider ref %s: %s", ErrProviderCapabilityUnsupported, SkipAPIFormatUnsupported, mref, ref.Ref.Name, message)
 			}
-			// The model's own invalid reference rejects only this model: the
-			// others resolved with it are still served.
 			if weight > 0 && activeProviders[key] {
 				mr.Rejected = fmt.Errorf("%w: multiple active references to ExternalProvider %s/%s; keep one, or set weight 0 on the others",
 					ErrInvalidProviderRef, prov.Namespace, prov.Name)

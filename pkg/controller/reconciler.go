@@ -1073,19 +1073,12 @@ func (r *Reconciler) handleHomeRouteResolutionError(
 		if unroutedReason, unroutedMessage, ok := unroutedStatus(set, namespace+"/"+modelName); ok {
 			reason, message = unroutedReason, unroutedMessage
 		}
-		excluded := translationPolicyExcludedModels(set)
+		excluded := policyExcludedModels(set)
 		disabledByWeight := explicitlyWeightDisabledModels(set)
 		if disabledByWeight[namespace+"/"+modelName] {
 			reason = reasonNoRoutes
-		} else if excluded[namespace+"/"+modelName] {
-			reason = reasonTranslationDisabled
 		}
 		for modelRef := range disabledByWeight {
-			excluded[modelRef] = true
-		}
-		// A model rejected for its own provider references cannot serve either,
-		// so its earlier route and candidate are withdrawn too.
-		for modelRef := range rejectedModels(set) {
 			excluded[modelRef] = true
 		}
 		if len(excluded) > 0 {
@@ -1138,7 +1131,7 @@ func unroutedStatus(set *resolver.ResolvedRouteSet, modelRef string) (reason, me
 			reason = reasonRefNotPermitted
 		}
 	}
-	if translationPolicyExcludedModels(set)[modelRef] {
+	if set.Models[i].ExcludedByTranslationPolicy() {
 		reason = reasonTranslationDisabled
 	}
 	return reason, "no routable ExternalModel provider remains: " + strings.Join(skips, "; "), true
@@ -1417,7 +1410,7 @@ func (r *Reconciler) republishHomeWithout(ctx context.Context, deleted *v1alpha1
 		if servesErr != nil {
 			return servesErr
 		}
-		if len(modelPtrs) > 0 && !allRoutesExcludedByPolicy(set) && !revoked {
+		if len(modelPtrs) > 0 && !set.ExcludedByPolicy() && !revoked {
 			return err
 		}
 		if err := r.ensureHomeTenantBeforeWrite(ctx, deleted.Namespace, live, gatewayName, gatewayNamespace); err != nil {
@@ -1589,53 +1582,20 @@ func (r *Reconciler) applyRemainingHomeModels(
 	return r.gcTenantState(ctx, deleted.Namespace, excludedRoutes(attached), stateAnnotations(home.gateway, state))
 }
 
-// allRoutesExcludedByPolicy reports a set whose every model is excluded on
-// purpose: by disabled API translation, or rejected for its own provider
-// references. Neither can serve, so no last-known serving state is kept.
-func allRoutesExcludedByPolicy(set *resolver.ResolvedRouteSet) bool {
-	if set == nil || len(set.Models) == 0 {
-		return false
-	}
-	excluded := translationPolicyExcludedModels(set)
-	return !slices.ContainsFunc(set.Models, func(m resolver.ModelRoutes) bool { return !excluded[m.ModelRef] && m.Rejected == nil })
-}
-
-func translationPolicyExcludedModels(set *resolver.ResolvedRouteSet) map[string]bool {
+// policyExcludedModels returns the models excluded on purpose: by disabled API
+// translation, or rejected for their own provider references. Neither can
+// serve, so their earlier routes and candidates are withdrawn.
+func policyExcludedModels(set *resolver.ResolvedRouteSet) map[string]bool {
 	excluded := make(map[string]bool)
 	if set == nil {
 		return excluded
 	}
 	for _, model := range set.Models {
-		if len(model.Routes) > 0 || len(model.Skips) == 0 {
-			continue
-		}
-		policyOnly := true
-		for _, skip := range model.Skips {
-			if skip.Reason != resolver.SkipTranslationDisabled {
-				policyOnly = false
-				break
-			}
-		}
-		if policyOnly {
+		if model.Rejected != nil || model.ExcludedByTranslationPolicy() {
 			excluded[model.ModelRef] = true
 		}
 	}
 	return excluded
-}
-
-// rejectedModels returns the models the resolver rejected for their own
-// provider references.
-func rejectedModels(set *resolver.ResolvedRouteSet) map[string]bool {
-	rejected := make(map[string]bool)
-	if set == nil {
-		return rejected
-	}
-	for _, model := range set.Models {
-		if model.Rejected != nil {
-			rejected[model.ModelRef] = true
-		}
-	}
-	return rejected
 }
 
 // cleanupExcludedHomeModels removes only candidates made ineligible by an
