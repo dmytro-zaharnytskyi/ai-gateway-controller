@@ -1057,8 +1057,15 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 		return nil, false, fmt.Errorf("list ExternalProviders for ExtProc runtime configuration: %w", err)
 	}
 	modelPtrs := make([]*v1alpha1.ExternalModel, 0, len(models))
+	rejected, foreignOnly := false, false
 	for i := range models {
 		if !models[i].DeletionTimestamp.IsZero() {
+			continue
+		}
+		// The model controller publishes nothing for a model it rejected,
+		// also for providers of other namespaces, which only its status shows.
+		if reportedInvalidProviderRef(&models[i], gatewayName, gatewayNamespace) {
+			rejected = true
 			continue
 		}
 		// Providers in other namespaces are loaded from the published overlay
@@ -1068,6 +1075,8 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 			return ref.Ref.Namespace == "" || ref.Ref.Namespace == namespace
 		}) {
 			modelPtrs = append(modelPtrs, &models[i])
+		} else {
+			foreignOnly = true
 		}
 	}
 
@@ -1078,7 +1087,9 @@ func (r *Reconciler) runtimeCandidates(ctx context.Context, namespace, gatewayNa
 		}
 	}
 	runtimeSet, err := resolver.ResolveAllWithAPITranslation(modelPtrs, providerPtrs, apiTranslationEnabled)
-	policyExcludedOnly := runtimeSet.ExcludedByPolicy()
+	// With every model rejected, the model controller withdraws the overlay;
+	// a model on other namespaces' providers alone may still be published.
+	policyExcludedOnly := runtimeSet.ExcludedByPolicy() || (rejected && len(modelPtrs) == 0 && !foreignOnly)
 	if err != nil && !errors.Is(err, resolver.ErrNoRoutes) {
 		return nil, policyExcludedOnly, fmt.Errorf("resolve ExtProc runtime provider set: %w", err)
 	}

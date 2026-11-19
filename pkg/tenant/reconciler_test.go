@@ -1744,3 +1744,45 @@ func TestRequiredProvidersSkipModelRejectedForForeignProvider(t *testing.T) {
 		})
 	}
 }
+
+// When the model controller rejected every model of the tenant, it withdraws
+// the overlay, so the tenant must not wait for one (RHOAIENG-103278).
+func TestLoneRejectedModelDoesNotWaitForOverlay(t *testing.T) {
+	const namespace = "tenant-ns"
+	local := &v1alpha1.ExternalProvider{ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: namespace},
+		Spec:   v1alpha1.ExternalProviderSpec{Provider: "openai", Endpoint: "provider.example.com", Auth: v1alpha1.AuthConfig{Type: "apikey", SecretRef: v1alpha1.NameReference{Name: "key"}}},
+		Status: v1alpha1.ExternalProviderStatus{Phase: resolver.PhaseReady}}
+	ref := func(provider, providerNamespace string) v1alpha1.ExternalProviderRef {
+		return v1alpha1.ExternalProviderRef{Ref: v1alpha1.ExternalProviderReference{Name: provider, Namespace: providerNamespace},
+			TargetModel: "chat", APIFormat: "openai-chat", Path: "/v1/chat/completions"}
+	}
+	rejected := v1alpha1.ExternalModelStatus{ObservedGeneration: 1, Conditions: []metav1.Condition{{
+		Type: "Ready", Status: metav1.ConditionFalse, Reason: "InvalidProviderRef", Message: "reported", LastTransitionTime: metav1.Now()}}}
+	model := func(name string, status v1alpha1.ExternalModelStatus, refs ...v1alpha1.ExternalProviderRef) client.Object {
+		return &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Generation: 1},
+			Spec: v1alpha1.ExternalModelSpec{ExternalProviderRefs: refs}, Status: status}
+	}
+	shared := ref("shared", "providers")
+	for _, tc := range []struct {
+		name   string
+		models []client.Object
+		wait   bool
+	}{
+		{name: "rejected with a local provider", models: []client.Object{model("chat", rejected, ref("local", ""), shared, shared)}},
+		{name: "rejected on another namespace's provider alone", models: []client.Object{model("chat", rejected, shared, shared)}},
+		{name: "rejection not reported yet", models: []client.Object{model("chat", v1alpha1.ExternalModelStatus{}, ref("local", ""), shared, shared)}, wait: true},
+		{name: "another model on another namespace's provider", wait: true, models: []client.Object{
+			model("chat", rejected, ref("local", ""), shared, shared), model("other", v1alpha1.ExternalModelStatus{}, shared)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(append(tc.models, local)...).Build()}
+			candidates, serving, overlayReady, reason, err := r.resolvePraxisRuntimeCandidates(context.Background(), namespace, "gateway", "gateway-system", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if overlayReady == tc.wait || (!tc.wait && (serving || len(candidates) != 0)) {
+				t.Fatalf("serving=%t overlayReady=%t reason=%q candidates=%d, want wait=%t", serving, overlayReady, reason, len(candidates), tc.wait)
+			}
+		})
+	}
+}
