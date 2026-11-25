@@ -27,6 +27,23 @@ func TestScopedStableIDFormsAreDisjointFromExistingForm(t *testing.T) {
 	}
 }
 
+func TestParseScopedStableID(t *testing.T) {
+	want := ScopedID{ModelNamespace: "team", Model: "model", ProviderNamespace: "shared", Provider: "openai"}
+	if got, ok := ParseScopedStableID(ScopedStableID("team", "model", "shared", "openai")); !ok || got != want {
+		t.Fatalf("readable form = %#v, %t; want %#v", got, ok, want)
+	}
+	long := strings.Repeat("m", 253)
+	for name, id := range map[string]string{
+		"hash form":     ScopedStableID("team", long, "shared", "openai"),
+		"existing form": CandidateStableID("model", "openai"),
+		"empty":         "",
+	} {
+		if got, ok := ParseScopedStableID(id); ok {
+			t.Errorf("%s %q parsed as %#v, want no fields", name, id, got)
+		}
+	}
+}
+
 func TestRenderUsesRouteStableIDOverride(t *testing.T) {
 	scoped := route("model", "openai", 1)
 	scoped.StableID = ScopedStableID("team", "model", "team", "openai")

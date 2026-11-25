@@ -27,6 +27,13 @@ func servingRevisionLogs(revision string) func(context.Context, string, string, 
 	}
 }
 
+// podsReport sets the revision the tenant's ExtProc pods report from now on,
+// as once the reuse of an earlier check has lapsed.
+func podsReport(r *Reconciler, revision string) {
+	r.readPodLogs = servingRevisionLogs(revision)
+	r.revisionChecks = revisionChecks{}
+}
+
 // pendingHomeModel publishes the fixture's model while its tenant ExtProc
 // starts, then makes that ExtProc available with ready pods that report
 // serving revision.
@@ -67,10 +74,84 @@ func TestNewHomeModelWaitsForPublishedOverlayRevision(t *testing.T) {
 			result, got.Status, reasonExtProcNotReady, published)
 	}
 
-	r.readPodLogs = servingRevisionLogs(published)
+	podsReport(r, published)
 	reconcileModel(t, r, model)
 	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady || readyReason(got) != reasonReconciled {
 		t.Fatalf("model whose ExtProc serves the published revision = %#v", got.Status)
+	}
+}
+
+// The models of a tenant that wait for one overlay revision share a check of
+// its ExtProc pods: a model rechecked moments after another reads no pod log
+// again, so models created together do not each read them on every recheck.
+func TestWaitingModelsShareServingRevisionCheck(t *testing.T) {
+	r, model := pendingHomeModel(t, staleOverlayRevision)
+	reads := 0
+	r.readPodLogs = func(ctx context.Context, namespace, pod, container string) (string, error) {
+		reads++
+		return servingRevisionLogs(staleOverlayRevision)(ctx, namespace, pod, container)
+	}
+	waits := func(model *v1alpha1.ExternalModel, wantReads int) {
+		t.Helper()
+		reconcileForResult(t, r, model)
+		if got := getModel(t, r, model); got.Status.Phase != modelPhasePending || readyReason(got) != reasonExtProcNotReady || reads != wantReads {
+			t.Fatalf("model %s: %d pod log reads, status %#v; want %d reads and Pending %s", model.Name, reads, got.Status, wantReads, reasonExtProcNotReady)
+		}
+	}
+	waits(model, 1)
+
+	// A second model changes the overlay, so its revision is checked anew.
+	sibling := model.DeepCopy()
+	sibling.ObjectMeta = metav1.ObjectMeta{Name: "sibling", Namespace: model.Namespace, UID: "sibling-uid"}
+	sibling.Spec.ExternalProviderRefs[0].TargetModel = sibling.Name
+	if err := r.Create(context.Background(), sibling); err != nil {
+		t.Fatal(err)
+	}
+	waits(sibling, 2)
+	waits(model, 2)
+	waits(sibling, 2)
+}
+
+// A check is reused only for its tenant and revision, for less than
+// overlayRevisionCheckReuse, and a check past it is dropped.
+func TestRevisionCheckReuse(t *testing.T) {
+	now := time.Now()
+	var checks revisionChecks
+	if _, found := checks.lookup("tenant-a", "r1", now); found {
+		t.Fatal("a tenant without a check has one to reuse")
+	}
+	checks.record("tenant-a", revisionCheck{revision: "r1", pod: "pod-0", at: now})
+	for _, tc := range []struct {
+		name, namespace, revision string
+		after                     time.Duration
+		want                      bool
+	}{
+		{name: "same revision moments later", namespace: "tenant-a", revision: "r1", after: time.Second, want: true},
+		{name: "another revision", namespace: "tenant-a", revision: "r2", after: time.Second},
+		{name: "another tenant", namespace: "tenant-b", revision: "r1", after: time.Second},
+		{name: "reuse lapsed", namespace: "tenant-a", revision: "r1", after: overlayRevisionCheckReuse},
+		{name: "check ahead of this clock", namespace: "tenant-a", revision: "r1", after: -time.Second},
+	} {
+		pod, found := checks.lookup(tc.namespace, tc.revision, now.Add(tc.after))
+		if found != tc.want || found && pod != "pod-0" {
+			t.Errorf("%s: lookup = %q, %t; want reuse %t", tc.name, pod, found, tc.want)
+		}
+	}
+	checks.record("tenant-b", revisionCheck{revision: "r1", at: now.Add(overlayRevisionCheckReuse)})
+	if _, kept := checks.latest["tenant-a"]; kept || len(checks.latest) != 1 {
+		t.Fatalf("checks held after one lapsed = %#v, want only tenant-b", checks.latest)
+	}
+}
+
+// An undetermined check is not reused: the next model reads the pods again.
+func TestUndeterminedServingRevisionCheckIsNotReused(t *testing.T) {
+	r, model := pendingHomeModel(t, staleOverlayRevision)
+	r.readPodLogs = func(context.Context, string, string, string) (string, error) {
+		return "", errors.New("injected log read failure")
+	}
+	reconcileModel(t, r, model)
+	if len(r.revisionChecks.latest) != 0 {
+		t.Fatalf("undetermined check recorded for reuse: %#v", r.revisionChecks.latest)
 	}
 }
 
@@ -186,14 +267,14 @@ func TestAttachmentWaitsForPublishedOverlayRevision(t *testing.T) {
 		t.Fatalf("attachment whose tenant ExtProc serves another revision: result %#v, status %#v", result, got.Status)
 	}
 
-	r.readPodLogs = servingRevisionLogs(published)
+	podsReport(r, published)
 	reconcileModel(t, r, model)
 	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
 		t.Fatalf("attachment whose tenant ExtProc serves the published revision = %#v", got.Status)
 	}
 
 	// Once Ready, the attachment stays Ready while the pods lag another revision.
-	r.readPodLogs = servingRevisionLogs(staleOverlayRevision)
+	podsReport(r, staleOverlayRevision)
 	reconcileModel(t, r, model)
 	if got := getModel(t, r, model); got.Status.Phase != resolver.PhaseReady {
 		t.Fatalf("Ready attachment while its tenant ExtProc lags = %#v, want it to stay Ready", got.Status)

@@ -103,6 +103,9 @@ type Reconciler struct {
 	// accepted and is serving the published overlay revision before withdrawal
 	// cleanup begins. Tests inject deterministic process-reported revisions.
 	readPodLogs func(context.Context, string, string, string) (string, error)
+	// revisionChecks lets the models of a tenant that wait for one overlay
+	// revision share a check of its ExtProc pods (overlayRevisionCheckReuse).
+	revisionChecks revisionChecks
 	// ApplyResource and PublishOverlay are test seams. Production leaves them
 	// nil, selecting the real SSA renderer and publisher below. Applying one
 	// object at a time preserves the production order and lets tests inject a

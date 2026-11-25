@@ -237,11 +237,11 @@ func splitTenantWithdrawalStableID(stableID, namespace string) (model, providerN
 		model, provider, ok := splitCandidateStableID(stableID)
 		return model, "", provider, ok
 	}
-	parts := strings.Split(stableID, "/")
-	if len(parts) != 4 || parts[0] != namespace {
+	scoped, ok := envelope.ParseScopedStableID(stableID)
+	if !ok || scoped.ModelNamespace != namespace {
 		return "", "", "", false
 	}
-	return parts[1], parts[2], parts[3], true
+	return scoped.Model, scoped.ProviderNamespace, scoped.Provider, true
 }
 
 func (r *Reconciler) providerNamespaceForService(ctx context.Context, modelNamespace, modelName, providerName, serviceName string) (string, bool, error) {
@@ -511,8 +511,8 @@ func (r *Reconciler) providerTransportStillInUse(ctx context.Context, namespace,
 // namesProviderOutside reports a scoped stable ID that names a provider
 // outside namespace. The hashed form names no namespace, so it never does.
 func namesProviderOutside(stableID, namespace string) bool {
-	parts := strings.Split(stableID, "/")
-	return len(parts) == 4 && parts[2] != namespace
+	scoped, ok := envelope.ParseScopedStableID(stableID)
+	return ok && scoped.ProviderNamespace != namespace
 }
 
 // providerWithdrawalWaitMessage makes the safe provider-deletion contract

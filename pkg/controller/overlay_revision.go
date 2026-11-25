@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -21,6 +22,57 @@ import (
 // serve it. The kubelet syncs a mounted ConfigMap within about 90 seconds;
 // past the limit something else is wrong and the model is reported as before.
 const overlayRevisionWaitLimit = 2 * time.Minute
+
+// overlayRevisionCheckReuse is how long a tenant's serving-revision check is
+// reused. The answer is the same for every model of the tenant that waits for
+// one overlay revision, so models created together would otherwise each list
+// the pods and read their logs on every recheck. It is shorter than
+// attachmentRequeueInterval, so a model's timed recheck never reuses its own
+// previous answer.
+const overlayRevisionCheckReuse = 2 * time.Second
+
+// revisionCheck is what extProcPodOnOtherRevision found for a tenant at a
+// time: the pod that serves another revision than revision, or "" when every
+// ready pod serves it.
+type revisionCheck struct {
+	revision string
+	pod      string
+	at       time.Time
+}
+
+// revisionChecks holds the latest revisionCheck of each tenant namespace.
+type revisionChecks struct {
+	mu     sync.Mutex
+	latest map[string]revisionCheck
+}
+
+// lookup returns the pod of a check of namespace for revision that was made
+// less than overlayRevisionCheckReuse before now.
+func (c *revisionChecks) lookup(namespace, revision string, now time.Time) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	check, found := c.latest[namespace]
+	if !found || check.revision != revision || now.Before(check.at) || now.Sub(check.at) >= overlayRevisionCheckReuse {
+		return "", false
+	}
+	return check.pod, true
+}
+
+// record stores the check of namespace and drops the checks that can no
+// longer be reused, so only tenants checked moments ago are held.
+func (c *revisionChecks) record(namespace string, check revisionCheck) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.latest == nil {
+		c.latest = map[string]revisionCheck{}
+	}
+	for other, old := range c.latest {
+		if check.at.Sub(old.at) >= overlayRevisionCheckReuse {
+			delete(c.latest, other)
+		}
+	}
+	c.latest[namespace] = check
+}
 
 // overlayRevisionPending reports whether a model that is not Ready yet must
 // keep waiting because a ready pod of the tenant's available ExtProc
@@ -43,7 +95,7 @@ func (r *Reconciler) overlayRevisionPending(ctx context.Context, model *v1alpha1
 	if runtime.DefaultUnstructuredConverter.FromUnstructured(extProc.Object, deployment) != nil || !managedExtProcDeployment(deployment) {
 		return false, ""
 	}
-	pod := r.extProcPodOnOtherRevision(ctx, t.namespace, deployment, env.Revision.Value)
+	pod := r.extProcPodOnOtherRevision(ctx, t.namespace, deployment, env.Revision.Value, now)
 	if pod == "" {
 		return false, ""
 	}
@@ -92,8 +144,12 @@ func readyAt(model *v1alpha1.ExternalModel, gateway v1alpha1.NamespacedObjectRef
 
 // extProcPodOnOtherRevision returns a running, ready pod of the tenant's
 // ExtProc Deployment that reports serving an overlay revision other than
-// revision, or "" when there is none or it cannot be told.
-func (r *Reconciler) extProcPodOnOtherRevision(ctx context.Context, namespace string, deployment *appsv1.Deployment, revision string) string {
+// revision, or "" when there is none or it cannot be told. A check made less
+// than overlayRevisionCheckReuse before now is reused.
+func (r *Reconciler) extProcPodOnOtherRevision(ctx context.Context, namespace string, deployment *appsv1.Deployment, revision string, now time.Time) string {
+	if pod, found := r.revisionChecks.lookup(namespace, revision, now); found {
+		return pod
+	}
 	replicaSets, err := r.extProcReplicaSets(ctx, namespace, deployment)
 	if err != nil {
 		return ""
@@ -102,14 +158,26 @@ func (r *Reconciler) extProcPodOnOtherRevision(ctx context.Context, namespace st
 	if err != nil {
 		return ""
 	}
+	behind, undetermined := "", false
 	for _, pod := range pods {
 		if pod.replicaSet == nil || pod.Status.Phase != corev1.PodRunning || !pod.DeletionTimestamp.IsZero() || !podReady(pod.Pod) {
 			continue
 		}
 		// An unreadable log or one without a revision line proves nothing.
-		if serves, err := r.podServesOverlayRevision(ctx, pod.Pod, revision); err == nil && !serves {
-			return pod.Name
+		serves, err := r.podServesOverlayRevision(ctx, pod.Pod, revision)
+		if err != nil {
+			undetermined = true
+			continue
+		}
+		if !serves {
+			behind = pod.Name
+			break
 		}
 	}
-	return ""
+	// Only an answer that was determined is reused: a pod that serves another
+	// revision, or every ready pod serving this one.
+	if behind != "" || !undetermined {
+		r.revisionChecks.record(namespace, revisionCheck{revision: revision, pod: behind, at: now})
+	}
+	return behind
 }

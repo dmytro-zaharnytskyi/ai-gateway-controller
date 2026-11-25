@@ -565,6 +565,25 @@ func ScopedStableID(modelNamespace, model, providerNamespace, provider string) s
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }
 
+// ScopedID holds the fields that a ScopedStableID names.
+type ScopedID struct {
+	ModelNamespace    string
+	Model             string
+	ProviderNamespace string
+	Provider          string
+}
+
+// ParseScopedStableID returns the fields of a ScopedStableID in its readable
+// form. The hash form names none, so it reports false, as does the existing
+// tenant-local form.
+func ParseScopedStableID(id string) (ScopedID, bool) {
+	fields := strings.Split(id, "/")
+	if len(fields) != 4 {
+		return ScopedID{}, false
+	}
+	return ScopedID{ModelNamespace: fields[0], Model: fields[1], ProviderNamespace: fields[2], Provider: fields[3]}, true
+}
+
 // RouteStableID returns the route's stable_id: its explicit scoped override,
 // otherwise the existing CandidateStableID form.
 func RouteStableID(route resolver.Route) string {
